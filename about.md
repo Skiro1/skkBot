@@ -1,23 +1,37 @@
-# skkBot
-skkBot is a macro bot for Geometry Dash with a built-in video renderer
+# skkBot2
+skkBot2 is an input-first macro bot for Geometry Dash (the skkBot rewrite). It records
+real GD inputs and replays them through GD's native path, with a native ImGui menu
+that replaces the cocos frontend of the old skkBot.
 
 ## Features
-- Macro recording/playback with per-frame physics
-- Video renderer via bundled FFmpeg — the codec list shows every video encoder available in the FFmpeg build (NVENC, AMF, QSV, libx264, libx265, AV1, VP9/VP8, MPEG-4, ProRes, MJPEG, ...)
-- Default codec libx264 — works on any machine, GPU or not; no auto-detection, the exact codec you pick is used
-- Bitrate 5–200 Mbps (default 50), fade in/out (0–3s, off by default), resolution presets (144p–8K), 1–240 FPS
-- Audio recording: AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC3, E-AC3 (as available in the bundled FFmpeg)
-- Keybinds: F6 = Record/Stop, F7 = Play/Stop — rebind by right-clicking the buttons
-- Single macro format (.skk)
-- Practice mode support
-- Logging fully off by default (optional file logging in Settings)
+- **Input-first macro recording/playback** with per-substep (sub-tick) input dispatch
+  through GD's native pipeline (`.skk`, SKK3 format)
+- **LockDelta**: physics-delta freeze (`warp*physicsDt` per substep, step-grid hooks) —
+  verified playback at 1.00–1.13 plan/tick
+- **Accuracy levels**: Vanilla and CBS (Click-Between-Steps) + COS helper (vanilla GD
+  mechanics, applied natively). External accuracy mods (SIP, Click-Between-Frames) are
+  declared as incompatibilities
+- **Triple RNG lock** (shake + teleport + per-object 2068), velocity fix (always on),
+  gravity/up-down/dash state correction from player-visual bits
+- **Per-frame persistence-attempt** recording + playback, practice-mode support,
+  frame stepper (forward), dead-cell hold-sync on checkpoints
+- **Checkpoint system** with `PlayerStateBundle` (54 fields) and Rubber-Banding reconcile
+- **Single macro format `.skk` (SKK3)**: zstd-22 compression, dense wire encoding
+  (varint/zigzag/XOR + RLE), per-frame delta layout, checkpoints, persistence,
+  triple-RNG boundaries
+- **Built-in video renderer** (bundled FFmpeg): FBO + PBO ring, GPU NV12 output,
+  full encoder list (libx264, libx265, NVENC, AMF, QSV, AV1, VP9/VP8, MPEG-4, ProRes,
+  MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–200 Mbps, audio AAC/MP3/Opus/Vorbis/
+  FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**
+- **Logging system** (None/Error/Warn/Info/All): Geode console + optional file logging,
+  split Record/Play log files
 
 ## Changelog
 See [changelog.md](changelog.md)
 
-- **v0.0.3** — keybinds (F6/F7 with right-click rebinding), render codec overhaul (no auto-config, full encoder list, default libx264, bitrate up to 200 Mbps, fades default 0), more audio codecs (Vorbis/ALAC/AC3/E-AC3), logging off by default
-- **v0.0.2** — major audio system rewrite, multi-format replay support (GDR/GDR2/SLC), render stability fixes
-- **v0.0.1** — initial release: per-frame physics recording, video renderer, audio recording
+## Compatibility
+Won't load together with: `chizz.superb-input-precision`, `syzzi.click_between_frames`
+
 ---
 
 Thanks to everyone who helped test and improve skkBot

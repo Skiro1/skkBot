@@ -1,88 +1,58 @@
-# v0.0.3 (2026-08-11)
-Keybinds + render codec overhaul + logging off by default.
+# v0.1.0 (2026-09-17)
+Initial release of **skkBot2** — the input-first rewrite of skkBot (SKK3 `.skk` format,
+native ImGui menu, bundled video renderer).
 
 ## New
-- **Record/Play keybinds**: F6 = Record/Stop, F7 = Play/Stop (defaults, saved per mod); right-click the Record/Play buttons to open the rebind popup
-- **No auto-config for the video renderer**: the exact codec you pick in the GUI is used — no silent fallback chain (NVENC → x264) and no "Auto" option; a failing codec reports a clear error
-- **Full encoder list**: the codec combo shows every video encoder available in the bundled FFmpeg (h264/x264/x265/hevc/av1/vp9/vp8/mpeg4/prores/mjpeg/mpeg2/vc1 families — NVENC, AMF, QSV and software)
-- **NV12 → YUV420P conversion** via swscale for codecs that don't accept NV12 directly (libx265, SVT-AV1, VP9, MPEG-4, ...)
-- **Default video codec libx264** — works on any machine regardless of GPU
-- **More audio codecs**: Vorbis (libvorbis), ALAC, AC3, E-AC3 (all mux into MP4)
-- Video bitrate slider up to **200 Mbps** (default 50)
-- Fade in/out default **0** (off)
+- **Input-first macro engine**: records real GD inputs and replays them through GD's
+  native path with per-substep (sub-tick) input dispatch
+- **LockDelta**: physics-delta freeze (`warp*physicsDt` per substep) + step-grid
+  midhooks — playback verified at 1.00–1.13 plan/tick, resume window ≤17 plans
+- **Accuracy levels**: Vanilla / CBS (Click-Between-Steps) with COS helper — applied
+  through vanilla GD mechanics; external accuracy mods (SIP, Click-Between-Frames)
+  are blocked via mod.json incompatibilities
+- **Triple RNG lock** (shake + teleport + per-object), velocity fix (always on),
+  gravity/up-down/dash state correction from player visuals
+- **Per-frame persistence-attempt** recording/playback; practice mode; frame stepper
+- **Checkpoints**: `PlayerStateBundle` (54 fields) with Rubber-Banding reconcile,
+  hold-restore after checkpoint restore
+- **SKK3 format**: zstd-22 compression, dense wire v6 (varint/zigzag/XOR, RLE input
+  repeats), per-frame delta layout + record RLE, flags for
+  anchors/checkpoints/persistence/tpsEvents/perFrame/variance/practiceFix/rngBoundaries
+- **Video renderer** (ported from skkBot v0.0.4): FBO + PBO ring, GPU NV12, FFmpeg
+  loaded at runtime from the mod bundle, separate "Video Render" window with live
+  preview, `.mp4` output
+  - Black-screen fix: `dt=1/fps`, `m_started` gate in drawScene, binary TPS-bypass
+    patch disabled during recording; tested 1080p@60 (1.52×) and 8K@60 (0.44×)
+  - **Level audio from block 0** (v59.7): FMOD kick cycle
+    `startMusic + startMusic(0) + pauseAllAudio/resumeAllAudio` restarts the stopped
+    music channel — verified by two consecutive renders with near-identical audio
+    (residual to AAC noise)
+- **GUI**: native ImGui menu — main (Record/Play/Status), Features, Bot Settings,
+  Macro List; Render window; menu keybind; accuracy dropdown (Vanilla/CBS); input
+  counter with `[chain]` truncation labels
+- **Logging**: None/Error/Warn/Info/All levels, console + file, split Record/Play logs
 
-## Changes
-- Removed the "Ready" status text and the "Used: <codec>" lines from the Render tab
-- Default log level = None, file logging and verbose logging off by default (no log file is created until enabled in Settings)
-- Version v0.0.3 displayed in the window title and logs
-
-## Temporary (to be re-added later)
-- **CUDA temporarily removed** — pixel readback no longer uses CUDA
-- **Only one macro format supported** — GDR/GDR2/SLC support removed; only .skk remains
-- **.skk format fully redesigned** (v31)
-- **Macro recording and playback fully redesigned**
-- **Renderer fully redesigned, Silicate-style**
+## TPS Bypass
+- TPS bypass + anti-SSB, step-grid midhooks, practice-fix P1 (broken-object tracker),
+  start-position policy, freeze/exhaustion fix
 
 ## Fixes
-- Bottom hint line showed the same key for Record and Play (keyName() returns a pointer to a shared static buffer — all format slots read the last-written key; each key name is now copied into a string immediately)
-- libx264 missing from the codec list (the encoder filter matched "h264" but not "x264")
+- Exhaustion freeze after playback pipeline shutdown (`6e9e4c8`)
+- Hold buttons not restored after checkpoint restore (`13191a1`)
+- T-pose / missing animation after checkpoint restore (`cc598bd`)
+- Duplicate SKK3 section on save (OOB write) — `seenKnown[9]`
+- PerFrame V2/V3 read-order mismatch (P2 dying in void) (`e3656c1`)
+- Death loop at level restart (`e2d0322`)
+- Press-suppression leftover — only release-suppression kept (`a9cdaa5`)
+- Upside-down preview in the Render window (V-flip UVs in ImGui `AddImage`)
+- Level audio silence in renders — FMOD paused-channel restart (v59.7)
 
-# v0.0.2 (2026-07-09)
-Major audio system rewrite + multi-format replay support + render stability.
+## Known issues
+- BUG-04: cosmetic spider visual gravity (`m_isUpsideDown`) — open, cosmetic
+- BUG-06: rare teleport/pop on orb arcs during playback — source identified, realign
+  from practice checkpoint still open
+- Backward stepping, multi-act recording, autoclicker, trajectory — on the road-map
 
-## New
-- **Audio rewrite**: offline song decode via `FMOD::Sound::lock()` instead of DSP callback — no more 1.39×/0.70× drift
-- **Perfect audio sync**: audio prepared once at render start, trimmed/padded to exact video duration
-- **`m_startGameTime`**: game-time offset captured at render start — correct sync when recording from pause menu
-- **Restart support**: renderer stays alive when restarting level during recording; `m_levelTime` and `m_gameTimeOffset` reset properly
-- **GDR format**: read-only playback support (`.gdr`, `.gdr.json`)
-- **GDR2 format**: read-only playback support (`.gdr2`)
-- **SLC format**: auto-detect V1/V2/V3 by magic bytes (`.slc`)
-- **Multi-format picker**: file dialog filters by extension, auto-detection fallback
-- **SKK v2 read support**: backwards-compatible with older .skk format
-- **Debug WAV**: writes `.debug.wav` next to rendered video for audio verification
+---
 
-## Changes
-- Removed FMOD DSP callback, `FMODAudioEngine::update` hook, carry buffer, per-frame audio collect
-- `onQuit()` no longer kills renderer during active recording
-- Song offset applied before trim (correct order)
-- `m_levelTime` changed from `float` to `double` for precision
-- GDR2 playback uses `+1` frame conversion instead of `+1.0000001`
-
-## Infrastructure
-- Standalone `gdr2_playback.hpp` — separate engine for GDR2/SLC input dispatch
-- `AudioCapture::setGameTimeOffset()` — reset game offset on restart
-- Cleaned up `hooks.cpp`: removed FMOD, DSP, `trackPreRollIfNeeded`, `muteSfx`
-
-# v0.0.1 (2026-07-08)
-Initial release of skkBot. A macro bot with per-frame physics recording and built-in video renderer.
-
-What's new:
-- Macro recording/playback with per-frame physics and loop compression (.skk v3 format)
-- Video renderer via FFmpeg API — 37+ codecs including NVENC, AMF, QSV, D3D12VA, Vulkan, libx264, libx265, VP9, AV1
-- CUDA-accelerated pixel readback (D3D9 → CUDA → RAM)
-- Audio recording via FMOD DSP (AAC, MP3, FLAC, Opus, PCM)
-- ImGui GUI with render/audio settings and resolution presets (144p–8K)
-- TPS Bypass, Seedhack, Practice Fix
-- Logging system with levels (None/Error/Warn/Info/All) and file output
-- Auto-download FFmpeg if not installed
-- Performance presets with one-click bitrate selection
-
-Bug fixes:
-- Fixed CUDA 13.3 crash — replaced removed `cuMemcpy2DFromArray` with `cuMemcpy2D`
-- Fixed audio crash with pcm_s16le (frame_size=0)
-- Fixed render stopping early — now waits for actual level end
-- Fixed GD notifications appearing in rendered video
-- Fixed preset button layout and bitrate progression
-- Fixed tooltips in GUI
-
-Changes:
-- Default settings: log=None/file=off, lock delta=on, audio=on (AAC 192k), render=1080p60 50Mbps libx264
-- Removed music/SFX volume sliders (didn't affect render)
-- Replaced GD notifications with internal logging
-
-Infrastructure:
-- CMakeLists.txt with DONT_INSTALL flag
-- CUDA 13.3 driver support (GTX 1650)
-
-Thanks to everyone who tested the early builds
+Thanks to everyone who helped test and improve skkBot
