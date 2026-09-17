@@ -1,0 +1,26 @@
+{
+	"geode": "5.10.1",
+	"version": "v0.1.0",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "skiro1.skk-bot2",
+	"name": "skkBot2",
+	"developers": [
+		"Skiro1"
+	],
+	"description": "Input-first macro bot (skkBot base, SKK3 format): records real GD inputs and replays through GD's native path, with native ImGui menu.",
+	"incompatibilities": {
+		"chizz.superb-input-precision": "*",
+		"syzzi.click_between_frames": "*"
+	},
+	"resources": {
+		"sprites": [
+			"logo.png"
+		],
+		"files": [
+			"resources/libraries/*.dll"
+		]
+	},
+	"tags": ["gameplay", "utility", "cheat"]
+}

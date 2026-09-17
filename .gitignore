@@ -1,0 +1,11 @@
+build/
+build-release/
+.vs/
+out/
+*.geode
+geomod/
+.geode/
+build.bat
+opencode.json
+build_out.log
+*.log
