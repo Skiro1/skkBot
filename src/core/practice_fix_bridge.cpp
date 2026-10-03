@@ -34,7 +34,8 @@ static void copyFullP1ToWire(
     w.p1_gameModeChangedTime = fp.gameModeChangedTime; w.p1_lastLandTime = fp.lastLandTime;
     w.p1_lastCollisionBottom = fp.lastCollisionBottom; w.p1_lastCollisionTop = fp.lastCollisionTop;
     w.p1_lastCollisionLeft = fp.lastCollisionLeft; w.p1_lastCollisionRight = fp.lastCollisionRight;
-    w.p1_stateOnGround = fp.stateOnGround; w.p1_stateForce = fp.stateForce; w.p1_reverseRelated = fp.reverseRelated;
+    w.p1_stateOnGround = fp.stateOnGround; w.p1_stateForce = fp.stateForce;
+    w.p1_stateFlipGravity = fp.stateFlipGravity; w.p1_reverseRelated = fp.reverseRelated;
     w.p1_flags1 = fp.flags1; w.p1_flags2 = fp.flags2;
     w.p1_holdingRight = fp.holdingRight; w.p1_holdingLeft = fp.holdingLeft;
 }
@@ -66,7 +67,8 @@ static void copyFullP2ToWire(
     w.p2_gameModeChangedTime = fp.gameModeChangedTime; w.p2_lastLandTime = fp.lastLandTime;
     w.p2_lastCollisionBottom = fp.lastCollisionBottom; w.p2_lastCollisionTop = fp.lastCollisionTop;
     w.p2_lastCollisionLeft = fp.lastCollisionLeft; w.p2_lastCollisionRight = fp.lastCollisionRight;
-    w.p2_stateOnGround = fp.stateOnGround; w.p2_stateForce = fp.stateForce; w.p2_reverseRelated = fp.reverseRelated;
+    w.p2_stateOnGround = fp.stateOnGround; w.p2_stateForce = fp.stateForce;
+    w.p2_stateFlipGravity = fp.stateFlipGravity; w.p2_reverseRelated = fp.reverseRelated;
     w.p2_flags1 = fp.flags1; w.p2_flags2 = fp.flags2;
     w.p2_holdingRight = fp.holdingRight; w.p2_holdingLeft = fp.holdingLeft;
 }
@@ -98,7 +100,8 @@ static void copyWireToFullP1(
     fp.gameModeChangedTime = w.p1_gameModeChangedTime; fp.lastLandTime = w.p1_lastLandTime;
     fp.lastCollisionBottom = w.p1_lastCollisionBottom; fp.lastCollisionTop = w.p1_lastCollisionTop;
     fp.lastCollisionLeft = w.p1_lastCollisionLeft; fp.lastCollisionRight = w.p1_lastCollisionRight;
-    fp.stateOnGround = w.p1_stateOnGround; fp.stateForce = w.p1_stateForce; fp.reverseRelated = w.p1_reverseRelated;
+    fp.stateOnGround = w.p1_stateOnGround; fp.stateForce = w.p1_stateForce;
+    fp.stateFlipGravity = w.p1_stateFlipGravity; fp.reverseRelated = w.p1_reverseRelated;
     fp.flags1 = w.p1_flags1; fp.flags2 = w.p1_flags2;
     fp.holdingRight = w.p1_holdingRight; fp.holdingLeft = w.p1_holdingLeft;
 }
@@ -130,7 +133,8 @@ static void copyWireToFullP2(
     fp.gameModeChangedTime = w.p2_gameModeChangedTime; fp.lastLandTime = w.p2_lastLandTime;
     fp.lastCollisionBottom = w.p2_lastCollisionBottom; fp.lastCollisionTop = w.p2_lastCollisionTop;
     fp.lastCollisionLeft = w.p2_lastCollisionLeft; fp.lastCollisionRight = w.p2_lastCollisionRight;
-    fp.stateOnGround = w.p2_stateOnGround; fp.stateForce = w.p2_stateForce; fp.reverseRelated = w.p2_reverseRelated;
+    fp.stateOnGround = w.p2_stateOnGround; fp.stateForce = w.p2_stateForce;
+    fp.stateFlipGravity = w.p2_stateFlipGravity; fp.reverseRelated = w.p2_reverseRelated;
     fp.flags1 = w.p2_flags1; fp.flags2 = w.p2_flags2;
     fp.holdingRight = w.p2_holdingRight; fp.holdingLeft = w.p2_holdingLeft;
 }

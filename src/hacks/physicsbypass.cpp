@@ -295,6 +295,19 @@ namespace {
     }
 
     static bool shouldUseCustomTiming(ReplayEngine const& engine) {
+        // Editor playtest: GD funnels processCommands at ~180/s with dt=1/180,
+        // and the step clock is compensated for exactly that cadence (BUG-10).
+        // Do NOT drag a plain editor PLAY onto the custom 240 grid - it would
+        // break the compensation. Only take over timing when the user actually
+        // changed TPS/Speed (or render/autoclicker/frame-step needs it).
+        if (skk::gameplay::isEditorPlaytest()) {
+            return engine.tickStepping
+                || engine.singleTickStep
+                || skkbot2::render::Renderer::get().isRecording()
+                || !nearlyEqual(engine.runtimeTickRate(), ReplayEngine::kBaseTickRate, 0.01)
+                || !nearlyEqual(engine.gameSpeed, 1.0, 0.0001)
+                || Autoclicker::get()->enabled;
+        }
         return engine.tickStepping
             || engine.singleTickStep
             || skkbot2::render::Renderer::get().isRecording()
@@ -624,18 +637,20 @@ class $modify(TickControlPlayLayer, PlayLayer) {
 
 class $modify(SpeedControlScheduler, CCScheduler) {
     void update(float dt) {
-        if (!PlayLayer::get()) {
+        // Engage for a PlayLayer attempt OR an editor playtest (TPS/Speed
+        // control). Plain editor play with default timing falls through to
+        // vanilla inside shouldUseCustomTiming (BUG-10 compensation stays
+        // intact); build mode keeps the vanilla scheduler entirely.
+        if (!PlayLayer::get() && !skk::gameplay::isEditorPlaytest()) {
             return CCScheduler::update(dt);
         }
 
-        // While the renderer is capturing, physics is stepped manually by the
-        // CCDirector::drawScene hook (Renderer::drive -> m_pScheduler->update
-        // with 1/tps). Route around the step-grid machinery entirely so the
-        // video is fed the exact vanilla tick sequence.
-        if (skkbot2::render::Renderer::get().isRecording()) {
-            return CCScheduler::update(dt);
-        }
-
+        // Render capture: physics is stepped by the CCDirector::drawScene hook
+        // (Renderer::drive -> m_pScheduler->update(1/fps)), but it still flows
+        // through the step-grid machinery below so the simulation runs on the
+        // macro's tps grid (1/tps substeps), exactly like the PLAY session the
+        // macro was recorded on. The scheduler carry turns one 1/fps drive
+        // call into floor((1/fps)/(1/tps)) batches of 1/tps.
         auto* engine = ReplayEngine::get();
         auto& controller = timingController();
 
@@ -662,18 +677,14 @@ class $modify(PhysicsControlLayer, GJBaseGameLayer) {
     };
 
     void update(float dt) {
-        if (!PlayLayer::get()) {
+        if (!PlayLayer::get() && !skk::gameplay::isEditorPlaytest()) {
             return GJBaseGameLayer::update(dt);
         }
 
-        // Render capture: physics runs via the drawScene hook's own stepping;
-        // bypass the step-grid plumbing (see SpeedControlScheduler::update).
-        // The vanilla update still calls getModifiedDelta internally (the
-        // 1/tps dt quantizes to the standard time-base scale).
-        if (skkbot2::render::Renderer::get().isRecording()) {
-            return GJBaseGameLayer::update(dt);
-        }
-
+        // Render capture: physics runs via the drawScene hook's own stepping,
+        // but through the shared step-grid path below (see
+        // SpeedControlScheduler::update) so substeps integrate on the macro's
+        // 1/tps grid instead of the vanilla 240-Hz one.
         auto* engine = ReplayEngine::get();
         auto& controller = timingController();
 
@@ -697,15 +708,12 @@ class $modify(PhysicsControlLayer, GJBaseGameLayer) {
     }
 
     double getModifiedDelta(float dt) {
-        if (!PlayLayer::get()) {
+        if (!PlayLayer::get() && !skk::gameplay::isEditorPlaytest()) {
             return GJBaseGameLayer::getModifiedDelta(dt);
         }
 
-        // Render capture: keep vanilla dt quantization (no step-grid freeze).
-        if (skkbot2::render::Renderer::get().isRecording()) {
-            return GJBaseGameLayer::getModifiedDelta(dt);
-        }
-
+        // Render capture keeps the step-grid freeze (customTickPlanActive) so
+        // substeps stay on the 1/tps grid, matching the recorded macro.
         auto* engine = ReplayEngine::get();
         if (!shouldUseCustomTiming(*engine)) {
             setExpectedTicksPatchEnabled(false);

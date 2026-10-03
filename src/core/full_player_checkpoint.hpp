@@ -138,7 +138,19 @@ struct FullPlayerCheckpoint {
     cocos2d::ccColor3B originalSecondColor = { 0, 0, 0 };
 
     // --- Wave trail ---
+    // The point array alone is not enough: forceCurrentModeVisual re-runs
+    // toggleDartMode(true) on restore, and GD REPLACES m_waveTrail with a
+    // fresh HardStreak (new point array, default flags). Re-pinning just the
+    // points leaves the streak with its reset state, so it renders wrong or
+    // vanishes outright ("трейл пропал после рестарта"). Every field the draw
+    // depends on is snapshotted and re-applied after the mode rebuild.
     std::vector<cocos2d::CCPoint> waveTrailPoints;
+    cocos2d::CCPoint waveTrailCurrentPoint = { 0.f, 0.f };
+    float waveTrailWaveSize = 0.f;
+    float waveTrailPulseSize = 0.f;
+    bool waveTrailIsSolid = false;
+    bool waveTrailIsFlipped = false;
+    bool waveTrailDrawStreak = false;
 };
 
 struct FullCheckpointBundle {

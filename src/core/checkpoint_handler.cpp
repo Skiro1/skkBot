@@ -81,6 +81,15 @@ namespace {
         else if (state.flags.spider) player->toggleSpiderMode(true, true);
         else if (state.flags.swing)  player->toggleSwingMode(true, true);
         else if (state.flags.robot)  player->toggleRobotMode(true, true);
+
+        // toggleMode() re-initializes sprite frames assuming normal upright gravity.
+        // Re-apply upsideDown and gravity states immediately so that robot/spider/ship
+        // armatures are properly flipped.
+        player->m_isUpsideDown = state.flags.upsideDown;
+        player->m_stateFlipGravity = state.flags.upsideDown ? 1 : 0;
+        if (state.environment.gravity != 0.0) {
+            player->m_gravity = state.environment.gravity;
+        }
     }
 
     // Force a full re-init of the current mode's sprite/armature even when the
@@ -102,6 +111,15 @@ namespace {
         else if (state.flags.spider) player->toggleSpiderMode(true, true);
         else if (state.flags.swing)  player->toggleSwingMode(true, true);
         else if (state.flags.robot)  player->toggleRobotMode(true, true);
+
+        // toggleMode() re-initializes sprite frames assuming normal upright gravity.
+        // Re-apply upsideDown and gravity states immediately so that robot/spider/ship
+        // armatures are properly flipped.
+        player->m_isUpsideDown = state.flags.upsideDown;
+        player->m_stateFlipGravity = state.flags.upsideDown ? 1 : 0;
+        if (state.environment.gravity != 0.0) {
+            player->m_gravity = state.environment.gravity;
+        }
     }
 }
 
@@ -109,7 +127,7 @@ uint8_t InputStateRestorer::captureLatchMask(PlayerObject* player) {
     return encodeButtonHoldMask(player);
 }
 
-void InputStateRestorer::restoreInputState(PlayLayer* playLayer, PlaybackAnchor const& anchor) {
+void InputStateRestorer::restoreInputState(GJBaseGameLayer* playLayer, PlaybackAnchor const& anchor) {
     if (!playLayer || !playLayer->m_player1) {
         return;
     }
@@ -125,7 +143,7 @@ void InputStateRestorer::restoreInputState(PlayLayer* playLayer, PlaybackAnchor 
     }
 }
 
-void InputStateRestorer::restoreInputState(PlayLayer* playLayer, CheckpointStateBundle const& checkpoint) {
+void InputStateRestorer::restoreInputState(GJBaseGameLayer* playLayer, CheckpointStateBundle const& checkpoint) {
     if (!playLayer || !playLayer->m_player1) {
         return;
     }
@@ -186,6 +204,7 @@ PlayerStateBundle PlayerStateRestorer::captureState(PlayerObject* player, bool i
     state.flags.accelerating = player->m_isAccelerating;
     state.flags.affectedByForces = player->m_affectedByForces;
     state.flags.jumpBuffered = player->m_jumpBuffered;
+    state.flags.slopeFlipGravityRelated = player->m_slopeFlipGravityRelated;
     state.flags.buttonHolds[0] = holdButtonHeld(player, 1);
     state.flags.buttonHolds[1] = holdButtonHeld(player, 2);
     state.flags.buttonHolds[2] = holdButtonHeld(player, 3);
@@ -269,6 +288,7 @@ void PlayerStateRestorer::restoreState(PlayerObject* player, PlayerStateBundle c
         player->m_isSlidingRight = state.flags.slidingRight;
         player->m_isAccelerating = state.flags.accelerating;
         player->m_affectedByForces = state.flags.affectedByForces;
+        player->m_slopeFlipGravityRelated = state.flags.slopeFlipGravityRelated;
         // m_jumpBuffered is NOT restored from the snapshot. Vanilla GD clears
         // it via releaseAllButtons() during loadFromCheckpoint; the snapshot
         // was captured mid-input (jump buffered while holding the button), so
@@ -399,7 +419,7 @@ bool PlayerStateRestorer::needsModeReconciliation(
 
 PlaybackAnchor AnchorReconciler::captureAnchor(
     int tick,
-    PlayLayer* playLayer,
+    GJBaseGameLayer* playLayer,
     PlayerObject* player1,
     PlayerObject* player2,
     AnchorRngState const& rng
@@ -428,7 +448,7 @@ PlaybackAnchor AnchorReconciler::captureAnchor(
 }
 
 bool AnchorReconciler::reconcile(
-    PlayLayer* playLayer,
+    GJBaseGameLayer* playLayer,
     PlayerObject* player1,
     PlayerObject* player2,
     PlaybackAnchor const& anchor,
@@ -462,7 +482,7 @@ bool AnchorReconciler::reconcile(
 CheckpointStateBundle CheckpointStateManager::capture(
     int tick,
     int priorTick,
-    PlayLayer* playLayer,
+    GJBaseGameLayer* playLayer,
     AnchorRngState const& rng
 ) {
     CheckpointStateBundle checkpoint;
@@ -560,6 +580,7 @@ CheckpointStateBundle CheckpointStateManager::capture(
         fp.lastCollisionRight = p->m_lastCollisionRight;
         fp.stateOnGround = p->m_stateOnGround;
         fp.stateForce = p->m_stateForce;
+        fp.stateFlipGravity = p->m_stateFlipGravity;
         fp.reverseRelated = p->m_reverseRelated;
         fp.holdingRight = p->m_holdingRight;
         fp.holdingLeft = p->m_holdingLeft;
@@ -628,6 +649,22 @@ CheckpointStateBundle CheckpointStateManager::capture(
         storeFullP1(checkpoint.fullP2, playLayer->m_player2);
     }
 
+    // BUG-13: the reduced fullP1 set above round-trips the SKK3 wire but omits
+    // the SHIP FLIGHT ANGLE (m_shipRotation/m_rotationSpeed), m_fallStartY and
+    // m_unkAngle1. A practice respawn on the ship restored the player LEVEL
+    // instead of banked, so the trajectory curved differently and the moment
+    // had to be redone from scratch. The complete FullPlayerCheckpoint carries
+    // every field; it is stored alongside (hasFullPlayer) and applied LAST in
+    // restore(), after forceCurrentModeVisual rebuilds the vehicle sprite —
+    // that rebuild can reset transforms the reduced apply just pinned, so the
+    // full re-pin must run after it.
+    checkpoint.fullPlayer1 = FullPlayerCheckpoint::store(playLayer->m_player1);
+    if (isDual && playLayer->m_player2) {
+        checkpoint.fullPlayer2 = FullPlayerCheckpoint::store(playLayer->m_player2);
+        checkpoint.hasFullPlayer2 = true;
+    }
+    checkpoint.hasFullPlayer = true;
+
     // RNG state
     checkpoint.seedState = rng.fastRandState;
 
@@ -660,7 +697,7 @@ CheckpointStateBundle CheckpointStateManager::capture(
     return checkpoint;
 }
 
-void CheckpointStateManager::restore(PlayLayer* playLayer, CheckpointStateBundle const& checkpoint) {
+void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointStateBundle const& checkpoint) {
     if (!playLayer) {
         return;
     }
@@ -754,6 +791,7 @@ void CheckpointStateManager::restore(PlayLayer* playLayer, CheckpointStateBundle
             p->m_lastCollisionRight = fp.lastCollisionRight;
             p->m_stateOnGround = fp.stateOnGround;
             p->m_stateForce = fp.stateForce;
+            p->m_stateFlipGravity = fp.stateFlipGravity;
             p->m_reverseRelated = fp.reverseRelated;
             p->m_holdingRight = fp.holdingRight;
             p->m_holdingLeft = fp.holdingLeft;
@@ -828,6 +866,20 @@ void CheckpointStateManager::restore(PlayLayer* playLayer, CheckpointStateBundle
         forceCurrentModeVisual(playLayer->m_player1, checkpoint.player1);
         if (playLayer->m_player2) {
             forceCurrentModeVisual(playLayer->m_player2, checkpoint.player2);
+        }
+
+        // BUG-13: forceCurrentModeVisual can reset transforms the apply above
+        // just pinned — the ship's m_shipRotation (its FLIGHT ANGLE) is the
+        // visible one: without re-pinning it the respawned ship sits level
+        // instead of banked and the trajectory diverges from the recording.
+        // The complete snapshot re-pins every field (angle, rotation speed,
+        // fall start, colours, wave trail) AFTER the sprite rebuild, so the
+        // respawn continues the recorded flight exactly.
+        if (checkpoint.hasFullPlayer) {
+            checkpoint.fullPlayer1.apply(playLayer->m_player1);
+            if (playLayer->m_player2 && checkpoint.hasFullPlayer2) {
+                checkpoint.fullPlayer2.apply(playLayer->m_player2);
+            }
         }
 
         // Restore broken objects — re-disable them so they stay destroyed

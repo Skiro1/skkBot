@@ -9,3 +9,5 @@ build.bat
 opencode.json
 build_out.log
 *.log
+node_modules/
+dist/

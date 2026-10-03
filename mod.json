@@ -1,6 +1,6 @@
 {
 	"geode": "5.10.1",
-	"version": "v0.1.0",
+	"version": "v0.1.1",
 	"gd": {
 		"win": "2.2081"
 	},
@@ -15,11 +15,9 @@
 		"syzzi.click_between_frames": "*"
 	},
 	"resources": {
-		"sprites": [
-			"logo.png"
-		],
 		"files": [
-			"resources/libraries/*.dll"
+			"resources/libraries/*.dll",
+			"resources/font_main.ttf"
 		]
 	},
 	"tags": ["gameplay", "utility", "cheat"]

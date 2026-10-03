@@ -368,6 +368,14 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
             auto* node = static_cast<PointNode*>(arr->objectAtIndex(i));
             cp.waveTrailPoints.push_back(node->m_point);
         }
+        // The streak's own draw state, not just its points: without these the
+        // rebuilt HardStreak renders with defaults (see header note).
+        cp.waveTrailCurrentPoint = p->m_waveTrail->m_currentPoint;
+        cp.waveTrailWaveSize = p->m_waveTrail->m_waveSize;
+        cp.waveTrailPulseSize = p->m_waveTrail->m_pulseSize;
+        cp.waveTrailIsSolid = p->m_waveTrail->m_isSolid;
+        cp.waveTrailIsFlipped = p->m_waveTrail->m_isFlipped;
+        cp.waveTrailDrawStreak = p->m_waveTrail->m_drawStreak;
     }
 
     return cp;
@@ -520,5 +528,22 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
             auto* node = PointNode::create(pt);
             if (node) arr->addObject(node);
         }
+        // Re-pin the streak's draw state. This apply runs AFTER
+        // forceCurrentModeVisual, which rebuilt m_waveTrail via
+        // toggleDartMode(true) — a fresh HardStreak with reset flags. Without
+        // m_drawStreak/m_currentPoint/m_waveSize the respawned wave trail
+        // either does not draw at all or starts from the wrong origin, so the
+        // trail visibly vanishes/jumps after a practice restart.
+        p->m_waveTrail->m_currentPoint = waveTrailCurrentPoint;
+        p->m_waveTrail->m_waveSize = waveTrailWaveSize;
+        p->m_waveTrail->m_pulseSize = waveTrailPulseSize;
+        p->m_waveTrail->m_isSolid = waveTrailIsSolid;
+        p->m_waveTrail->m_isFlipped = waveTrailIsFlipped;
+        p->m_waveTrail->m_drawStreak = waveTrailDrawStreak;
+        // HardStreak is a CCNode whose own position is the streak's origin.
+        // The rebuilt streak inherits no position, so the first frame after a
+        // restore would draw from (0,0); pin it to the player like GD's own
+        // update does for darts (silicate does the same in its render hook).
+        p->m_waveTrail->setPosition(p->m_position);
     }
 }

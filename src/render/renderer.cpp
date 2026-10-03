@@ -11,6 +11,8 @@
 #include <Geode/binding/PauseLayer.hpp>
 #include <Geode/binding/PlayLayer.hpp>
 #include <Geode/binding/ShaderLayer.hpp>
+#include <Geode/cocos/shaders/CCShaderCache.h>
+#include <Geode/cocos/shaders/ccGLStateCache.h>
 
 #include "../skkBot.hpp"
 #include "../logger/logger.hpp"
@@ -285,6 +287,41 @@ void Renderer::useWindowViewForUi() {
     // Menu-space swap (no shader-layer resize — the texture must stay at the
     // output size for the visit()-based grab that runs between menu frames).
     silentChangeSize(CCSize(m_windowW, m_windowH));
+    // Cocos's CCDirector::setViewport()/setProjection(), invoked by
+    // silentChangeSize above, reset the GL blend FUNCTION to cocos's default
+    // premultiplied pair (GL_ONE / GL_ONE_MINUS_SRC_ALPHA). imgui-cocos sets
+    // its own (GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA) exactly ONCE at the top
+    // of drawFrame — BEFORE this callback runs — and never re-asserts it, so
+    // the whole menu composites with the leaked premultiplied func.
+    // ImGui vertex colors are NOT premultiplied, so with GL_ONE every
+    // translucent pixel paints at ~2x intensity: anti-aliased glyph edges go
+    // solid (text looks fat/garbled/"filled with one color") and the 14%-alpha
+    // glass panels turn nearly opaque. This is why the UI only breaks while a
+    // render is on — silentChangeSize runs every render frame (acquireView +
+    // this), and never outside one. Re-assert imgui's func HERE (after the
+    // swap) so renderFrame() below paints with correct alpha. Raw glBlendFunc
+    // (not the cached ccGLBlendFunc): the scene path may have changed the real
+    // GL state through the cache, and the wrapper would no-op if its cache
+    // still holds the old value while the actual state differs.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // The render path leaves a non-cocos GL program bound (the capture/Y-UV
+    // shaders, set through raw glUseProgram). gd-imgui-cocos renders the menu
+    // through shader->use() -> the CACHED ccGLUseProgram wrapper, which no-ops
+    // when its cache still holds the imgui program while a different one is
+    // actually bound. The whole menu then composites with a program that has
+    // no matching vertex attrs/uniforms - every widget paints invisible while
+    // our blur callback (raw GL, own program) stays visible.
+    // Fix: bind a DIFFERENT cocos program THROUGH the cached path. This makes
+    // the wrapper's cache agree with the real GL state (both hold the other
+    // program), so renderFrame()'s use() of the imgui program sees a cache
+    // mismatch and issues a REAL glUseProgram. (Raw glUseProgram(0) +
+    // ccGLInvalidateStateCache did NOT fix it: 2026/09/27 session, still
+    // invisible; invalidate apparently does not reset the program slot.)
+    if (auto* other = CCShaderCache::sharedShaderCache()->programForKey(
+            kCCShader_PositionColor)) {
+        other->use();
+    }
 }
 
 void Renderer::storeWindowFbSize(float fbW, float fbH) {
@@ -833,6 +870,7 @@ void Renderer::applySettings(const RenderSettings& s) {
     mBitrateMbps = s.bitrateMbps;
     if (mBitrateMbps < 1) mBitrateMbps = 1;
     if (mBitrateMbps > 300) mBitrateMbps = 300;
+    m_audioWanted = s.audioEnabled;
     m_audioEnabled = s.audioEnabled;
     m_audioCodecSel = s.audioCodec.empty() ? std::string("aac") : s.audioCodec;
     m_audioBitrate = s.audioBitrate;
@@ -846,12 +884,19 @@ void Renderer::applySettings(const RenderSettings& s) {
     m_fadeOutSeconds = s.fadeOutSeconds;
     if (m_fadeOutSeconds < 0.0) m_fadeOutSeconds = 0.0;
     if (m_fadeOutSeconds > 10.0) m_fadeOutSeconds = 10.0;
+    m_audioFadeInSec = s.audioFadeInSec;
+    if (m_audioFadeInSec < 0.0) m_audioFadeInSec = 0.0;
+    if (m_audioFadeInSec > 10.0) m_audioFadeInSec = 10.0;
+    m_audioFadeOutSec = s.audioFadeOutSec;
+    if (m_audioFadeOutSec < 0.0) m_audioFadeOutSec = 0.0;
+    if (m_audioFadeOutSec > 10.0) m_audioFadeOutSec = 10.0;
 }
 
 Renderer::RenderSettings Renderer::settings() const {
-    return RenderSettings{mWidth, mHeight, mFps, mBitrateMbps, m_audioEnabled,
+    return RenderSettings{mWidth, mHeight, mFps, mBitrateMbps, m_audioWanted,
                           m_audioCodecSel, m_audioBitrate, m_musicVolume,
-                          m_sfxVolume, m_fadeInSeconds, m_fadeOutSeconds};
+                          m_sfxVolume, m_fadeInSeconds, m_fadeOutSeconds,
+                          m_audioFadeInSec, m_audioFadeOutSec};
 }
 
 bool Renderer::hasAudioCodec(const std::string& name) const {
@@ -968,10 +1013,12 @@ bool Renderer::setupAudioStream() {
     m_audioPts = 0;
     m_audioPackets = 0;
     m_audioAccum.clear();
+    m_audioFadeDiag = 0;
     skkbot2::log::info(
-        "[RENDER] audio stream: {} @ {} kbps, {} Hz x {} ch ({} fps codec)",
+        "[RENDER] audio stream: {} @ {} kbps, {} Hz x {} ch ({} fps codec) "
+        "fade: in={:.1f}s out={:.1f}s",
         m_audioCodecUsed, m_audioBitrate, m_audioSampleRate, m_audioChannels,
-        frameSize);
+        frameSize, m_audioFadeInSec, m_audioFadeOutSec);
     return true;
 }
 
@@ -1003,19 +1050,60 @@ void Renderer::writeAudioBlock(const float* block, int64_t pts) {
     const int frameSize =
         m_audioCtx->frame_size > 0 ? m_audioCtx->frame_size : 1024;
 
+    // Audio fade: multiply the whole block by a ramp gain computed from this
+    // block's time. Fade-in ramps up over the first m_audioFadeInSec of the
+    // track; fade-out mirrors the video trailer, ramping to silence over the
+    // last m_audioFadeOutSec (m_audioFadeOutRemain is decremented in the same
+    // trailer path the video fade uses). 0.0 settings leave the block intact.
+    double gain = 1.0;
+    if (m_audioFadeInSec > 0.0 && m_audioSampleRate > 0) {
+        const double t = static_cast<double>(pts) / m_audioSampleRate;
+        if (t < m_audioFadeInSec) {
+            gain = std::max(t / m_audioFadeInSec, 0.0);
+        }
+    }
+    if (m_audioFadeOutSec > 0.0 && m_audioFadeOutRemain < m_audioFadeOutSec) {
+        gain = std::min(gain, std::max(m_audioFadeOutRemain / m_audioFadeOutSec, 0.0));
+    }
+    const float gainF = static_cast<float>(gain);
+
+    // AUDIO-FADE DIAGNOSTIC (bug: audio fade sounds silent/full):
+    // log the first block ever, then notable transitions, so a test render
+    // shows whether the ramp is engaged and where it points.
+    if (m_audioFadeDiag < 4 || (gain < 1.0 && m_audioFadeDiag < 12 &&
+        (pts / 2048) > static_cast<int64_t>(m_audioFadeDiag))) {
+        skkbot2::log::info(
+            "[RENDER] audio-fade diag: blk#{} pts={} t={:.3f}s gain={:.3f} "
+            "fade(in={:.1f}s out={:.1f}s remain={:.3f}) sr={} ctxSR={} fmt={}",
+            m_audioFadeDiag, pts,
+            m_audioSampleRate > 0 ? static_cast<double>(pts) / m_audioSampleRate
+                                  : 0.0,
+            gain, m_audioFadeInSec, m_audioFadeOutSec, m_audioFadeOutRemain,
+            m_audioSampleRate,
+            m_audioCtx ? m_audioCtx->sample_rate : -1,
+            m_audioCtx ? static_cast<int>(m_audioCtx->sample_fmt) : -1);
+        ++m_audioFadeDiag;
+    }
+
     // Manual format conversion (swr removed вЂ” it crashed mid-render). The
     // block is interleaved stereo FLT (the DSP output); the codec takes
     // either planar FLTP (aac/mp3/flac) or interleaved FLT (libopus) вЂ”
     // exactly what setupAudioStream() pinned on the context.
     if (m_audioCtx->sample_fmt == AV_SAMPLE_FMT_FLT) {
-        std::memcpy(m_audioFrame->data[0], block,
-                    static_cast<size_t>(frameSize) * 2 * sizeof(float));
+        if (gainF != 1.0f) {
+            float* out = reinterpret_cast<float*>(m_audioFrame->data[0]);
+            const int n = frameSize * 2;
+            for (int i = 0; i < n; ++i) out[i] = block[i] * gainF;
+        } else {
+            std::memcpy(m_audioFrame->data[0], block,
+                        static_cast<size_t>(frameSize) * 2 * sizeof(float));
+        }
     } else {
         float* left = reinterpret_cast<float*>(m_audioFrame->data[0]);
         float* right = reinterpret_cast<float*>(m_audioFrame->data[1]);
         for (int i = 0; i < frameSize; ++i) {
-            left[i] = block[i * 2];
-            right[i] = block[i * 2 + 1];
+            left[i] = block[i * 2] * gainF;
+            right[i] = block[i * 2 + 1] * gainF;
         }
     }
 
@@ -1128,42 +1216,14 @@ bool Renderer::begin(PlayLayer* layer) {
         return false;
     }
 
-    // The bot menu is usually opened while the game is paused, so a render
-    // frequently starts with the pause menu open. Both the macro replay and
-    // the capture pipeline need a PLAYING level: close the pause menu through
-    // GD's own onResume() path, then restart the level from the beginning
-    // (same as beginExecutionImmediate: practice off, reset to the start).
-    // Without this the paused path in drawScene()/drive() captures nothing
-    // but the pause menu for the whole render - 2026/09/16 session produced
-    // 1826 consecutive "view -> 0x0 (pause menu)" frames with level time
-    // frozen at 0 and an audio track full of -inf dB.
-    if (layer->m_isPaused) {
-        skkbot2::log::info(
-            "[RENDER] level paused at start - closing the pause menu and "
-            "restarting the level so the video starts at the beginning");
-        // Close the pause menu the same way the Resume button does. Search the
-        // WHOLE running scene, not just the PlayLayer's direct children: a
-        // missed close leaves the menu node alive for the whole render (frozen
-        // loop, black window) until the user presses a button manually.
-        if (auto* pauseLayer = findOpenPauseLayerRecursive(
-                CCDirector::sharedDirector()->getRunningScene())) {
-            pauseLayer->onResume(pauseLayer);
-        } else {
-            // Belt and braces: onResume() is GD's official close path, but if
-            // no PauseLayer is present at all, clear the flag directly so the
-            // level cannot stay frozen for the render.
-            layer->m_isPaused = false;
-        }
-        if (layer->m_isPracticeMode) {
-            layer->togglePracticeMode(false);
-        }
-        if (layer->m_levelSettings &&
-            layer->m_levelSettings->m_platformerMode) {
-            layer->resetLevelFromStart();
-        } else {
-            layer->resetLevel();
-        }
-    }
+    // MANUAL LEVEL START (user's choice, 24.09): begin() ARMS the render
+    // (encoder, audio capture, view lock) but never launches or restarts the
+    // level. If the level is paused or has not started, drive() and the
+    // drawScene hook hold all captures (the pause menu never reaches the
+    // video — drive() drops the pending frame and the hook draws the real
+    // scene), so the render simply waits until the user starts/resumes the
+    // level themselves. This replaces the old auto-restart that closed the
+    // pause menu and called resetLevel()/resetLevelFromStart() on START.
 
     if (mWidth < 64 || mHeight < 64 || (mWidth % 2) != 0 || (mHeight % 2) != 0) {
         m_error = "invalid resolution " + std::to_string(mWidth) + "x" + std::to_string(mHeight);
@@ -1197,6 +1257,13 @@ bool Renderer::begin(PlayLayer* layer) {
     }
     std::string outPath = (vidDir / (levelName + "_" + tbuf + ".mp4")).string();
     m_lastOutputPath = outPath;
+
+    // Seed the runtime audio latch from the SETTING. m_audioEnabled is the
+    // "capture attached for THIS render" flag and was left false by the
+    // previous stop(); without re-seeding, every render after the first one
+    // would start video-only unless a render setting happened to be edited
+    // in between (which re-runs applySettings and sets it back).
+    m_audioEnabled = m_audioWanted;
 
     // Audio capture attaches BEFORE the encoder so the audio stream can be
     // configured with the FMOD mix format (rate/channels). If FMOD is not
@@ -1297,6 +1364,8 @@ bool Renderer::begin(PlayLayer* layer) {
     // frame. The trailer is extended when a fade-out is configured so the
     // ramp has room to play.
     mTrailerRemain = std::max(kTrailerHold, m_fadeOutSeconds);
+    // Audio fade-out rides the same trailer timeline as the video fade.
+    m_audioFadeOutRemain = std::max(kTrailerHold, m_audioFadeOutSec);
     m_pendingFrame = false;
     m_pendingPts = -1;
     m_pendingFadeOut = 1.0f;
@@ -1310,12 +1379,13 @@ bool Renderer::begin(PlayLayer* layer) {
     m_lastStatsWall = 0.0;
     m_firstCaptureLogged = false;
     m_pauseLogged = false;
-    // The step-grid drive keeps the TPS-bypass binary patch (expected-ticks)
-    // ENABLED so GD reads g_expectedTicks instead of computing the substep
-    // count from dt. During recording that count stays 0 (nobody updates it),
-    // so the physics loop never advances m_levelTime. Disable the patch so
-    // the vanilla scheduler path advances the level normally.
-    disableExpectedTicksPatch();
+    // The render drive feeds the scheduler 1/fps through the SAME step-grid
+    // pipeline the macro was recorded on (SpeedControlScheduler ->
+    // advanceNormalScheduler -> applyCustomTickPlan), so the expected-ticks
+    // patch must stay ENABLED: applyCustomTickPlan keeps g_expectedTicks in
+    // sync and getModifiedDelta freezes the substep delta to 1/tps. Disabling
+    // the patch here makes GD fall back to its vanilla 240-Hz grid, which
+    // desyncs the input dispatch (and the video timeline) whenever tps != 240.
     mRecording.store(true);
     mCapturedFrames.store(0);
     mEncodedFrames.store(0);
@@ -1491,6 +1561,7 @@ void Renderer::drive(GJBaseGameLayer* layer,
                 : 1.0f;
         m_pendingFrame = true;
         mTrailerRemain -= 1.0 / mFps;
+        m_audioFadeOutRemain -= 1.0 / mFps;
         // The level's own end music (if any) keeps playing at video speed вЂ”
         // pump to the trailer's video time so the audio tail matches the
         // last frames.

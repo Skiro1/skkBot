@@ -3,14 +3,15 @@
 #include "format/replay.hpp"
 
 #include <Geode/Geode.hpp>
+#include <Geode/binding/GJBaseGameLayer.hpp>
 
 using namespace geode::prelude;
 
 class InputStateRestorer {
 public:
     static uint8_t captureLatchMask(PlayerObject* player);
-    static void restoreInputState(PlayLayer* playLayer, PlaybackAnchor const& anchor);
-    static void restoreInputState(PlayLayer* playLayer, CheckpointStateBundle const& checkpoint);
+    static void restoreInputState(GJBaseGameLayer* playLayer, PlaybackAnchor const& anchor);
+    static void restoreInputState(GJBaseGameLayer* playLayer, CheckpointStateBundle const& checkpoint);
 };
 
 class PlayerStateRestorer {
@@ -41,14 +42,14 @@ class AnchorReconciler {
 public:
     static PlaybackAnchor captureAnchor(
         int tick,
-        PlayLayer* playLayer,
+        GJBaseGameLayer* playLayer,
         PlayerObject* player1,
         PlayerObject* player2,
         AnchorRngState const& rng
     );
 
     static bool reconcile(
-        PlayLayer* playLayer,
+        GJBaseGameLayer* playLayer,
         PlayerObject* player1,
         PlayerObject* player2,
         PlaybackAnchor const& anchor,
@@ -62,9 +63,9 @@ public:
     static CheckpointStateBundle capture(
         int tick,
         int priorTick,
-        PlayLayer* playLayer,
+        GJBaseGameLayer* playLayer,
         AnchorRngState const& rng
     );
 
-    static void restore(PlayLayer* playLayer, CheckpointStateBundle const& checkpoint);
+    static void restore(GJBaseGameLayer* playLayer, CheckpointStateBundle const& checkpoint);
 };

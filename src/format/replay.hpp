@@ -2,6 +2,7 @@
 #define _replay_hpp
 
 #include "core/accuracy_mode.hpp"
+#include "core/full_player_checkpoint.hpp"
 #include "utils.hpp"
 
 #include <Geode/Geode.hpp>
@@ -202,6 +203,7 @@ struct PlayerFlagState {
     bool accelerating = false;
     bool affectedByForces = false;
     bool jumpBuffered = false;
+    bool slopeFlipGravityRelated = false;
     std::array<bool, 4> buttonHolds = { false, false, false, false };
 };
 
@@ -278,6 +280,25 @@ struct CheckpointStateBundle {
     // --- Practice-fix extended fields (P1) ---
     // Full player state for practice checkpoint restore (silicate/GDH pattern)
     bool hasFullState = false;
+
+    // The COMPLETE per-player snapshot. fullP1/fullP2 below are the REDUCED set
+    // that round-trips through the SKK3 wire format; this struct carries every
+    // field the physics actually reads back — notably m_shipRotation /
+    // m_rotationSpeed (the ship's flight angle), m_fallStartY, m_unkAngle1 and
+    // the full flag/colour/wave-trail state. Without the flight angle, a
+    // practice respawn on the ship restarts the character LEVEL instead of
+    // banked, so the trajectory diverges and the moment has to be redone from
+    // scratch (BUG-13). Only populated on the live capture path (the wire
+    // format cannot hold it yet); hasFullPlayer gates its use.
+    FullPlayerCheckpoint fullPlayer1;
+    FullPlayerCheckpoint fullPlayer2;
+    bool hasFullPlayer = false;
+    // P2's full snapshot is only stored when a dual/2p context actually
+    // provides m_player2 at capture time (see CheckpointStateManager::store).
+    // FullPlayerCheckpoint's colour fields default to {0,0,0}, so applying an
+    // uncaptured (default-constructed) fullPlayer2 to a player that later
+    // exists paints it COMPLETELY BLACK (BUG-18). Gate the P2 apply on this.
+    bool hasFullPlayer2 = false;
     struct FullP1 {
         float p_x = 0.f, p_y = 0.f;
         float p_rotation = 0.f;
@@ -319,6 +340,7 @@ struct CheckpointStateBundle {
         int lastCollisionLeft = 0, lastCollisionRight = 0;
         int stateOnGround = 0;
         int stateForce = 0;
+        int stateFlipGravity = 0;
         int reverseRelated = 0;
         uint64_t flags1 = 0;
         uint64_t flags2 = 0;
@@ -367,6 +389,7 @@ struct CheckpointStateBundle {
         int lastCollisionLeft = 0, lastCollisionRight = 0;
         int stateOnGround = 0;
         int stateForce = 0;
+        int stateFlipGravity = 0;
         int reverseRelated = 0;
         uint64_t flags1 = 0;
         uint64_t flags2 = 0;

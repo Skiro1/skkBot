@@ -11,6 +11,7 @@
 #include <Geode/modify/CCDirector.hpp>
 #include <Geode/modify/CCEGLView.hpp>
 #include <Geode/modify/FMODAudioEngine.hpp>
+#include <Geode/modify/PlayLayer.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -54,6 +55,14 @@ void armMusicRestart() {
     s_musicRestartPending.store(true);
 }
 
+// Drop a pending deferred song start. Called when the PlayLayer goes away
+// (the song can never start without a level); otherwise the armed flag keeps
+// the FMOD update hook ticking AUDIO_DEFERRED_WAIT forever (the log spammed
+// pl=0 prepared=-1 once per second for minutes after leaving the level).
+void disarmMusicRestart() {
+    s_musicRestartPending.store(false);
+}
+
 // Deferred song start used by the renderer: the level song may still be
 // loading when a render begins (m_musicPrepared = false). Armed by begin(),
 // ticked from FMODAudioEngine::update (below) until the song is ready, then
@@ -91,6 +100,26 @@ bool tickPendingMusicRestart() {
         skkbot2::log::info("AUDIO_RESTART_DEFERRED musicID={}", s_lastMusicId);
     }
     return false;
+}
+
+// v58.22 silicate parity: freeze the mixer at the very bottom of GD's audio
+// stack. While a render is active and AudioCapture::pump's update window is
+// closed, the offline mixer does NOT advance no matter who calls
+// System::update (the FMODAudioEngine::update hook above only covers GD's
+// normal engine path). Inside the window the mixer advances exactly as much
+// as (fmodTime - time) * sampleRate demands, so audio stays locked to the
+// level's sim time (and to the encoder-consumed audio via time(): a slow
+// encoder stalls the mixer, it never races ahead).
+static geode::Hook* s_fmodUpdateHook = nullptr;
+
+void enableFmodUpdateHook(bool enable) {
+    if (s_fmodUpdateHook) {
+        if (enable) {
+            (void)s_fmodUpdateHook->enable();
+        } else {
+            (void)s_fmodUpdateHook->disable();
+        }
+    }
 }
 
 // v58.22 silicate parity: freeze the mixer at the very bottom of GD's audio
@@ -246,6 +275,20 @@ class $modify(CCEGLView) {
     }
 };
 
+// ===================== DEFERRED MUSIC RESTART CLEANUP =====================
+// begin() may arm a deferred song start when the level song is not prepared
+// yet. If the player leaves the level (PlayLayer gone) the armed flag would
+// otherwise stay set forever, and tickPendingMusicRestart() would log
+// AUDIO_DEFERRED_WAIT once per second for the rest of the session. Drop the
+// arm when the PlayLayer exits.
+class $modify(PlayLayer) {
+    $override
+    void onExit() {
+        skkbot2::render::disarmMusicRestart();
+        PlayLayer::onExit();
+    }
+};
+
 // ===================== AUDIO CAPTURE GATE =====================
 // While the renderer captures audio, FMOD runs on the offline NOSOUND_NRT
 // mixer advanced manually from drive() (Renderer::audioPump) at the level's
@@ -305,10 +348,18 @@ class $modify(FMODAudioEngine) {
 
 $execute {
     // Raw FMOD::System::update freeze (see FMODSystemUpdateHook above).
-    (void)Mod::get()->hook(
-        reinterpret_cast<void*>(
-            geode::addresser::getNonVirtual(&FMOD::System::update)),
+    auto addr = reinterpret_cast<void*>(
+        geode::addresser::getNonVirtual(&FMOD::System::update));
+    auto res = Mod::get()->hook(
+        addr,
         &skkbot2::render::FMODSystemUpdateHook,
         "FMOD::System::update",
         tulip::hook::TulipConvention::Stdcall);
+    if (res.isOk()) {
+        skkbot2::render::s_fmodUpdateHook = res.unwrap();
+        // Disabled by default so normal gameplay and editor use 100% vanilla FMOD
+        (void)skkbot2::render::s_fmodUpdateHook->disable();
+    } else {
+        skkbot2::log::error("Failed to hook FMOD::System::update: {}", res.unwrapErr());
+    }
 }

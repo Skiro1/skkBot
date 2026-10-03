@@ -6,6 +6,7 @@
 #include "core/broken_object_tracker.hpp"
 #include "core/physical_keys.hpp"
 #include "core/practice_fix_bridge.hpp"
+#include "core/playback_align.hpp"
 #include "hacks/physicsbypass.hpp"
 #include "trajectory/trajectory.hpp"
 
@@ -13,6 +14,12 @@
 #include <windows.h>
 #endif
 
+// Playback alignment helpers (position matching, tick baselines, coverage
+// tolerances) moved to core/playback_align.hpp so the editor playtest path can
+// reuse the exact logic that powers the PlayLayer attempt takeovers.
+using namespace skk::playback_align;
+
+#include <Geode/utils/casts.hpp>
 #include <Geode/modify/CheckpointObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
@@ -299,8 +306,15 @@ bool ReplayEngine::saveActiveMacro() {
             return false;
         }
 
-        activeSk->practiceFixCheckpoints = skk::bridge::captureRestorePointsToWire(
-            storedRestorePoints, activeSk->framerate > 0.0 ? activeSk->framerate : tickRate);
+        // Live restore points are authoritative when the level is still open.
+        // After a level exit, onQuit already materialized them into the macro
+        // and cleared the map (BUG-19); re-capturing then would overwrite the
+        // preserved set with an empty one and drop every practice-fix
+        // checkpoint recorded this session.
+        if (!storedRestorePoints.empty() || activeSk->practiceFixCheckpoints.empty()) {
+            activeSk->practiceFixCheckpoints = skk::bridge::captureRestorePointsToWire(
+                storedRestorePoints, activeSk->framerate > 0.0 ? activeSk->framerate : tickRate);
+        }
         skkbot2::log::info("P1 save: practiceFixCheckpoints written={}", activeSk->practiceFixCheckpoints.size());
 
         if (macroSaveInFlight) {
@@ -910,74 +924,138 @@ namespace {
             return nullptr;
         }
     };
+}
 
-    static int computePlaybackTick(PlayLayer* playLayer) {
-        if (!playLayer) {
-            return 0;
+bool ReplayEngine::tryLivePlaybackTakeover(GJBaseGameLayer* playLayer) {
+    if (!playLayer ||
+        !pendingPlaybackStart ||
+        engineMode != MODE_DISABLED ||
+        !skMode || !activeSk ||
+        activePersistencePlaybackAttempt()) {
+        return false;
+    }
+    auto* p = playLayer->m_player1;
+    if (!p || p->m_isDead || playLayer->m_levelEndAnimationStarted) {
+        return false;
+    }
+
+    const float refX = p->getPositionX();
+    const float refY = p->getPositionY();
+
+    int targetTick = -1;
+    if (auto* frames = activePerFrames(); frames && !frames->empty()) {
+        targetTick = matchRecordedTickByPositionXY(
+            *frames, refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
+    }
+    if (targetTick < 0) {
+        if (auto const* anchors = activeAnchors(); anchors && !anchors->empty()) {
+            targetTick = matchRecordedAnchorTickByPositionXY(
+                *anchors, refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
         }
-
-        auto* engine = ReplayEngine::get();
-        int tick = static_cast<int>(playLayer->m_gameState.m_levelTime * engine->runtimeTickRate());
-        return std::max(0, tick + 1);
+    }
+    if (targetTick < 0) {
+        // The player has not reached a spot the macro covers yet: keep waiting.
+        skkbot2::log::debug("PLAY takeover wait: live=({:.0f},{:.0f}) no recorded coverage within {}/{}px (x/y)",
+            refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
+        return false;
     }
 
-    static int computeStartPosTargetTick(PlayLayer* playLayer, std::vector<PlaybackAnchor> const& anchors) {
-        if (!playLayer->m_startPosObject || anchors.empty()) {
-            return 0;
+    // Found coverage: arm the engine exactly there. Unlike the reset path this
+    // does NOT resetLevel - the live run keeps its current attempt (no teleport).
+    if (!armExecutionState()) {
+        return false;
+    }
+    // The reset path re-asserts the recorded variance table under MODE_EXECUTE;
+    // a takeover arms from a live run, so do the same here.
+    applyVarianceOverrides();
+
+    const int baselineTick = playbackBaselineTick(playLayer, this);
+    tickOffset = targetTick - baselineTick;
+    startPosActive = true;
+    if (auto* a = activeAnchors(); a && !a->empty()) {
+        playbackAnchorIndex = findFirstAnchorAtTick(*a, targetTick);
+    }
+    if (auto* f = activePerFrames(); f && !f->empty()) {
+        perFramePlaybackIndex = findFirstPerFrameAtTick(*f, targetTick);
+    }
+    if (auto* il = activeSkInputs()) {
+        executeIndex = findFirstSkInputAtTick(*il, targetTick);
+    } else if (activeMacro) {
+        executeIndex = findFirstInputAtTick(activeMacro->inputs, targetTick);
+    }
+    if (auto* pl = typeinfo_cast<PlayLayer*>(playLayer); pl && pl->m_isPracticeMode) {
+        pl->togglePracticeMode(false);
+    }
+    clearStartPosWarning();
+    skkbot2::log::info("PLAY live takeover: live=({:.0f},{:.0f}) -> targetTick={} baseline={} offset={}",
+        refX, refY, targetTick, baselineTick, tickOffset);
+    return true;
+}
+
+bool ReplayEngine::coversPlaybackPosition(float refX, float refY,
+                                          float xTolerance, float yTolerance) {
+    if (!skMode || !activeSk) {
+        // Legacy macro path keeps the classic tick-0 playback; there are no
+        // position streams to test coverage against.
+        return true;
+    }
+    if (auto const* frames = activePerFrames(); frames && !frames->empty()) {
+        if (matchRecordedTickByPositionXY(*frames, refX, refY, xTolerance, yTolerance) >= 0) {
+            return true;
         }
-
-        float startX = playLayer->m_startPosObject->getPositionX();
-        float startY = playLayer->m_startPosObject->getPositionY();
-
-        constexpr float threshold = 50.0f;
-        for (auto const& anchor : anchors) {
-            float dx = anchor.player1.motion.position.x - startX;
-            float dy = anchor.player1.motion.position.y - startY;
-            float distance = std::sqrt(dx * dx + dy * dy);
-            if (distance < threshold) {
-                return anchor.tick;
-            }
+    }
+    if (auto const* anchors = activeAnchors(); anchors && !anchors->empty()) {
+        if (matchRecordedAnchorTickByPositionXY(*anchors, refX, refY, xTolerance, yTolerance) >= 0) {
+            return true;
         }
+    }
+    return false;
+}
 
-        int bestTick = 0;
-        float bestDistance = FLT_MAX;
-        for (auto const& anchor : anchors) {
-            float dx = std::abs(anchor.player1.motion.position.x - startX);
-            if (dx < bestDistance) {
-                bestDistance = dx;
-                bestTick = anchor.tick;
-            }
+void ReplayEngine::parkPlaybackPending() {
+    // A just-armed MODE_EXECUTE turned out to have an uncovered reset spawn.
+    // Drop back into the armed-waiting state (same shape requestExecutionStart
+    // produces) so the live takeover can arm when the player reaches the
+    // macro-covered route. No "PLAY session ended" epilogue - nothing ended.
+    pendingPlaybackStart = true;
+    initialRun = false;
+    levelRestarting = false;
+    anchorReconciliation = false;
+    perFrameReconciliation = false;
+    macroInputActive = false;
+    respawnTickIndex = -1;
+    tickAccumulator = 0.0f;
+    resetPlayDriftMeter();
+    resetSessionStepGridStat();
+    tickOffset = 0;
+    startPosActive = false;
+    resetTimingTracking();
+    resetDeferredInputState();
+    if (auto* playLayer = PlayLayer::get()) {
+        if (playLayer->m_player1) {
+            playLayer->m_player1->releaseAllButtons();
         }
-        return bestTick;
+        if (playLayer->m_player2) {
+            playLayer->m_player2->releaseAllButtons();
+        }
     }
-
-    static size_t findFirstInputAtTick(std::vector<MacroAction>& inputs, int tick) {
-        auto it = std::lower_bound(inputs.begin(), inputs.end(), tick, [](MacroAction const& action, int targetTick) {
-            return static_cast<int>(action.frame) < targetTick;
-        });
-        return static_cast<size_t>(std::distance(inputs.begin(), it));
+    Autoclicker::get()->reset();
+    endReplayAccuracyEnvironment();
+    executeIndex = 0;
+    playbackAnchorIndex = 0;
+    perFramePlaybackIndex = 0;
+    playbackExhaustionNotified = false;
+    engineMode = MODE_DISABLED;
+    flushPendingPersistenceCaptureAttempt();
+    clearPersistenceRuntimeState();
+    for (bool& state : activeButtons) {
+        state = false;
     }
-
-    static size_t findFirstSkInputAtTick(std::vector<SkInput>& inputs, int tick) {
-        auto it = std::lower_bound(inputs.begin(), inputs.end(), tick, [](SkInput const& input, int targetTick) {
-            return input.tick < targetTick;
-        });
-        return static_cast<size_t>(std::distance(inputs.begin(), it));
+    for (bool& state : priorButtonState) {
+        state = false;
     }
-
-    static size_t findFirstAnchorAtTick(std::vector<PlaybackAnchor> const& anchors, int tick) {
-        auto it = std::lower_bound(anchors.begin(), anchors.end(), tick, [](PlaybackAnchor const& anchor, int targetTick) {
-            return anchor.tick < targetTick;
-        });
-        return static_cast<size_t>(std::distance(anchors.begin(), it));
-    }
-
-    static size_t findFirstPerFrameAtTick(std::vector<SkPerFrame> const& frames, int tick) {
-        auto it = std::lower_bound(frames.begin(), frames.end(), tick, [](SkPerFrame const& frame, int targetTick) {
-            return frame.tick < targetTick;
-        });
-        return static_cast<size_t>(std::distance(frames.begin(), it));
-    }
+    resetRecordedHoldShadow();
+    refreshManualInputIgnoreState();
 }
 
 void ReplayEngine::runWithUnsavedMacroGuard(std::function<void()> continueAction, std::string message) {
@@ -1123,7 +1201,11 @@ class $modify(MacroPlayLayer, PlayLayer) {
         // respawns in practice never recreate the PlayLayer and keep reusing
         // the same object instances, so the registry still survives attempts.
         skk::advRandomClear();
-        return PlayLayer::init(level, useReplay, dontCreateObjects);
+        bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
+        if (engine && !engine->replayAccuracyEnvironmentActive) {
+            engine->syncAccuracyFromGame();
+        }
+        return ret;
     }
 
     void applyReplayResetState(bool inPractice, int tick) {
@@ -1163,7 +1245,30 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->respawnTickIndex = -1;
         engine->nextBoundaryIndex = 0;
         engine->tickAccumulator = 0.0f;
-        engine->armPendingPlaybackStart(this);
+        // PLAY was armed while the player was already in a live run (or queued
+        // outside the level): take over NOW only if the freshly reset spawn is
+        // actually covered by the recording. Otherwise keep waiting - the
+        // per-tick live takeover arms the moment the player reaches a covered
+        // spot. Never realign a raw spawn to a mid-run macro's first frames.
+        if (engine->pendingPlaybackStart && engine->engineMode != MODE_EXECUTE) {
+            float spawnX = m_startPosObject ? m_startPosObject->getPositionX()
+                                            : (m_player1 ? m_player1->getPositionX() : 0.f);
+            float spawnY = m_startPosObject ? m_startPosObject->getPositionY()
+                                            : (m_player1 ? m_player1->getPositionY() : 0.f);
+            const bool spawnCovered = engine->coversPlaybackPosition(
+                spawnX, spawnY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
+            if (spawnCovered || !engine->skMode) {
+                engine->armPendingPlaybackStart(this);
+            } else {
+                skkbot2::log::info(
+                    "PLAY armed-wait: respawn=({:.0f},{:.0f}) not covered by macro - waiting for live coverage "
+                    "(no reset align, no teleport)",
+                    spawnX, spawnY);
+                engine->clearStartPosWarning();
+            }
+        } else {
+            engine->armPendingPlaybackStart(this);
+        }
         if (engine->engineMode == MODE_CAPTURE) {
             bool fromStartPosition = skk::start_position::shouldRecordFromStartPosition(
                 m_startPosObject != nullptr,
@@ -1229,54 +1334,192 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 startPosMatch = std::sqrt(dx * dx + dy * dy) < 50.0f;
             }
 
-            skkbot2::log::info("PLAY attempt: practice={} progressPct={} levelTick={} startPos={} recStartPos={} match={} anchors={}",
+            // Non-standard-start support: the recording knows WHERE its timeline
+            // began. A macro whose first captured frame sits beyond this tick was
+            // recorded MID-RUN (the bot was armed while the player was already in
+            // the level) - its data does not cover the prefix a tick-0 timeline
+            // assumes, so playback must align by POSITION instead. Everything is
+            // derived from the saved streams (no wire-format change).
+            int recFirstTick = 0;
+            float recFirstX = 0.f, recFirstY = 0.f;
+            bool midRun = false;
+            if (engine->skMode && engine->activeSk) {
+                recFirstTick = static_cast<int>(engine->activeSk->recordFirstTick());
+                midRun = engine->activeSk->startedMidRun();
+                recFirstX = engine->activeSk->recordStartX();
+                recFirstY = engine->activeSk->recordStartY();
+            }
+
+            // Where the character stands right now: the start-pos object the
+            // player spawns at (if the level has one), else the live player
+            // position itself - the bot "understands" where the player is.
+            const bool haveRef = m_startPosObject != nullptr || m_player1 != nullptr;
+            float refX = m_startPosObject
+                ? m_startPosObject->getPositionX()
+                : (m_player1 ? m_player1->getPositionX() : 0.f);
+            float refY = m_startPosObject
+                ? m_startPosObject->getPositionY()
+                : (m_player1 ? m_player1->getPositionY() : 0.f);
+
+            // Coverage gate: refuse to start playback from a spawn the recording
+            // never covered. Previously a mid-run macro (data begins at tick ~2,
+            // far ahead of the world spawn) would tight->loose align a raw spawn
+            // X to its first frames - a ~900px catch-up that jarringly teleported
+            // the player backwards. If the spawn IS covered, proceed (alignment
+            // happens right there, seamless). Without coverage, park back into
+            // the armed-waiting state; the live takeover arms when the player
+            // reaches a covered position.
+            if (engine->skMode && !engine->activePersistencePlaybackAttempt() &&
+                !engine->coversPlaybackPosition(refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance)) {
+                skkbot2::log::info(
+                    "PLAY waiting: spawn=({:.0f},{:.0f}) not covered by macro - holding armed state (no teleport)",
+                    refX, refY);
+                engine->parkPlaybackPending();
+                return;
+            }
+
+            skkbot2::log::info("PLAY attempt: practice={} progressPct={} levelTick={} ref=({:.0f},{:.0f}) "
+                    "startPos={} recStartPos={} match={} midRun={} recOrigin=[tick={} ({:.0f},{:.0f})] anchors={}",
                 inPractice, tick, computePlaybackTick(this),
+                refX, refY,
                 m_startPosObject != nullptr, recordedFromStartPos, startPosMatch,
+                midRun, recFirstTick, recFirstX, recFirstY,
                 anchors ? static_cast<unsigned long long>(anchors->size()) : 0);
 
-            if (m_startPosObject && startPosMatch) {
-                engine->tickOffset = 0;
+            constexpr float kAlignTight = 120.0f;
+            constexpr float kAlignLoose = 500.0f;
+
+            // Position-aware timeline alignment: find the recorded frame whose p1
+            // X best matches the player's spawn and re-anchor the playback there
+            // (tickOffset + per-frame/anchor/input cursors). Skips persistence
+            // chain playback (its segments use run-local ticks) and legacy macros
+            // (no position streams). Returns false when the recording has no
+            // coverage near the reference X.
+            auto alignByPosition = [&](float alignRefX, float alignRefY) -> bool {
+                if (!engine->skMode || engine->activePersistencePlaybackAttempt() || !haveRef) {
+                    return false;
+                }
+                int targetTick = -1;
+                if (auto* framesStream = engine->activePerFrames();
+                    framesStream && !framesStream->empty()) {
+                    targetTick = matchRecordedTickByPosition(*framesStream, alignRefX, kAlignTight);
+                    if (targetTick < 0) {
+                        targetTick = matchRecordedTickByPosition(*framesStream, alignRefX, kAlignLoose);
+                    }
+                }
+                if (targetTick < 0) {
+                    if (auto const* anchorStream = engine->activeAnchors();
+                        anchorStream && !anchorStream->empty()) {
+                        targetTick = matchRecordedAnchorTickByPosition(*anchorStream, alignRefX, kAlignTight);
+                        if (targetTick < 0) {
+                            targetTick = matchRecordedAnchorTickByPosition(*anchorStream, alignRefX, kAlignLoose);
+                        }
+                    }
+                }
+                if (targetTick < 0) {
+                    return false;
+                }
+
+                const int baselineTick = playbackBaselineTick(this, engine);
+                engine->tickOffset = targetTick - baselineTick;
                 engine->startPosActive = true;
-                if (anchors && !anchors->empty()) {
-                    engine->playbackAnchorIndex = findFirstAnchorAtTick(*anchors, 0);
-                } else {
-                    engine->playbackAnchorIndex = 0;
+                if (auto* a = engine->activeAnchors(); a && !a->empty()) {
+                    engine->playbackAnchorIndex = findFirstAnchorAtTick(*a, targetTick);
                 }
-                if (engine->skMode) {
-                    // Seek in the stream that will ACTUALLY play (chain link
-                    // during persistence playback, main otherwise), not
-                    // blindly in main's array.
-                    if (auto* frames = engine->activePerFrames()) {
-                        engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*frames, 0);
-                    }
+                if (auto* f = engine->activePerFrames(); f && !f->empty()) {
+                    engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*f, targetTick);
                 }
-                if (engine->skMode && engine->activeSk) {
-                    engine->executeIndex = 0;
-                } else if (engine->activeMacro) {
-                    engine->executeIndex = 0;
-                }
-                engine->clearStartPosWarning();
-            } else if (m_startPosObject && anchors && !anchors->empty()) {
-                int targetTick = computeStartPosTargetTick(this, *anchors);
-                int currentTick = computePlaybackTick(this);
-                engine->tickOffset = targetTick - currentTick;
-                engine->startPosActive = true;
-                engine->playbackAnchorIndex = findFirstAnchorAtTick(*anchors, targetTick);
-                if (engine->skMode) {
-                    if (auto* frames = engine->activePerFrames()) {
-                        engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*frames, targetTick);
-                    }
-                }
-                if (engine->skMode && engine->activeSk) {
-                    if (auto* inputList = engine->activeSkInputs()) {
-                        engine->executeIndex = findFirstSkInputAtTick(*inputList, targetTick);
-                    } else {
-                        engine->executeIndex = 0;
-                    }
+                if (auto* il = engine->activeSkInputs()) {
+                    engine->executeIndex = findFirstSkInputAtTick(*il, targetTick);
                 } else if (engine->activeMacro) {
                     engine->executeIndex = findFirstInputAtTick(engine->activeMacro->inputs, targetTick);
                 }
+                skkbot2::log::info("PLAY position-aligned: ref=({:.0f},{:.0f}) -> targetTick={} baseline={} offset={}",
+                    alignRefX, alignRefY, targetTick, baselineTick, engine->tickOffset);
                 engine->clearStartPosWarning();
+                return true;
+            };
+
+            if (m_startPosObject && startPosMatch) {
+                // The player uses the exact SP the macro was recorded from.
+                // When the recording's data begins at tick 0 the world spawn IS
+                // the macro start: classic tick-0 alignment. A MID-RUN recording
+                // begins several frames AFTER that spawn, so tick-0 would replay
+                // the missing prefix blind - align by position instead.
+                if (!midRun) {
+                    engine->tickOffset = 0;
+                    engine->startPosActive = true;
+                    if (anchors && !anchors->empty()) {
+                        engine->playbackAnchorIndex = findFirstAnchorAtTick(*anchors, 0);
+                    } else {
+                        engine->playbackAnchorIndex = 0;
+                    }
+                    if (engine->skMode) {
+                        // Seek in the stream that will ACTUALLY play (chain link
+                        // during persistence playback, main otherwise), not
+                        // blindly in main's array.
+                        if (auto* frames = engine->activePerFrames()) {
+                            engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*frames, 0);
+                        }
+                    }
+                    if (engine->skMode && engine->activeSk) {
+                        engine->executeIndex = 0;
+                    } else if (engine->activeMacro) {
+                        engine->executeIndex = 0;
+                    }
+                    engine->clearStartPosWarning();
+                } else if (!alignByPosition(refX, refY)) {
+                    skkbot2::log::warn("PLAY aborted: macro recorded from start position ({:.0f},{:.0f}) but data begins "
+                                       "MID-RUN at tick {} p1=({:.0f},{:.0f}) and the player's spawn ({:.0f},{:.0f}) has no "
+                                       "recorded coverage - start from the spot where recording began or re-record "
+                                       "from the level start",
+                        recStartX, recStartY, recFirstTick, recFirstX, recFirstY, refX, refY);
+                    engine->setStartPosWarningKey("Macro was recorded mid-run. Start playback from the position where recording began, or re-record from the level start.");
+                    engine->haltExecution();
+                }
+            } else if (m_startPosObject && anchors && !anchors->empty()) {
+                if (engine->activePersistencePlaybackAttempt()) {
+                    // Chain segments use run-local ticks; their own reset path
+                    // restores cursors. Skip position alignment entirely.
+                    engine->tickOffset = 0;
+                    engine->startPosActive = false;
+                    engine->clearStartPosWarning();
+                } else {
+                    int targetTick = matchStartPosTargetTick(engine, *anchors, refX, refY);
+                    if (targetTick < 0) {
+                        // A start pos the recording never covered within the
+                        // tight window: park back into the armed wait - the live
+                        // takeover arms the moment the player reaches a covered
+                        // spot (no teleport, per spec).
+                        skkbot2::log::info(
+                            "PLAY startpos wait: spawn=({:.0f},{:.0f}) not on recorded route (within {}/{}) - "
+                            "holding armed state until live coverage",
+                            refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
+                        engine->parkPlaybackPending();
+                        return;
+                    }
+                    const int baselineTick = playbackBaselineTick(this, engine);
+                    engine->tickOffset = targetTick - baselineTick;
+                    engine->startPosActive = true;
+                    engine->playbackAnchorIndex = findFirstAnchorAtTick(*anchors, targetTick);
+                    if (engine->skMode) {
+                        if (auto* frames = engine->activePerFrames()) {
+                            engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*frames, targetTick);
+                        }
+                    }
+                    if (engine->skMode && engine->activeSk) {
+                        if (auto* inputList = engine->activeSkInputs()) {
+                            engine->executeIndex = findFirstSkInputAtTick(*inputList, targetTick);
+                        } else {
+                            engine->executeIndex = 0;
+                        }
+                    } else if (engine->activeMacro) {
+                        engine->executeIndex = findFirstInputAtTick(engine->activeMacro->inputs, targetTick);
+                    }
+                    engine->clearStartPosWarning();
+                    skkbot2::log::info("PLAY startpos-aligned: spawn=({:.0f},{:.0f}) -> targetTick={} baseline={} offset={}",
+                        refX, refY, targetTick, baselineTick, engine->tickOffset);
+                }
             } else if (!m_startPosObject && recordedFromStartPos && !recordedAtLevelStart) {
                 skkbot2::log::warn("PLAY aborted: macro recorded from start position ({:.0f},{:.0f}) but the "
                                     "session has none - playback from raw spawn would diverge at tick 1; "
@@ -1293,6 +1536,22 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 engine->tickOffset = 0;
                 engine->startPosActive = false;
                 engine->clearStartPosWarning();
+
+                // Generalized non-standard-start support: re-anchor the timeline
+                // to wherever the character actually stands. This is what makes a
+                // MID-RUN recording playable (record with the bot already in the
+                // level, then start playback from the same spot) and lets a
+                // from-start macro be played from any later position.
+                const bool positionAligned = alignByPosition(refX, refY);
+                if (!positionAligned && midRun) {
+                    skkbot2::log::warn("PLAY aborted mid-run macro: data starts at tick {} p1=({:.0f},{:.0f}) but the "
+                                       "player's position ({:.0f},{:.0f}) has no recorded coverage - start playback "
+                                       "from the position where recording began or re-record from the level start",
+                        recFirstTick, recFirstX, recFirstY, refX, refY);
+                    engine->setStartPosWarningKey("Macro was recorded mid-run. Start playback from the position where recording began, or re-record from the level start.");
+                    engine->haltExecution();
+                }
+
                 // Playback continuity across a practice checkpoint respawn (or
                 // a PLAY armed while the player is already past the start):
                 // recorded perFrame/input/anchor streams start at the level
@@ -1303,8 +1562,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 // data and pin the player far from the live respawn position
                 // (massive drift, portal section teleports). Seek every
                 // playback cursor to the first record at/after the current
-                // checkpoint levelTime tick and continue from there.
-                if (engine->skMode && !engine->activePersistencePlaybackAttempt()) {
+                // checkpoint levelTime tick and continue from there. Skipped
+                // when position alignment already placed the cursors.
+                if (!positionAligned && engine->skMode && !engine->activePersistencePlaybackAttempt()) {
                     int respawnTick = computePlaybackTick(this);
                     // BUG-06: `computePlaybackTick` returns the game-time label
                     // (m_levelTime*tickRate), but the recorded streams are
@@ -1379,6 +1639,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
         engine->stepPairCount = 0;  // step clock restarts with the attempt
+        engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
         engine->pinSetupSeedBeforeReset();
         resetSimulationTimingState();
@@ -1402,6 +1663,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
         engine->stepPairCount = 0;  // step clock restarts with the attempt
+        engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
         engine->pinSetupSeedBeforeReset();
         resetSimulationTimingState();
@@ -1458,6 +1720,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 // restored level time (1 call == 1 sub-step by definition).
                 engine->stepPairCount = std::max(0, static_cast<int>(
                     m_gameState.m_levelTime * engine->runtimeTickRate()));
+                engine->stepPairFrac = 0.0;
                 engine->captureReleaseSuppressUntil = engine->stepPairCount + 9;
                 engine->captureIgnored = false;
                 resetSimulationTimingState();
@@ -1482,6 +1745,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
             // checkpoint label. Re-assert the label AFTER vanilla finished.
             engine->captureIgnored = true;
             engine->stepPairCount = std::max(0, it->second.priorTick - 1);
+            engine->stepPairFrac = 0.0;
             engine->lastTickIndex = it->second.priorTick;
             engine->restoreLockedRngState(it->second.rng.fastRandState);
 
@@ -1555,6 +1819,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
             clearRestoredHolds(m_player2);
 
             engine->stepPairCount = std::max(0, it->second.priorTick - 1);
+            engine->stepPairFrac = 0.0;
             engine->lastTickIndex = it->second.priorTick;
             engine->captureReleaseSuppressUntil = it->second.priorTick + 8;
             engine->captureIgnored = false;
@@ -1626,6 +1891,7 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
                 engine->prepareCaptureRestore(ref.priorTick);
                 engine->captureIgnored = true;
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
+                engine->stepPairFrac = 0.0;
                 engine->lastTickIndex = ref.priorTick;
                 engine->restoreLockedRngState(ref.rng.fastRandState);
 
@@ -1658,6 +1924,7 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
                 pushPhysicalHolds();
 
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
+                engine->stepPairFrac = 0.0;
                 engine->lastTickIndex = ref.priorTick;
                 engine->captureReleaseSuppressUntil = ref.priorTick + 8;
                 engine->captureIgnored = false;
@@ -1899,6 +2166,23 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
                 engine->disablePersistenceModeSafeguard();
             }
             skk::advRandomClear();
+            // The level exit discards the live checkpoint map, but the macro
+            // stays in memory and remains saveable from the menu. The save
+            // path (saveActiveMacro) reads storedRestorePoints, which would
+            // otherwise be gone by the time the user clicks Save in the GUI,
+            // silently dropping every practice-fix checkpoint recorded this
+            // session (BUG-19). Materialize them into the macro now so the
+            // pending save still sees them.
+            if (engine->engineMode == MODE_CAPTURE && !editorPlaytest
+                && engine->skMode && engine->activeSk
+                && !engine->storedRestorePoints.empty()) {
+                engine->activeSk->practiceFixCheckpoints = skk::bridge::captureRestorePointsToWire(
+                    engine->storedRestorePoints,
+                    engine->activeSk->framerate > 0.0 ? engine->activeSk->framerate : engine->tickRate);
+                skkbot2::log::info(
+                    "P1 quit: preserved practiceFixCheckpoints into macro (count={})",
+                    engine->activeSk->practiceFixCheckpoints.size());
+            }
             engine->storedRestorePoints.clear();
             engine->practiceFixQueue.clear();
             BrokenObjectTracker::get().clear();

@@ -9,6 +9,7 @@
 #include "core/noclip_accuracy.hpp"
 #include "core/replay_timing.hpp"
 #include "core/rng_lock.hpp"
+#include "core/gameplay_layer.hpp"
 #include "hacks/autoclicker.hpp"
 #include "trajectory/trajectory.hpp"
 #include "render/renderer.hpp"
@@ -17,6 +18,7 @@
 #include <Geode/loader/Loader.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -103,9 +105,10 @@ public:
     };
 
     static constexpr double kBaseTickRate = 240.0;
+    // Trajectory overlay length is a fixed constant — no user control. These
+    // bounds belong to the separate pathLength (replay path) helper below.
+    static constexpr int kTrajectoryLengthDefault = 300;
     static constexpr int kTrajectoryLengthMin = 1;
-    static constexpr int kTrajectoryLengthDefault = 312;
-    static constexpr int kTrajectoryLengthSliderMax = 2400;
     static constexpr int kTrajectoryLengthMax = 60000;
     static constexpr int kTrajectoryPredictionStepMax = 250000;
 
@@ -118,7 +121,13 @@ public:
     // multi-MB .skk serialization+zstd+disk write happens off the game thread
     // (a synchronous save visibly hitched the game); completion posts back to
     // the main thread, and this flag is only ever touched there.
-    bool macroSaveInFlight = false;
+    std::atomic<bool> macroSaveInFlight{false};
+
+    // True while the async save worker is still compressing+writing. The GUI
+    // reads this to keep the RECORD button from being re-pressed mid-save (a
+    // several-MB macro takes long enough that a double-click would otherwise
+    // queue a second capture over the one already being flushed).
+    bool macroSaveBusy() const { return macroSaveInFlight.load(std::memory_order_acquire); }
 
     float tickAccumulator = 0.f;
 
@@ -168,11 +177,35 @@ public:
 
     bool safeMode = false;
     bool persistenceMode = false;
+
+    // TRAJECTORY overlay (RECORD tab): predicts the flight path by running GD's
+    // own physics on hidden fake players — one line per player holding the jump
+    // button, one releasing it (GDH / Neverhook / EclipseMenu approach).
+    // Visual only: the trace suppresses every world-mutating call and restores
+    // what it touched. The length is kTrajectoryLengthDefault, not a setting.
     bool showTrajectory = false;
+
+    // WAVE TRAIL FIX (drag-fix + draw-fix, always-on, visual only):
+    // waveTrailFix is the master switch. dragFix rebuilds the streak geometry
+    // every update (vanilla only adds points on collision, so noclipping or
+    // fast vertical snaps leave gaps / stray lines); drawFix replaces the
+    // vanilla stroke renderer with a miter-joined band that can be tinted and
+    // given an opacity, and adds an outline sub-part.
+    bool waveTrailFix = true;
+    bool waveTrailDragFix = true;
+    bool waveTrailDrawFix = true;
+    bool waveTrailColorOverride = false;
+    float waveTrailColorR = 1.0f;
+    float waveTrailColorG = 1.0f;
+    float waveTrailColorB = 1.0f;
+    float waveTrailOpacity = 1.0f;
+    float waveTrailOutlineOpacity = 0.65f;
+    bool waveTrailEditor = true;
     bool trajectoryBothSides = false;
     bool creatingTrajectory = false;
 
     bool showHitboxes = false;
+    bool hitboxFill = false;
     bool hitboxOnDeath = false;
     bool noclipHitboxOnDeath = false;
     bool hitboxTrail = false;
@@ -294,6 +327,12 @@ public:
     // live on - immune to levelTime-vs-step phase drift. Reset per attempt.
     bool stepClock = false;
     int stepPairCount = 0;
+    // Editor-playtest cadence compensation: GD funnels processCommands at
+    // ~180/s with dt=1/180 there (not 240/s @ dt=1/240 like a PlayLayer),
+    // so one call is NOT one macro tick. The step clock advances by
+    // dt*tickRate instead of +1 to keep the playback grid locked to the
+    // level's game time; this fraction holds the sub-tick remainder.
+    double stepPairFrac = 0.0;
     // Periodic phase-grid visibility (every ~10s of sim time) for logs.
     int phaseSampleCounter = 0;
     // Sample window per session: reset at session start so a window never
@@ -322,6 +361,14 @@ public:
     int playDriftMaxTick = -1;
     int playDriftLastLogTick = -100000;
     int playDriftLastSampleTick = -100000;
+    // Rendered-drift meter (VISIBLE residual): sampled at isLastTick AFTER the
+    // whole pin+physics+reconcile cycle, i.e. what the eye actually renders
+    // against the recorded frame for the same effective tick. Unlike
+    // playDriftMax (which reads pre-reconcile preP1x and always shows the
+    // ±1.95px phase saw), this excludes the measurement artifact.
+    float renderDriftMax = 0.0f;
+    int renderDriftMaxTick = -1;
+    int renderDriftLastLogTick = -100000;
     // Seam-recovery glide (BUG-06): a recording seam (practice death/restart
     // stitched into the per-frame stream) produces a physically-impossible jump
     // with NO portal object nearby. Snapping the player across it in one tick
@@ -459,6 +506,10 @@ public:
     bool startPosWarningIsKey = false;
 
     std::vector<std::string> storedMacros;
+    // Bumped by every reloadMacroList() disk scan so shells can cheaply re-sync
+    // their cached macro list once an async scan (e.g. after a save lands on
+    // the worker thread) has refreshed the engine's storedMacros.
+    uint32_t macroListVersion = 0;
     std::unordered_set<std::string> incompatibleMacros;
     std::unordered_set<std::string> cbsMacros;
     std::unordered_set<std::string> platformerMacros;
@@ -520,6 +571,7 @@ public:
     }
 
     void reloadMacroList() {
+        ++macroListVersion;
         storedMacros.clear();
         incompatibleMacros.clear();
         cbsMacros.clear();
@@ -601,6 +653,7 @@ public:
 
     // Loads a .skk macro by name from the replays dir into memory (no playback).
     bool loadMacroFromName(std::string const& name) {
+        if (engineMode != MODE_DISABLED) return false;
         if (name.empty()) return false;
         namespace fs = std::filesystem;
         auto dir = Mod::get()->getSaveDir() / "replays";
@@ -679,6 +732,7 @@ public:
         // v4: every new capture runs on the GD physics-step label grid.
         stepClock = true;
         stepPairCount = 0;
+        stepPairFrac = 0.0;
         resetTimingTracking();
         resetSessionStepGridStat();
         resetRecordedHoldShadow();
@@ -816,6 +870,7 @@ public:
         // Follow the macro's own clock declaration (legacy files = time grid).
         stepClock = skMode && activeSk ? activeSk->usesStepClock : false;
         stepPairCount = 0;
+        stepPairFrac = 0.0;
         executeIndex = 0;
         playbackAnchorIndex = 0;
         perFramePlaybackIndex = 0;
@@ -1070,7 +1125,25 @@ public:
         }
 
         auto* playLayer = PlayLayer::get();
-        if (!playLayer || fastPlayback) {
+        if (fastPlayback) {
+            return beginExecutionImmediate();
+        }
+        if (!playLayer) {
+            if (skk::gameplay::isEditorPlaytest()) {
+                // PLAY pressed while ALREADY inside an editor playtest: arm in
+                // place, then park so the LIVE position drives the takeover
+                // (the player is mid-flight, not at a spawn - re-aligning to a
+                // spawn would fake a backwards teleport).
+                if (!armExecutionState()) {
+                    engineMode = MODE_DISABLED;
+                    return false;
+                }
+                applyVarianceOverrides();
+                parkPlaybackPending();
+                return true;
+            }
+            // Editor build mode (or menu): arm now; the playtest-start hook
+            // performs the spawn alignment when physics begins.
             return beginExecutionImmediate();
         }
 
@@ -1101,6 +1174,27 @@ public:
         return armExecutionState();
     }
 
+    // Live-playback takeover (PLAY pressed while the player is mid-run): the
+    // engine is sitting in the armed-waiting state (pendingPlaybackStart true,
+    // MODE_DISABLED). Each tick we check whether the recording actually covers
+    // the player's CURRENT spot (X AND Y proximity, so the takeover is seamless);
+    // on the first covered tick we arm MODE_EXECUTE IN PLACE - no resetLevel,
+    // no realignment to the macro's first frames, no backwards teleport.
+    bool tryLivePlaybackTakeover(GJBaseGameLayer* playLayer);
+
+    // True when the recording has a frame/anchor within the given X/Y
+    // tolerances of (refX, refY). Used to refuse starting playback from a spot
+    // the macro never covered, instead of tight->loose aligning a raw spawn to
+    // a mid-run macro's first frames (the ~900px PLAY teleport).
+    bool coversPlaybackPosition(float refX, float refY,
+                                float xTolerance, float yTolerance);
+
+    // Transition from a just-armed MODE_EXECUTE state back into the
+    // armed-waiting state (pendingPlaybackStart true, MODE_DISABLED) when the
+    // reset spawn turned out to be uncovered by the recording. Keeps the macro
+    // loaded so the live takeover can arm once the player reaches covered ground.
+    void parkPlaybackPending();
+
     void haltExecution() {
         if (engineMode == MODE_CAPTURE) {
             captureVarianceSnapshot();
@@ -1110,9 +1204,10 @@ public:
                     activeSk->persistenceAttempts.size(), activeSk->varianceOverrides.size());
             }
         } else if (engineMode == MODE_EXECUTE && activeSk) {
-            skkbot2::log::info("PLAY session ended: consumed {}/{} inputs, maxDrift {:.2f}px@{}, "
+            skkbot2::log::info("PLAY session ended: consumed {}/{} inputs, maxDrift {:.2f}px@{}, maxRenderDrift {:.2f}px@{}, "
                                "slice-skips={}, cbs[imm={},queue={},wait={}]",
                 executeIndex, activeSk->inputs.size(), playDriftMax, playDriftMaxTick,
+                renderDriftMax, renderDriftMaxTick,
                 processSliceSkips, cbsImmediateCount, cbsQueueNativeCount, cbsWaitCount);
         }
         // Step-grid session epilogue: audit plan/step/resume counts.
@@ -1171,6 +1266,9 @@ public:
         playDriftMax = 0.0f;
         playDriftMaxTick = -1;
         playDriftLastLogTick = -100000;
+        renderDriftMax = 0.0f;
+        renderDriftMaxTick = -1;
+        renderDriftLastLogTick = -100000;
         playDriftLastSampleTick = -100000;
         seamGlideUntilTick = -1;
         rngStreamMismatchReports = 0;
@@ -1385,6 +1483,18 @@ public:
         return mode == AccuracyMode::CBS ? AccuracyMode::CBS : AccuracyMode::Vanilla;
     }
 
+    void syncAccuracyFromGame() {
+        if (replayAccuracyEnvironmentActive) {
+            return;
+        }
+        if (auto* gameManager = GameManager::get()) {
+            bool cbs = gameManager->getGameVariable("0177");
+            bool cos = gameManager->getGameVariable("0176");
+            selectedAccuracyMode = cbs ? AccuracyMode::CBS : AccuracyMode::Vanilla;
+            cosEnabled = cos;
+        }
+    }
+
     static void applyRuntimeAccuracyMode(AccuracyMode mode, bool cosEnabled) {
         mode = runtimeAccuracyModeFor(mode);
         bool enabled = mode == AccuracyMode::CBS;
@@ -1469,6 +1579,18 @@ public:
         hasSavedLayerClickBetweenSteps = false;
         hasSavedLayerClickOnSteps = false;
         replayAccuracyEnvironmentActive = false;
+    }
+
+    // Hand the tick rate back to the menu's own setting WITHOUT ending the
+    // replay's accuracy environment — the TPS toggle in the GUI uses this when
+    // the user turns it off mid-playback, so the clock returns to whatever the
+    // menu declared at arm time (the "тот TPS что был в меню" behaviour) while
+    // CBS / click-between-steps stay engaged for the running replay.
+    void dropPlaybackTickRateOverride() {
+        if (playbackTickRateOverrideActive) {
+            tickRate = savedPlaybackTickRate;
+            playbackTickRateOverrideActive = false;
+        }
     }
 
     double runtimeTickRate() const {

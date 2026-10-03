@@ -130,7 +130,7 @@ struct SkPracticeFixCheckpoint {
     double p1_gameModeChangedTime = 0.0, p1_lastLandTime = 0.0;
     int32_t p1_lastCollisionBottom = 0, p1_lastCollisionTop = 0;
     int32_t p1_lastCollisionLeft = 0, p1_lastCollisionRight = 0;
-    int32_t p1_stateOnGround = 0, p1_stateForce = 0, p1_reverseRelated = 0;
+    int32_t p1_stateOnGround = 0, p1_stateForce = 0, p1_stateFlipGravity = 0, p1_reverseRelated = 0;
     uint64_t p1_flags1 = 0, p1_flags2 = 0;
     bool p1_holdingRight = false, p1_holdingLeft = false;
     // Full P2 state
@@ -157,7 +157,7 @@ struct SkPracticeFixCheckpoint {
     double p2_gameModeChangedTime = 0.0, p2_lastLandTime = 0.0;
     int32_t p2_lastCollisionBottom = 0, p2_lastCollisionTop = 0;
     int32_t p2_lastCollisionLeft = 0, p2_lastCollisionRight = 0;
-    int32_t p2_stateOnGround = 0, p2_stateForce = 0, p2_reverseRelated = 0;
+    int32_t p2_stateOnGround = 0, p2_stateForce = 0, p2_stateFlipGravity = 0, p2_reverseRelated = 0;
     uint64_t p2_flags1 = 0, p2_flags2 = 0;
     bool p2_holdingRight = false, p2_holdingLeft = false;
 
@@ -305,6 +305,43 @@ public:
     // Practice-restart boundary reseeds (see SkRngBoundary). Playback re-applies
     // each entry's LCG reseed when the run crosses its tick.
     std::vector<SkRngBoundary> rngBoundaries;
+
+    // Non-standard-start support. The recording knows WHERE its timeline began:
+    // the tick (and p1 world position) of the very first captured frame. A macro
+    // whose origin is beyond this threshold was recorded MID-RUN (the bot was
+    // armed while the player was already in the level), so its data does not
+    // cover the prefix a tick-0 timeline assumes. Playback aligns such macros by
+    // POSITION instead of by tick. Everything is derived from the saved streams
+    // (perFrames are the densest ground truth), so no wire-format change.
+    static constexpr int kMidRunStartTickThreshold = 120;
+
+    int64_t recordFirstTick() const {
+        int64_t first = -1;
+        if (!perFrames.empty()) first = perFrames.front().tick;
+        if (!anchors.empty()) {
+            first = first < 0 ? anchors.front().tick
+                              : std::min<int64_t>(first, anchors.front().tick);
+        }
+        if (!inputs.empty()) {
+            first = first < 0 ? inputs.front().tick
+                              : std::min<int64_t>(first, inputs.front().tick);
+        }
+        return first < 0 ? 0 : first;
+    }
+
+    bool startedMidRun() const { return recordFirstTick() > kMidRunStartTickThreshold; }
+
+    float recordStartX() const {
+        if (!perFrames.empty()) return perFrames.front().p1x;
+        if (!anchors.empty()) return anchors.front().player1.motion.position.x;
+        return startPosX;
+    }
+
+    float recordStartY() const {
+        if (!perFrames.empty()) return perFrames.front().p1y;
+        if (!anchors.empty()) return anchors.front().player1.motion.position.y;
+        return startPosY;
+    }
 
     bool loadedFromSKK3() const { return fileFormat == SkFileFormat::SKK3; }
     double maxSourceTps() const;

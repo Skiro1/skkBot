@@ -12,16 +12,19 @@ include(CTest)
 # skkBot2 M1 sources: record/play engine (SKK3) + physics bypass/TPS + native
 # imGui GUI. Everything else from the original skkBot tree was pruned
 # per the skkBot2 spec; pruned modules that the engine still references are
-# provided as no-op stubs (see src/{lang,trajectory,render,hacks}/...).
+# provided as no-op stubs (see src/{lang,render,hacks}/...).
 set(SKKBOT2_SOURCES
     src/main.cpp
     src/gui/skkbot_gui.cpp
+    src/gui/beta_gui.cpp
+    src/gui/blur.cpp
     src/format/skk_format.cpp
     src/format/skk3_format.cpp
     src/format/codec.cpp
     src/core/checkpoint_handler.cpp
     src/core/replay_engine.cpp
     src/core/checkpoint_system.cpp
+    src/core/editor_playback.cpp
     src/core/full_player_checkpoint.cpp
     src/core/practice_fix_bridge.cpp
     src/core/frame_stepper.cpp
@@ -31,6 +34,9 @@ set(SKKBOT2_SOURCES
     src/hooks/rng_hooks.cpp
     src/hacks/physicsbypass.cpp
     src/hacks/render_hooks.cpp
+    src/hacks/wave_trail_fix.cpp
+    src/hacks/hitboxes.cpp
+    src/hacks/trajectory.cpp
     src/physics/step_grid_hooks.cpp
     src/logger/logger.cpp
 )
@@ -85,7 +91,6 @@ CPMAddPackage(
 target_include_directories(${PROJECT_NAME} PRIVATE ${gd-imgui-cocos_SOURCE_DIR}/src)
 
 # zstd: needed by SKK3 payload compression.
-include(FetchContent)
 FetchContent_Declare(
     zstd
     GIT_REPOSITORY https://github.com/facebook/zstd.git

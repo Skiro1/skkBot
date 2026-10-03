@@ -1,4 +1,6 @@
-﻿#include "gui/skkbot_gui.hpp"
+#include "gui/skkbot_gui.hpp"
+#include "gui/beta_actions.hpp"
+#include "gui/beta_gui.hpp"
 
 #include "skkBot.hpp"
 #include "logger/logger.hpp"
@@ -38,6 +40,7 @@ void Gui::init() {
     showFeatures = true;
     showMacroList = false;
     menuKeybind = mod->getSavedValue<int>("menu_keybind", 0xA5);
+    useBetaGui = mod->getSavedValue<bool>("gui_use_beta", true);
 
     if (mod->getSavedValue<bool>("gui_show_features", true)) {
         showFeatures = true;
@@ -48,22 +51,48 @@ void Gui::init() {
     // Features window settings.
     engine->tickRate = 240.0;
     tpsEnabled = mod->getSavedValue<bool>("gui_tps_enabled", false);
-    tpsValue = std::clamp(mod->getSavedValue<double>("gui_tps_value", 240.0), 10.0, 1000.0);
+    tpsValue = std::clamp(mod->getSavedValue<double>("gui_tps_value", 240.0), 1.0, 1000000.0);
     engine->tickRate = tpsEnabled ? tpsValue : 240.0;
     engine->gameSpeed = 1.0;
     speedhackEnabled = mod->getSavedValue<bool>("gui_speedhack_enabled", false);
     speedhackValue =
-        std::clamp(mod->getSavedValue<double>("gui_speedhack_value", 1.0), 0.01, 10.0);
+        std::max(0.01, mod->getSavedValue<double>("gui_speedhack_value", 1.0));
     engine->gameSpeed = speedhackEnabled ? speedhackValue : 1.0;
     // RNG seed is fixed (100) in the engine now - no saved value, no widget.
     engine->collisionBypass = mod->getSavedValue<bool>("gui_noclip", false);
     engine->noclipPlayer1 = mod->getSavedValue<bool>("gui_noclip_p1", true);
     engine->noclipPlayer2 = mod->getSavedValue<bool>("gui_noclip_p2", true);
     engine->noclipDeathFlash = mod->getSavedValue<bool>("gui_noclip_flash", false);
+
+    // HITBOX OVERLAY — visual-only collision-box debug draw (see
+    // src/hacks/hitboxes.cpp). Off by default; toggled from the RECORD tab.
+    engine->showHitboxes = mod->getSavedValue<bool>("gui_hitboxes", false);
+    engine->hitboxFill = mod->getSavedValue<bool>("gui_hitbox_fill", false);
+
+    // TRAJECTORY overlay (RECORD tab) — off by default, it simulates physics
+    // every frame while on. See src/hacks/trajectory.cpp. The length is a
+    // compile-time constant (ReplayEngine::kTrajectoryLengthDefault); there is
+    // no setting to restore.
+    engine->showTrajectory = mod->getSavedValue<bool>("gui_trajectory", false);
+
+    // WAVE TRAIL FIX — always-on visual-only trail rework (drag-fix +
+    // draw-fix). Defaults to on, like the reference mods.
+    engine->waveTrailFix = mod->getSavedValue<bool>("gui_wavetrail", true);
+    engine->waveTrailDragFix = mod->getSavedValue<bool>("gui_wavetrail_drag", true);
+    engine->waveTrailDrawFix = mod->getSavedValue<bool>("gui_wavetrail_draw", true);
+    engine->waveTrailColorOverride = mod->getSavedValue<bool>("gui_wavetrail_color_override", false);
+    engine->waveTrailColorR = std::clamp(mod->getSavedValue<float>("gui_wavetrail_color_r", 1.0f), 0.0f, 1.0f);
+    engine->waveTrailColorG = std::clamp(mod->getSavedValue<float>("gui_wavetrail_color_g", 1.0f), 0.0f, 1.0f);
+    engine->waveTrailColorB = std::clamp(mod->getSavedValue<float>("gui_wavetrail_color_b", 1.0f), 0.0f, 1.0f);
+    engine->waveTrailOpacity = std::clamp(mod->getSavedValue<float>("gui_wavetrail_opacity", 1.0f), 0.0f, 1.0f);
+    engine->waveTrailOutlineOpacity = std::clamp(mod->getSavedValue<float>("gui_wavetrail_outline_opacity", 0.65f), 0.0f, 1.0f);
+    engine->waveTrailEditor = mod->getSavedValue<bool>("gui_wavetrail_editor", true);
     int acc = mod->getSavedValue<int>("gui_accuracy", 0);
     AccuracyMode accMode = sanitizeAccuracyMode(acc);
     engine->selectedAccuracyMode = accMode;
     engine->cosEnabled = mod->getSavedValue<bool>("gui_cos", false);
+    // Mirror the game's actual live CBS / COS state if available
+    engine->syncAccuracyFromGame();
 
     // Settings window.
     auto& logger = skkbot2::Logger::get();
@@ -99,6 +128,7 @@ void Gui::saveSettings() {
     auto* engine = ReplayEngine::get();
 
     mod->setSavedValue("gui_show_features", showFeatures);
+    mod->setSavedValue("gui_use_beta", useBetaGui);
     mod->setSavedValue("gui_tps_enabled", tpsEnabled);
     mod->setSavedValue("gui_tps_value", tpsValue);
     mod->setSavedValue("gui_speedhack_enabled", speedhackEnabled);
@@ -107,6 +137,18 @@ void Gui::saveSettings() {
     mod->setSavedValue("gui_noclip_p1", engine->noclipPlayer1);
     mod->setSavedValue("gui_noclip_p2", engine->noclipPlayer2);
     mod->setSavedValue("gui_noclip_flash", engine->noclipDeathFlash);
+    mod->setSavedValue("gui_hitboxes", engine->showHitboxes);
+    mod->setSavedValue("gui_hitbox_fill", engine->hitboxFill);
+    mod->setSavedValue("gui_wavetrail", engine->waveTrailFix);
+    mod->setSavedValue("gui_wavetrail_drag", engine->waveTrailDragFix);
+    mod->setSavedValue("gui_wavetrail_draw", engine->waveTrailDrawFix);
+    mod->setSavedValue("gui_wavetrail_color_override", engine->waveTrailColorOverride);
+    mod->setSavedValue("gui_wavetrail_color_r", engine->waveTrailColorR);
+    mod->setSavedValue("gui_wavetrail_color_g", engine->waveTrailColorG);
+    mod->setSavedValue("gui_wavetrail_color_b", engine->waveTrailColorB);
+    mod->setSavedValue("gui_wavetrail_opacity", engine->waveTrailOpacity);
+    mod->setSavedValue("gui_wavetrail_outline_opacity", engine->waveTrailOutlineOpacity);
+    mod->setSavedValue("gui_wavetrail_editor", engine->waveTrailEditor);
     mod->setSavedValue("gui_accuracy",
                        static_cast<int>(sanitizeAccuracyMode(
                            static_cast<int>(engine->selectedAccuracyMode))));
@@ -140,6 +182,12 @@ void Gui::refreshMacroList() {
     macros = engine->storedMacros;
 }
 
+void Gui::syncMacros() {
+    selectedMacro = -1;
+    auto* engine = ReplayEngine::get();
+    macros = engine->storedMacros;
+}
+
 void Gui::selectMacroInList(std::string const& name) {
     refreshMacroList();
     selectedMacro = -1;
@@ -165,6 +213,8 @@ void Gui::loadRenderSettings() {
     render.sfxVolume = std::clamp(mod->getSavedValue<float>("gui_render_sfxvol", 1.0f), 0.0f, 1.0f);
     render.fadeIn = std::clamp(mod->getSavedValue<double>("gui_render_fadein", 0.0), 0.0, 10.0);
     render.fadeOut = std::clamp(mod->getSavedValue<double>("gui_render_fadeout", 0.0), 0.0, 10.0);
+    render.audioFadeIn = std::clamp(mod->getSavedValue<double>("gui_render_afadein", 0.0), 0.0, 10.0);
+    render.audioFadeOut = std::clamp(mod->getSavedValue<double>("gui_render_afadeout", 0.0), 0.0, 10.0);
     renderEncoder = mod->getSavedValue<std::string>("gui_render_encoder", "");
 }
 
@@ -181,6 +231,8 @@ void Gui::saveRenderSettings() {
     mod->setSavedValue("gui_render_sfxvol", render.sfxVolume);
     mod->setSavedValue("gui_render_fadein", render.fadeIn);
     mod->setSavedValue("gui_render_fadeout", render.fadeOut);
+    mod->setSavedValue("gui_render_afadein", render.audioFadeIn);
+    mod->setSavedValue("gui_render_afadeout", render.audioFadeOut);
     mod->setSavedValue("gui_render_encoder", renderEncoder);
 }
 
@@ -214,6 +266,8 @@ void Gui::startRender() {
     rs.sfxVolume = render.sfxVolume;
     rs.fadeInSeconds = render.fadeIn;
     rs.fadeOutSeconds = render.fadeOut;
+    rs.audioFadeInSec = render.audioFadeIn;
+    rs.audioFadeOutSec = render.audioFadeOut;
     renderer.applySettings(rs);
 
     if (!renderer.begin(pl)) {
@@ -225,29 +279,6 @@ void Gui::startRender() {
     skkbot2::Logger::get().info("Render started -> {} ({}x{}@{}fps)",
         renderer.lastOutputPath(), render.width, render.height, render.fps);
 }
-
-// Monotonic seconds since process start (delta-only usage).
-static double wallSecs() {
-    return std::chrono::duration<double>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-#ifdef GEODE_IS_WINDOWS
-// Opens the file's folder with the file highlighted (explorer /select):
-static void openFolderFor(const char* path) {
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
-    std::wstring wide(wlen > 0 ? wlen - 1 : 0, L'\0');
-    if (wlen > 0) {
-        MultiByteToWideChar(CP_UTF8, 0, path, -1, wide.data(), wlen);
-    }
-    std::wstring args = L"/select,\"" + wide + L"\"";
-    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr,
-                  SW_SHOW);
-}
-#else
-static void openFolderFor(const char*) {}
-#endif
 
 void Gui::drawRenderWindow() {
     auto& renderer = skkbot2::render::Renderer::get();
@@ -651,104 +682,6 @@ void Gui::drawRenderWindow() {
     ImGui::End();
 }
 
-// Starts a fresh recording of the level under the given macro name.
-static bool startRecording(std::string const& macroName) {
-    auto* playLayer = PlayLayer::get();
-    auto* engine = ReplayEngine::get();
-    if (!playLayer || !playLayer->m_level) {
-        return false;
-    }
-    if (engine->engineMode != MODE_DISABLED) {
-        engine->haltExecution();
-    }
-    skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::Record);
-    if (!engine->beginCapture(playLayer->m_level)) {
-        skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
-        return false;
-    }
-    if (!macroName.empty()) {
-        if (engine->activeSk) {
-            engine->activeSk->name = macroName;
-        }
-        if (engine->activeMacro) {
-            engine->activeMacro->name = macroName;
-        }
-    }
-    return true;
-}
-
-// Stops the current recording, keeping the macro in memory (no file write).
-// The recorded inputs stay in activeSk so Record -> Play works immediately.
-// haltExecution (not a raw engineMode poke) clears reconciliation flags,
-// timing state and held keys so no stale capture state leaks into playback.
-static void stopRecording(std::string const& macroName) {
-    auto* engine = ReplayEngine::get();
-    if (!macroName.empty()) {
-        if (engine->activeSk) {
-            engine->activeSk->name = macroName;
-        }
-        if (engine->activeMacro) {
-            engine->activeMacro->name = macroName;
-        }
-    }
-    // Halt FIRST so the closing RECORD lines still route to record.log,
-    // then close the session.
-    engine->haltExecution();
-    skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
-}
-
-// Loads the named .skk file into memory without starting playback.
-static bool loadMacroIntoMemory(std::string const& name) {
-    auto* engine = ReplayEngine::get();
-    if (name.empty()) {
-        return false;
-    }
-
-    namespace fs = std::filesystem;
-    auto dir = Mod::get()->getSaveDir() / "replays";
-    auto file = dir / (name + ".skk");
-    if (!fs::exists(file)) {
-        return false;
-    }
-
-    std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(file));
-    if (!macro) {
-        return false;
-    }
-
-    delete engine->activeSk;
-    engine->activeSk = macro.release();
-    engine->skMode = true;
-    engine->selectedAccuracyMode = engine->activeSk->accuracyMode;
-    engine->enableCBSForLoadedMacroIfNeeded();
-    double safeTps = engine->activeSk->framerate > 0.0 ? engine->activeSk->framerate : engine->tickRate;
-    engine->practiceFixQueue = skk::bridge::wireToBundles(engine->activeSk->practiceFixCheckpoints, safeTps);
-    skkbot2::log::info("P1 load(GUI): macro loaded practiceFixCheckpoints={} queueSize={}",
-        engine->activeSk->practiceFixCheckpoints.size(), engine->practiceFixQueue.size());
-    return true;
-}
-
-// Arms playback of the loaded (or on-disk named) macro WITHOUT restarting the
-// level while a run is live: playback takes over on the next attempt (death or
-// manual restart). Only starts immediately when there is no live run at all
-// (practice mode, dead player, end screen).
-static void armPlayback(std::string const& name) {
-    auto* engine = ReplayEngine::get();
-    if (!engine->hasMacroInputs() && !engine->loadMacroFromName(name)) {
-        return;
-    }
-    skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::Playback);
-    if (!engine->requestExecutionStart()) {
-        skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
-    }
-}
-
-// Centers a window of the given size on the screen.
-static ImVec2 centerPosFor(const ImVec2& size) {
-    const auto display = ImGui::GetIO().DisplaySize;
-    return ImVec2((display.x - size.x) * 0.5f, (display.y - size.y) * 0.5f);
-}
-
 // Applies skkBot2's simple, compact dark styling. Runs every frame at the
 // start of draw() so the palette always reflects the current styling. We keep
 // the default ImGui look with modestly rounded corners so the UI stays light,
@@ -773,10 +706,39 @@ static void applyTheme() {
     style.WindowTitleAlign = ImVec2(0.0f, 0.5f);
 }
 
+void Gui::applyCursorForOpenState() {
+    // GD owns the OS cursor on desktop: it hides it during gameplay and shows
+    // it on menu scenes. The bot menu must always be mouse-friendly, so force
+    // the cursor visible while the menu is open and hand control back to the
+    // state GD had before opening once the menu closes.
+    auto* view = CCEGLView::sharedOpenGLView();
+    if (!view) return;
+    if (open) {
+        if (!cursorForced) {
+            cursorForced = true;
+            cursorPrevShouldHide = view->getShouldHideCursor();
+        }
+        view->showCursor(true);
+    } else if (cursorForced) {
+        cursorForced = false;
+        view->showCursor(!cursorPrevShouldHide);
+    }
+}
+
 void Gui::draw() {
-    if (!open) {
+    // Keep the system mouse visible while the menu is open, restoring GD's
+    // original cursor state (hidden during gameplay) when it closes.
+    applyCursorForOpenState();
+
+    // Beta GUI routing: the beta shell draws (or clears) itself and takes over
+    // completely; the classic windows below only run when it is disabled.
+    if (useBetaGui) {
+        beta_gui::render(open);
         return;
     }
+    beta_gui::render(false);
+    if (!open) return;
+
     // On the very first time the menu appears in this session, show only the
     // main tab; sub-windows are opened via their buttons afterwards. Closing
     // and reopening the menu keeps whatever sub-windows were open.
@@ -834,7 +796,9 @@ void Gui::draw() {
     float spacing = ImGui::GetStyle().ItemSpacing.x;
     float pairW = (rowW - spacing) / 2.0f;
 
-    ImGui::BeginDisabled(executing || playQueued);
+    bool saveBusy = engine->macroSaveBusy();
+
+    ImGui::BeginDisabled(executing || playQueued || saveBusy);
     if (ImGui::Button(capturing || recordQueued ? "Stop" : "Record", ImVec2(pairW, 26))) {
         if (capturing) {
             stopRecording(macroName);
@@ -852,7 +816,7 @@ void Gui::draw() {
     ImGui::SameLine();
 
     bool noMacroToPlay = !engine->hasMacroInputs() && macroName[0] == '\0';
-    ImGui::BeginDisabled(capturing || recordQueued || (noMacroToPlay && !executing && !playArmed));
+    ImGui::BeginDisabled(capturing || recordQueued || saveBusy || (noMacroToPlay && !executing && !playArmed));
     if (ImGui::Button(executing || playArmed ? "Stop" : "Play", ImVec2(pairW, 26))) {
         if (executing) {
             engine->haltExecution();
@@ -938,6 +902,8 @@ void Gui::draw() {
     rowW = ImGui::GetContentRegionAvail().x;
     spacing = ImGui::GetStyle().ItemSpacing.x;
     float btnW = (rowW - spacing * 3.0f) / 4.0f;
+    bool recOrPlay = capturing || recordQueued || executing || playArmed;
+    ImGui::BeginDisabled(recOrPlay || saveBusy);
     if (ImGui::Button("Save", ImVec2(btnW, 0))) {
         if (macroName[0] == '\0') {
             Notification::create("Macro name is empty", NotificationIcon::Error)->show();
@@ -960,10 +926,11 @@ void Gui::draw() {
             }
         }
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     // Loading replaces activeSk - lethal mid-recording (Toasty refuses all
     // macro-load operations while capturing for exactly this reason).
-    ImGui::BeginDisabled(capturing);
+    ImGui::BeginDisabled(capturing || recordQueued || executing || playArmed || saveBusy);
     if (ImGui::Button("Load", ImVec2(btnW, 0))) {
         if (macroName[0] == '\0') {
             Notification::create("Macro name is empty",
@@ -980,6 +947,7 @@ void Gui::draw() {
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
+    ImGui::BeginDisabled(recOrPlay || saveBusy);
     if (ImGui::Button("Clear", ImVec2(btnW, 0))) {
         skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
         engine->haltExecution();
@@ -987,6 +955,7 @@ void Gui::draw() {
         macroName[0] = '\0';
         Notification::create("Macro cleared", NotificationIcon::Info)->show();
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("List", ImVec2(btnW, 0))) {
         refreshMacroList();
@@ -1174,36 +1143,54 @@ void Gui::drawFeaturesWindow() {
     bool anyValueHovered = false;
 
     if (ImGui::CollapsingHeader("Core", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Effective tick rate: 240.0 while disabled, the slider value when on.
-        if (tpsEnabled) {
-            engine->tickRate = tpsValue;
+        // While a replay owns the clock (beginReplayAccuracyEnvironment applies
+        // the macro's declared TPS on PLAY), the row shows that LIVE rate with
+        // the toggle ON, and turning the toggle off hands the rate back to the
+        // menu's own value (dropPlaybackTickRateOverride) without disturbing
+        // the replay's accuracy. Outside that, only WRITE engine->tickRate on
+        // an actual edit — writing it every frame (as the old
+        // `engine->tickRate = tpsOn ? tpsValue : 240.0` did) stomps the
+        // macro-declared TPS: a macro recorded at 360 TPS would silently fall
+        // back to 240 the moment the GUI redraws, and so would every render
+        // started while the TPS toggle was off.
+        const bool playbackOverriding =
+            engine->engineMode == MODE_EXECUTE && engine->playbackTickRateOverrideActive;
+        if (playbackOverriding) {
+            ImGui::BeginDisabled(true);
+            float liveTps = static_cast<float>(engine->runtimeTickRate());
+            ImGui::SliderFloat("TPS", &liveTps, 1.0f, 1000000.0f, "%.0f");
+            ImGui::EndDisabled();
+            bool on = true;
+            if (ImGui::Checkbox("##tps_enable", &on)) {
+                if (!on) engine->dropPlaybackTickRateOverride();
+            }
         } else {
-            engine->tickRate = 240.0;
-        }
-        ImGui::BeginDisabled(!tpsEnabled);
-        float tps = static_cast<float>(tpsEnabled ? tpsValue : 240.0);
-        if (ImGui::SliderFloat("TPS", &tps, 10.0f, 1000.0f, "%.0f")) {
-            tpsValue = static_cast<double>(tps);
-            engine->tickRate = tpsValue;
-            settingsDirty = true;
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered() && tpsEnabled) {
-            anyValueHovered = true;
-            if (wheelDelta != 0.0f) {
-                // Step exactly +-1 per wheel event (not by |wheelDelta|):
-                // multi-detent wheels report 2-3 per event and would skip
-                // values like 360 (359 -> 361). Sign-based single-step keeps
-                // every integer reachable.
-                tpsValue = std::clamp(
-                    tpsValue + (wheelDelta > 0.0f ? 1.0 : -1.0), 10.0, 1000.0);
+            engine->tickRate = tpsEnabled ? tpsValue : 240.0;
+            ImGui::BeginDisabled(!tpsEnabled);
+            float tps = static_cast<float>(tpsEnabled ? tpsValue : 240.0);
+            if (ImGui::SliderFloat("TPS", &tps, 1.0f, 1000000.0f, "%.0f")) {
+                tpsValue = static_cast<double>(tps);
                 engine->tickRate = tpsValue;
                 settingsDirty = true;
             }
-        }
-        ImGui::SameLine();
-        if (ImGui::Checkbox("##tps_enable", &tpsEnabled)) {
-            settingsDirty = true;
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered() && tpsEnabled) {
+                anyValueHovered = true;
+                if (wheelDelta != 0.0f) {
+                    // Step exactly +-1 per wheel event (not by |wheelDelta|):
+                    // multi-detent wheels report 2-3 per event and would skip
+                    // values like 360 (359 -> 361). Sign-based single-step keeps
+                    // every integer reachable.
+                    tpsValue = std::clamp(
+                        tpsValue + (wheelDelta > 0.0f ? 1.0 : -1.0), 1.0, 1000000.0);
+                    engine->tickRate = tpsValue;
+                    settingsDirty = true;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("##tps_enable", &tpsEnabled)) {
+                settingsDirty = true;
+            }
         }
         ImGui::TextDisabled("Base: %.0f Hz", ReplayEngine::kBaseTickRate);
 
@@ -1216,7 +1203,7 @@ void Gui::drawFeaturesWindow() {
         }
         ImGui::BeginDisabled(!speedhackEnabled);
         float speed = static_cast<float>(speedhackEnabled ? speedhackValue : 1.0);
-        if (ImGui::SliderFloat("Speedhack", &speed, 0.01f, 10.0f, "x%.2f")) {
+        if (ImGui::SliderFloat("Speedhack", &speed, 0.01f, 100.0f, "x%.2f")) {
             speedhackValue = static_cast<double>(speed);
             engine->gameSpeed = speedhackValue;
             settingsDirty = true;
@@ -1227,9 +1214,8 @@ void Gui::drawFeaturesWindow() {
             if (wheelDelta != 0.0f) {
                 // Round to 2 decimals so stepping from 0.99 lands exactly on
                 // 1.00 (float 0.99 + 0.01 would otherwise read as 1.01).
-                speedhackValue = std::clamp(
-                    std::round((speedhackValue + 0.01 * static_cast<double>(wheelDelta)) * 100.0) / 100.0,
-                    0.01, 10.0);
+                speedhackValue = std::max(0.01,
+                    std::round((speedhackValue + 0.01 * static_cast<double>(wheelDelta)) * 100.0) / 100.0);
                 engine->gameSpeed = speedhackValue;
                 settingsDirty = true;
             }
@@ -1240,6 +1226,7 @@ void Gui::drawFeaturesWindow() {
         }
 
         ImGui::Separator();
+        engine->syncAccuracyFromGame();
         struct AccuracyLabel {
             AccuracyMode mode;
             const char* name;
@@ -1336,6 +1323,14 @@ void Gui::drawSettingsWindow() {
     // width is stale on the very first open, which used to offset it further).
     if (!settingsWasOpenLast) {
         ImGui::SetWindowPos(ImVec2(mainPos.x - settingsWindowWidth - 12.0f, mainPos.y));
+    }
+
+    if (ImGui::CollapsingHeader("Interface", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Beta GUI (new style)", &useBetaGui)) {
+            Mod::get()->setSavedValue("gui_use_beta", useBetaGui);
+        }
+        ImGui::TextDisabled(useBetaGui ? "Beta GUI is active."
+                                       : "Classic menu interface.");
     }
 
     if (ImGui::CollapsingHeader("Menu Keybind", ImGuiTreeNodeFlags_DefaultOpen)) {

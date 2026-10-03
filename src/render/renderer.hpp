@@ -35,6 +35,7 @@ struct AVFormatContext;
 int getLastMusicId();
 void setLastMusicId(int id);
 void armMusicRestart();
+void disarmMusicRestart();
 bool tickPendingMusicRestart();
 
 // Video renderer (v3 вЂ” async encode pipeline).
@@ -161,6 +162,11 @@ class Renderer {
         float sfxVolume = 1.0f;     // in-game SFX volume forced for the render
         double fadeInSeconds = 0.0;   // fade from black at video start (0 = off)
         double fadeOutSeconds = 0.0;  // fade to black after level complete (0 = off)
+        // Audio fade (applied to the captured mixer output, independent of the
+        // video fade): ramp the level in at the start of the track and out
+        // over the live trailer at the end.
+        double audioFadeInSec = 0.0;
+        double audioFadeOutSec = 0.0;
     };
 
     void applySettings(const RenderSettings& s);
@@ -308,9 +314,26 @@ class Renderer {
     int64_t m_lastSentPts = -1;
 
     // Audio settings (from applySettings/begin)
+    // m_audioWanted is the pure SETTING (Capture Audio on/off) and survives a
+    // render: stop() must not clear it. m_audioEnabled is the RUNTIME latch
+    // ("capture is attached for THIS render") — begin() seeds it from
+    // m_audioWanted, and stop()/failure paths clear it. Before the split, the
+    // setting and the runtime flag were the same member, so after a render
+    // with audio the flag stayed false forever and every later render started
+    // video-only unless the user happened to edit a render setting (which
+    // re-ran applySettings) before pressing START.
+    bool m_audioWanted = false;
     bool m_audioEnabled = false;
     std::string m_audioCodecSel = "aac";
     int m_audioBitrate = 320;  // kbps
+    double m_audioFadeInSec = 0.0;
+    double m_audioFadeOutSec = 0.0;
+    // Counting-down mirror of the video trailer's mTrailerRemain, decremented
+    // in the same trailer path so the audio fade-out ramp lands on the same
+    // frames the video fade does.
+    double m_audioFadeOutRemain = 0.0;
+    // AUDIO-FADE DIAGNOSTIC: counter of logged audio-fade samples per render.
+    int m_audioFadeDiag = 0;
     std::string m_audioCodecUsed;
     // In-game volumes forced on FMODAudioEngine for the render (silicate
     // parity: attach() saves the previous values and detach() restores them).

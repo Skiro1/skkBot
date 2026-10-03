@@ -1,5 +1,6 @@
 #include "skkBot.hpp"
 #include "core/checkpoint_handler.hpp"
+#include "core/editor_playback.hpp"
 #include "core/gameplay_layer.hpp"
 #include "core/physical_keys.hpp"
 #include "core/replay_timing.hpp"
@@ -50,6 +51,10 @@ namespace {
     static int  gTraceWindowEnd     = -1;    // tick: active trace window ends here
     static constexpr int kTraceWindowLen = 40; // frames to trace after jump detected
     static constexpr float kJumpThresholdPx = 10.0f;  // frame-to-frame visible jump
+    // Rendered-drift logging cadence (Этап 0): sample every N ticks at the
+    // isLastTick visual boundary so the actual post-reconcile offset is visible
+    // even when it stays below any "visible" threshold.
+    static constexpr int kRenderDriftReportEveryTicks = 180;
 
     // Format a single-line P1 snapshot for the tracer.
     static void logP1TraceLine(
@@ -73,7 +78,7 @@ namespace {
     }
 }  // namespace
 
-static void prePhyWarmPortalCache(PlayLayer* playLayer) {
+static void prePhyWarmPortalCache(GJBaseGameLayer* playLayer) {
     auto* objects = playLayer ? playLayer->m_objects : nullptr;
     if (!objects) {
         gPortalCacheArray = nullptr;
@@ -125,11 +130,14 @@ namespace {
     namespace tick_util {
         int current(GJBaseGameLayer* layer, ReplayEngine* engine) {
             auto* playLayer = PlayLayer::get();
-            if (!playLayer) return 0;
+            // Editor playtest has no PlayLayer: fall back to the explicit layer
+            // the drive-loop passes (the hooked GJBaseGameLayer running physics).
+            GJBaseGameLayer* active = playLayer ? static_cast<GJBaseGameLayer*>(playLayer) : layer;
+            if (!active) return 0;
             if (engine && engine->stepClock) {
                 return std::max(0, engine->stepPairCount + 1);
             }
-            int tick = static_cast<int>(playLayer->m_gameState.m_levelTime * engine->runtimeTickRate());
+            int tick = static_cast<int>(active->m_gameState.m_levelTime * engine->runtimeTickRate());
             return std::max(0, tick + 1);
         }
     }
@@ -185,7 +193,7 @@ namespace {
         }
     };
 
-    static bool hasDualPlaybackContext(PlayLayer* playLayer) {
+    static bool hasDualPlaybackContext(GJBaseGameLayer* playLayer) {
         return playLayer && (playLayer->m_gameState.m_isDualMode || playLayer->m_levelSettings->m_twoPlayerMode);
     }
 
@@ -547,16 +555,77 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         auto* engine = ReplayEngine::get();
         auto* playLayer = PlayLayer::get();
 
-        if (!playLayer) {
+        // Drive the step clock for a PlayLayer attempt OR an editor playtest
+        // (LevelEditorLayer playtest funnels through this base-layer update).
+        if (!playLayer && !skk::gameplay::isEditorPlaytest()) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
+        // Editor playtest: align the freshly spawned player to the recorded
+        // route exactly once (loop-guarded by EXECUTE && !startPosActive). Must
+        // run BEFORE the step-clock increment so the baseline matches the
+        // reset-moment semantics applyReplayResetState relies on.
+        if (skk::gameplay::isEditorPlaytest() &&
+            engine->engineMode == MODE_EXECUTE && !engine->startPosActive) {
+            skk::editor::attemptPlaytestArm(this, engine);
+        }
+
         // Step-grid clock boundary: every processCommands call IS one 1/240
-        // physics sub-step (probe-proven: dt=1/240 per call, half/last are not
-        // pair flags, and m_currentStep stays 0 in this batched pipeline).
-        // One label per call, BEFORE any bookkeeping reads tick_util below.
+        // physics sub-step in a PlayLayer (probe-proven: dt=1/240 per call,
+        // half/last are not pair flags, and m_currentStep stays 0 in this
+        // batched pipeline). An editor playtest is different: GD funnels the
+        // same calls at ~180/s with dt=1/180, so one call is only ~1.33 macro
+        // ticks. Advance by dt*tickRate (keeping the sub-tick remainder) so the
+        // playback grid stays locked to the level's game time instead of
+        // drifting ~25% slow (the "speedhack-like" slowdown).
         if (engine->stepClock) {
-            ++engine->stepPairCount;
+            if (skk::gameplay::isEditorPlaytest()) {
+                engine->stepPairFrac += static_cast<double>(dt) * engine->runtimeTickRate();
+                int whole = static_cast<int>(engine->stepPairFrac);
+                engine->stepPairFrac -= static_cast<double>(whole);
+                engine->stepPairCount += whole;
+            } else {
+                ++engine->stepPairCount;
+            }
+        }
+
+        // EDITOR PLAYTEST CADENCE PROBE: in the editor the physics timing
+        // machinery (SpeedControlScheduler / PhysicsControlLayer / getModifiedDelta)
+        // is PlayLayer-gated and stays vanilla, so GD funnels processCommands at
+        // ~180/s with dt=1/180 instead of 240/s with dt=1/240. One call is NOT
+        // one macro tick there: the step clock now advances by dt*tickRate (see
+        // the compensation above). This probe verifies the grid stays locked to
+        // the level's game time - a residual cadence mismatch would still show
+        // up as a "speedhack-like" slowdown of the whole run.
+        if (skk::gameplay::isEditorPlaytest()) {
+            static double sLast = 0.0;
+            static int sCalls = 0;
+            static float sAccumDt = 0.0f;
+            static double sAccumLt = 0.0;
+            static int sLastTick = 0;
+            if (sCalls == 0) {
+                sLast = ReplayEngine::wallClockSeconds();
+                sLastTick = engine->stepPairCount;
+            }
+            ++sCalls;
+            sAccumDt += dt;
+            sAccumLt += m_gameState.m_levelTime;
+            if (sCalls >= 240) {
+                const double now = ReplayEngine::wallClockSeconds();
+                const double wall = now - sLast;
+                const double pps = wall > 0.0 ? static_cast<double>(sCalls) / wall : 0.0;
+                const int tickDelta = engine->stepPairCount - sLastTick;
+                skkbot2::log::info(
+                    "EDITOR cadence: {} calls in {:.3f}s = {:.1f} processCommands/s | "
+                    "sum(dt)={:.4f}s avgDt={:.7f} | tickDelta={} ({} ticks/s) lt={:.4f}",
+                    sCalls, wall, pps, sAccumDt,
+                    sAccumDt / static_cast<float>(sCalls),
+                    tickDelta, wall > 0.0 ? static_cast<double>(tickDelta) / wall : 0.0,
+                    sAccumLt);
+                sCalls = 0;
+                sAccumDt = 0.0f;
+                sAccumLt = 0.0;
+            }
         }
 
         // Substep-grid probe: how GD interleaves half/last processCommands
@@ -679,7 +748,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         // Fresh level entry after queueing outside: already at
                         // the start, no need to reset. Consume the flag.
                         engine->suppressInitialRunReset = false;
-                    } else if (!m_levelEndAnimationStarted) {
+                    } else if (!m_levelEndAnimationStarted && playLayer) {
                         skkbot2::log::info("initialRun: re-syncing attempt start (resetLevel at tick {})", tick);
                         if (m_levelSettings->m_platformerMode) {
                             playLayer->resetLevelFromStart();
@@ -746,7 +815,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 #ifdef GEODE_IS_WINDOWS
                 auto& hb = player->m_holdingButtons;
 
-                bool isP2 = (player == playLayer->m_player2);
+                bool isP2 = (player == m_player2);
                 bool blocked = player->m_controlsDisabled;
                 auto mode = currentPhysicalHoldMode(layer);
 
@@ -782,7 +851,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 // releaseButton only set internal state — they do NOT call
                 // handleButton, so the recording layer never sees these events.
                 if (engine->engineMode == MODE_CAPTURE && engine->hasMacro()) {
-                    bool p2 = handleButtonPlayer2Param(isP2, controlFlipActive(playLayer));
+                    bool p2 = handleButtonPlayer2Param(isP2, controlFlipActive(this));
                     if (jumpHeld && !jumpMap) {
                         g_perFramePressSync = true;
                         layer->handleButton(true, 1, p2);
@@ -813,10 +882,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
 #endif
             };
-            syncPhysicalHolds(playLayer->m_player1);
-            if (playLayer->m_player2) syncPhysicalHolds(playLayer->m_player2);
+            syncPhysicalHolds(m_player1);
+            if (m_player2) syncPhysicalHolds(m_player2);
 
-            auto dbgMode = currentPhysicalHoldMode(playLayer);
+            auto dbgMode = currentPhysicalHoldMode(this);
             const bool dbgP1J = isPhysicalKeyHeld(1, false, dbgMode.twoPlayer, dbgMode.platformer, dbgMode.dual);
             const bool dbgP1L = isPhysicalKeyHeld(2, false, dbgMode.twoPlayer, dbgMode.platformer, dbgMode.dual);
             const bool dbgP1R = isPhysicalKeyHeld(3, false, dbgMode.twoPlayer, dbgMode.platformer, dbgMode.dual);
@@ -846,7 +915,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             // dynamic_cast on 141k objects would otherwise hitch the start-warp
             // seam as a visible "пролаг ГД" on every attempt).
             if (tick <= 8) {
-                prePhyWarmPortalCache(playLayer);
+                prePhyWarmPortalCache(this);
             }
             tInputsStart = std::chrono::steady_clock::now();
             dispatchPlaybackInputsPre(tick, stepDelta);
@@ -878,6 +947,13 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         engine->lastProcessSliceTimestamp = processSliceTimestamp;
 
         if (engine->engineMode == MODE_DISABLED) {
+            // Armed-waiting playback takeover: PLAY was pressed mid-run, so the
+            // bot does NOT reset or teleport the player - it waits until the
+            // live position is actually covered by the recording and arms in
+            // place on that tick.
+            if (newTick) {
+                engine->tryLivePlaybackTakeover(this);
+            }
             return;
         }
 
@@ -909,8 +985,8 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         // the position the eye actually renders. A large frame-to-frame delta
         // there IS the reported "резкий скачок". On detection we open a detailed
         // per-tick trace window (reconcilePerFrames logs [TRC RECON] lines).
-        if (isLastTick && engine->engineMode == MODE_EXECUTE && playLayer->m_player1) {
-            auto* p = playLayer->m_player1;
+        if (isLastTick && engine->engineMode == MODE_EXECUTE && m_player1) {
+            auto* p = m_player1;
             const float px = p->getPositionX();
             const float py = p->getPositionY();
             const float rot = p->getRotation();
@@ -958,6 +1034,41 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             gFrameLastRot = rot;
             gFrameLastVy = vy;
         }
+        // === RENDERED-DRIFT METER (Этап 0) =====================================
+        // playDriftMax reads preP1x inside reconcilePerFrames (pre-position-write)
+        // and therefore always shows the ±~1.95px phase saw even when the
+        // recorded frame is applied exactly. THIS meter samples the actual
+        // post-reconcile rendered state at the visual boundary (isLastTick):
+        // (live - last applied recorded frame). A nonzero value here is a real
+        // residual a user could see; phase-saw artifacts do not appear.
+        auto* rdriftFrames = engine->activePerFrames();
+        if (isLastTick && rdriftFrames && !rdriftFrames->empty() && m_player1) {
+            const float rpx = m_player1->getPositionX();
+            const float rpy = m_player1->getPositionY();
+            const size_t ri = engine->perFramePlaybackIndex;
+            if (ri > 0) {
+                const auto& rpf = rdriftFrames->at(ri - 1);
+                const float rdx = rpx - rpf.p1x;
+                const float rdy = rpy - rpf.p1y;
+                const float rD = std::max(std::abs(rdx), std::abs(rdy));
+                if (rD > engine->renderDriftMax) {
+                    engine->renderDriftMax = rD;
+                    engine->renderDriftMaxTick = rpf.tick;
+                }
+                if (rpf.tick - engine->renderDriftLastLogTick >= kRenderDriftReportEveryTicks) {
+                    engine->renderDriftLastLogTick = rpf.tick;
+                    const double rvy = m_player1->m_yVelocity;
+                    const float rrot = m_player1->getRotation();
+                    skkbot2::log::info(
+                        "RENDER-drift: tick={} pfIdx={}/{} live=({:.1f},{:.1f}) pf=({:.1f},{:.1f}) dx={:.3f} dy={:.3f} "
+                        "dvy={:.3f} drot={:.1f} rot={:.1f}->{:.1f} (max {:.3f}@{})",
+                        rpf.tick, ri - 1, rdriftFrames->size(),
+                        rpx, rpy, rpf.p1x, rpf.p1y,
+                        rdx, rdy, rvy - rpf.p1vy, rrot - rpf.p1rot,
+                        rpf.p1rot, rrot, engine->renderDriftMax, engine->renderDriftMaxTick);
+                }
+            }
+        }
         // =====================================================================
     }
 
@@ -965,7 +1076,11 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     void update(float dt) {
         auto* engine = ReplayEngine::get();
         auto* playLayer = PlayLayer::get();
-        if (!playLayer || !engine || engine->engineMode == MODE_DISABLED) {
+        if (!playLayer || !engine) {
+            return GJBaseGameLayer::update(dt);
+        }
+        if (engine->engineMode == MODE_DISABLED) {
+            engine->tryLivePlaybackTakeover(playLayer);
             return GJBaseGameLayer::update(dt);
         }
 
@@ -1168,7 +1283,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
     void reconcileAnchors(int effectiveTick) {
         auto* engine = ReplayEngine::get();
-        auto* playLayer = PlayLayer::get();
+        GJBaseGameLayer* playLayer = this;
         auto* anchors = engine->activeAnchors();
         if (!engine->anchorReconciliation || !playLayer || !anchors) {
             return;
@@ -1226,7 +1341,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     // The ring is found by its objectID - the world is the same objects -
     // and only when the player currently has NO ring (never re-trigger an
     // in-flight dash).
-    static void reattachDashRing(PlayLayer* playLayer, PlayerObject* player, int32_t ringId,
+    static void reattachDashRing(GJBaseGameLayer* playLayer, PlayerObject* player, int32_t ringId,
                                  int tick, int& lastAttemptTick, float recVy, float recVyb) {
         static_cast<void>(lastAttemptTick);
         if (!playLayer || !player || ringId == 0) {
@@ -1240,7 +1355,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         // from recording) instead of unreliable touch detection. The per-frame
         // tells us the exact tick the ring was activated in the recording.
         static int s_lastAttachedRingId[2] = { 0, 0 };
-        int slot = (player == PlayLayer::get()->m_player2) ? 1 : 0;
+        int slot = (player == playLayer->m_player2) ? 1 : 0;
         bool risingEdge = (ringId != 0 && s_lastAttachedRingId[slot] != ringId);
         s_lastAttachedRingId[slot] = ringId;
 
@@ -1374,7 +1489,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     // m_orangePortal/group, applies y-offsets/effects and flags the player as
     // teleported (ToastyReplay/silicate approach).
     static TeleportPortalObject* findTeleportEntryPortal(
-        PlayLayer* playLayer, float ex, float ey, float tx, float ty) {
+        GJBaseGameLayer* playLayer, float ex, float ey, float tx, float ty) {
         // Level-wide portal list cache: dynamic_cast on ALL objects (this
         // level is 141 THOUSAND objects) per seam-window tick was a ~22ms
         // synchronous hitch exactly where the recorded teleport/orb fires
@@ -1511,7 +1626,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
     void prePhyPositionPin(int effectiveTick) {
         auto* engine = ReplayEngine::get();
-        auto* playLayer = PlayLayer::get();
+        GJBaseGameLayer* playLayer = this;
         auto* perFrames = engine->activePerFrames();
         if (!engine->perFrameReconciliation || !playLayer || !perFrames || !engine->skMode) {
             return;
@@ -1948,6 +2063,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 playLayer->m_player1->setPosition({ pfPrev->p1x, pfPrev->p1y });
                 playLayer->m_player1->m_yVelocity = pfPrev->p1vy;
                 playLayer->m_player1->m_yVelocityBeforeSlope = pfPrev->p1vyb;
+                // Rotation must be pinned BEFORE physics too (not only in
+                // reconcilePerFrames). GD's slope/look-at math reads the live
+                // rotation attached to the node; if only reconcile sets it, the
+                // per-tick physics roll in a rotating ship/ball starts from the
+                // stale live rotation and adds a growing Δrot on long spins.
+                playLayer->m_player1->setRotation(pfPrev->p1rot);
                 if (effectiveTick < gTraceWindowEnd) {
                     logP1TraceLine(
                         "PRE", effectiveTick,
@@ -1968,16 +2089,29 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
         if (pfPrev->hasPlayer2 && playLayer->m_player2) {
-            pinSpike(playLayer->m_player2, pfPrev->p2x, pfPrev->p2y, pfPrev->tick, "p2");
-            playLayer->m_player2->setPosition({ pfPrev->p2x, pfPrev->p2y });
-            playLayer->m_player2->m_yVelocity = pfPrev->p2vy;
-            playLayer->m_player2->m_yVelocityBeforeSlope = pfPrev->p2vyb;
+            // BUG-21: a recorded (0,0) P2 frame is the DORMANT sentinel from
+            // before the P2 liveness gate existed (or a macro from before
+            // today). Pinning a live, dual-activated P2 to it teleports it
+            // across the level. GD's own liveness signal is parenting, so
+            // skip the pin for dormant frames.
+            if (pfPrev->p2x == 0.0f && pfPrev->p2y == 0.0f
+                && playLayer->m_player2->getParent() != nullptr) {
+                skkbot2::log::debug(
+                    "prePhyPin p2 dormant-skip: effTick={} pfIdx={}/{} live=({:.1f},{:.1f})",
+                    effectiveTick, engine->perFramePlaybackIndex, perFrames->size(),
+                    playLayer->m_player2->getPositionX(), playLayer->m_player2->getPositionY());
+            } else {
+                pinSpike(playLayer->m_player2, pfPrev->p2x, pfPrev->p2y, pfPrev->tick, "p2");
+                playLayer->m_player2->setPosition({ pfPrev->p2x, pfPrev->p2y });
+                playLayer->m_player2->m_yVelocity = pfPrev->p2vy;
+                playLayer->m_player2->m_yVelocityBeforeSlope = pfPrev->p2vyb;
+            }
         }
     }
 
     void reconcilePerFrames(int effectiveTick) {
         auto* engine = ReplayEngine::get();
-        auto* playLayer = PlayLayer::get();
+        GJBaseGameLayer* playLayer = this;
         auto* perFrames = engine->activePerFrames();
         if (!engine->perFrameReconciliation || !playLayer || !perFrames || !engine->skMode) {
             return;
@@ -2071,6 +2205,14 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         } else {
                             engine->seamGlideUntilTick = -1;
                         }
+                    } else if (d1 <= ReplayEngine::kSeamGlideStepPx) {
+                        // Small backward gap (live slightly AHEAD of the route,
+                        // typically <= one tick's advance, ~2px). Claw it back
+                        // now: leaving it lets a one-substep lead turn into a
+                        // lingering forward offset on the rendered frame. Only
+                        // genuine rewind seams (large backward distance) are
+                        // exempt below.
+                        engine->seamGlideUntilTick = -1;
                     } else {
                         leavePosition = true;
                     }
@@ -2134,10 +2276,16 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         }
                     }
                     if (curGravNeg != wantGravNeg) {
-                        playLayer->m_player1->m_gravity = wantGravNeg ? -1.0 : 1.0;
+                        double mag = std::abs(playLayer->m_player1->m_gravity);
+                        if (mag < 0.001) mag = 1.0;
+                        playLayer->m_player1->m_gravity = wantGravNeg ? -mag : mag;
+                        if (playLayer->m_player1->m_isRobot) {
+                            playLayer->m_player1->m_wasRobotJump = false;
+                        }
                     }
                     if (curUD != wantUD) {
                         playLayer->m_player1->m_isUpsideDown = wantUD;
+                        playLayer->m_player1->m_stateFlipGravity = wantUD ? 1 : 0;
                     }
                 }
                 if (pf.p1RingId != 0) {
@@ -2156,10 +2304,19 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
             }
             if (pf.hasPlayer2 && playLayer->m_player2) {
-                playLayer->m_player2->setPosition({ pf.p2x, pf.p2y });
-                playLayer->m_player2->m_yVelocity = pf.p2vy;
-                playLayer->m_player2->m_yVelocityBeforeSlope = pf.p2vyb;
-                playLayer->m_player2->setRotation(pf.p2rot);
+                // BUG-21: skip the dormant (0,0) sentinel — same guard as the
+                // pre-phy pin above, so a dual-activated live P2 is never
+                // yanked to the origin by a pre-gate recorded frame.
+                if (pf.p2x == 0.0f && pf.p2y == 0.0f
+                    && playLayer->m_player2->getParent() != nullptr) {
+                    // Still reconcile the gravity/ud flags below? No — a
+                    // dormant frame's vis bits are stale too. Skip entirely.
+                } else {
+                    playLayer->m_player2->setPosition({ pf.p2x, pf.p2y });
+                    playLayer->m_player2->m_yVelocity = pf.p2vy;
+                    playLayer->m_player2->m_yVelocityBeforeSlope = pf.p2vyb;
+                    playLayer->m_player2->setRotation(pf.p2rot);
+                }
                 // P2 gravity/ud correction (mirrors P1 logic above).
                 {
                     const bool wantGravNeg = (pf.p2vis & kVisualGravityNegative) != 0;
@@ -2185,10 +2342,16 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         }
                     }
                     if (curGravNeg != wantGravNeg) {
-                        playLayer->m_player2->m_gravity = wantGravNeg ? -1.0 : 1.0;
+                        double mag = std::abs(playLayer->m_player2->m_gravity);
+                        if (mag < 0.001) mag = 1.0;
+                        playLayer->m_player2->m_gravity = wantGravNeg ? -mag : mag;
+                        if (playLayer->m_player2->m_isRobot) {
+                            playLayer->m_player2->m_wasRobotJump = false;
+                        }
                     }
                     if (curUD != wantUD) {
                         playLayer->m_player2->m_isUpsideDown = wantUD;
+                        playLayer->m_player2->m_stateFlipGravity = wantUD ? 1 : 0;
                     }
                 }
                 if (pf.p2RingId != 0) {

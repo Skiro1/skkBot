@@ -23,6 +23,10 @@ that replaces the cocos frontend of the old skkBot.
   full encoder list (libx264, libx265, NVENC, AMF, QSV, AV1, VP9/VP8, MPEG-4, ProRes,
   MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–200 Mbps, audio AAC/MP3/Opus/Vorbis/
   FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**
+- **Modern ImGui GUI**: intuitive modern interface with tab navigation (Record,
+  Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
+- **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,
+  and Wave Trail Fix (draw + drag fixes)
 - **Logging system** (None/Error/Warn/Info/All): Geode console + optional file logging,
   split Record/Play log files
 

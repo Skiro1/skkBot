@@ -28,6 +28,10 @@ renderer using bundled FFmpeg — no extra downloads needed.
   1–240 FPS, bitrate 5–200 Mbps, fade in/out
 - **Audio recording**: AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC3, E-AC3 (as available in the
   bundled FFmpeg); **level audio is captured from block 0**
+- **Modern ImGui GUI**: intuitive modern interface enabled by default with tab
+  navigation (Record, Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
+- **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,
+  and Wave Trail Fix (draw + drag fixes)
 - **Logging system** (None/Error/Warn/Info/All): Geode console + optional file logging,
   split Record/Play log files; off by default
 

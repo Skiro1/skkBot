@@ -1,4 +1,4 @@
-﻿#include "audiocap.hpp"
+#include "audiocap.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -166,6 +166,7 @@ bool AudioCapture::attach(float musicVolume, float sfxVolume) {
 
     skkbot2::log::info("[RENDER] audio capture attached: {} Hz x {} ch",
                        m_sampleRate, m_channels);
+    enableFmodUpdateHook(true);
     return true;
 }
 
@@ -174,6 +175,7 @@ void AudioCapture::detach() {
         return;
     }
     m_active = false;
+    enableFmodUpdateHook(false);
     auto* engine = FMODAudioEngine::get();
     if (engine && engine->m_system) {
         m_master->removeDSP(m_dsp);

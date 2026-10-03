@@ -1,3 +1,27 @@
+# v0.1.1 (2026-10-04)
+Minor update bringing redesigned modern UI, engine stability fixes and expanded customization.
+
+## New
+- **Modern Beta UI enabled by default**: sleek Liquid Glass interface with full
+  tab navigation (Record, Assist, Video, Settings), macro library search & management
+- **Solid background**: opaque panel mode for the beta UI (default on, configurable
+  under Settings → Cosmetics)
+- **Assist tab & cosmetics**: wave trail fix section reorganized as Cosmetic
+- **Expanded controls**: TPS limit extended up to 1,000,000; Speedhack lower limit
+  extended down to 0.01x
+- **Accuracy synchronization**: real-time two-way synchronization of CBS and COS
+  settings directly with vanilla Geometry Dash options
+
+## Fixes
+- Crash on CCDrawNode creation and level exit in hitbox overlay
+- Trajectory ghost robot visual glitch on dual mode
+- Hitbox overlay affected by game shader effects
+- FMOD stream thread crash during normal gameplay and level editing
+- Out-of-bounds access on slope collision detection and section traversal
+- Automatic Record stop when entering Level Editor
+
+---
+
 # v0.1.0 (2026-09-17)
 Initial release of **skkBot2** — the input-first rewrite of skkBot (SKK3 `.skk` format,
 native ImGui menu, bundled video renderer).

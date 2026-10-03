@@ -4,6 +4,7 @@
 #include <Geode/cocos/shaders/ccGLStateCache.h>
 
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #include "../logger/logger.hpp"
@@ -426,6 +427,26 @@ void FboCapture::issueReadback(int64_t pts) {
     glViewport(prevViewport[0], prevViewport[1],
                static_cast<GLsizei>(prevViewport[2]),
                static_cast<GLsizei>(prevViewport[3]));
+    // scene->visit() in renderSceneInto drives cocos's own draw path, which
+    // overwrites the GL blend FUNCTION to whatever the level's nodes last set
+    // (GD's sprites/particles use premultiplied and additive blends, not
+    // imgui's). imgui-cocos sets its blend func exactly ONCE at the top of
+    // drawFrame (backend.cpp, BEFORE this capture callback runs) and never
+    // re-asserts it before renderFrame() paints the bot menu — so a leaked
+    // func is what the whole menu composites with for the rest of the frame.
+    // With a replace blend (GL_ONE/GL_ZERO) every glyph renders as a SOLID
+    // colour BLOCK (the atlas RGB coverage is taken literally, alpha is
+    // ignored): text looks fat, "filled with one colour" and unreadable, and
+    // every translucent panel turns opaque — the entire UI reads as broken
+    // for the whole render. This only shows while recording: scene->visit()
+    // in the grab is the ONLY path that touches blend, and it runs solely
+    // during a render. Re-apply imgui's blend func so the menu renders right.
+    // Raw glBlendFunc (not the cached ccGLBlendFunc wrapper): the scene may
+    // have changed the real GL state through cocos's cached path, and
+    // ccGLBlendFunc would no-op if its cache still holds imgui's value while
+    // the actual state differs. ccGLInvalidateStateCache() below resyncs the
+    // cache either way.
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_BLEND);
 
     // Restore program / active unit / unit-0 texture binding. The capture
@@ -489,6 +510,11 @@ void FboCapture::syncReadback(uint8_t* dst) {
     glViewport(prevViewport[0], prevViewport[1],
                static_cast<GLsizei>(prevViewport[2]),
                static_cast<GLsizei>(prevViewport[3]));
+    // Re-apply imgui's blend func: the Y/UV passes above disabled GL_BLEND
+    // and the scene re-render in issueReadback (which runs right before this
+    // fallback in grab()) left a non-imgui blend FUNCTION behind. Same leak
+    // as the async path — see the restore there.
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_BLEND);
 
     // Same cocos state-cache resync as issueReadback (see there).

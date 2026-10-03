@@ -14,6 +14,19 @@ namespace skkbot2::gui {
 struct Gui {
     bool open = true;
 
+    // Beta GUI (new ImGui shell): routed at the top of draw().
+    bool useBetaGui = true;
+
+    // Semibold UI font for titles/logo (loaded in main.cpp setup, may stay
+    // null if no bold system font was found — callers must null-check).
+    ImFont* boldFont = nullptr;
+
+    // Fixed-width font for eyebrow labels / numerical readouts, loaded in
+    // main.cpp setup (Consolas / Cascadia Mono / Courier New). May stay null
+    // if none found — callers must null-check (spacedText falls back to the
+    // default font).
+    ImFont* monoFont = nullptr;
+
     char macroName[128] = {0};
 
     bool showSettings = false;
@@ -77,6 +90,8 @@ struct Gui {
         float sfxVolume = 1.0f;    // in-game SFX volume forced during render
         double fadeIn = 0.0;
         double fadeOut = 0.0;
+        double audioFadeIn = 0.0;
+        double audioFadeOut = 0.0;
     };
     RenderSettingsStore render;
     // Encoder selected in the dropdown ("" = auto-pick on first FFmpeg load:
@@ -99,11 +114,23 @@ struct Gui {
     // close the menu.
     int toggleLockKey = -1;
 
+    // OS mouse handling: GD hides the system cursor during gameplay. While the
+    // menu is open we force it visible every frame; the pre-open state is
+    // remembered and restored exactly when the menu closes again.
+    bool cursorForced = false;
+    bool cursorPrevShouldHide = false;
+
     static const char* keyName(int key);
     void init();
     void saveSettings();
+    void applyCursorForOpenState();
     void draw();
     void refreshMacroList();
+    // Copy the engine's already-scanned storedMacros into this shell's list
+    // WITHOUT touching the disk (no storedMacros scan). Used to pick up async
+    // list changes (a save finishing on the worker thread bumps the engine's
+    // macroListVersion, the shell notices and calls this).
+    void syncMacros();
     void selectMacroInList(std::string const& name);
     void drawSettingsWindow();
     void drawFeaturesWindow();

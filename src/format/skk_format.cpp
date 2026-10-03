@@ -195,7 +195,15 @@ void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerOb
             frame.p1RingId = static_cast<GameObject*>(p1->m_dashRing)->m_objectID;
         }
     }
-    if (p2) {
+    // P2 liveness gate (BUG-21): in a 2P/dual level GD keeps m_player2
+    // allocated but DORMANT until it actually joins — spawnPlayer2() parents
+    // it into the layer, removePlayer2() detaches it. A dormant P2 sits at
+    // (0,0) and never moves. Recording it as hasPlayer2=true poisons the
+    // stream: on playback, once a dual portal activates the LIVE P2, the
+    // pre-phy pin/reconcile yank it back to the recorded (0,0) — a
+    // 14000px TELEPORT-SPIKE that kills it. GD's own liveness signal is
+    // the parenting, so mirror it here.
+    if (p2 && p2->getParent() != nullptr) {
         frame.hasPlayer2 = true;
         auto pos = p2->getPosition();
         frame.p2x = pos.x;
@@ -420,9 +428,15 @@ bool SkMacro::saveToPath(std::filesystem::path const& path) {
         setupRngSeed
     );
     if (!perFrames.empty() && perFrames.front().tick > 120) {
-        skkbot2::log::warn("NOTE: first recorded frame is tick {} (~{:.1f}s) - capture started MID-RUN; "
-                           "playback from level start may fire near-spawn triggers that never fired while recording",
-                           perFrames.front().tick, perFrames.front().tick / 240.0);
+        skkbot2::log::warn("NOTE: first recorded frame is tick {} (~{:.1f}s) at p1=({:.0f},{:.0f}) - capture started MID-RUN; "
+                           "playback will POSITION-ALIGN to wherever the player is, not assume a tick-0 timeline "
+                           "(start recording from the level start for full coverage)",
+                           perFrames.front().tick, perFrames.front().tick / 240.0,
+                           perFrames.front().p1x, perFrames.front().p1y);
+    } else if (!anchors.empty() && anchors.front().tick > 120) {
+        skkbot2::log::warn("NOTE: first recorded anchor is tick {} - capture started MID-RUN; "
+                           "playback will make a best-effort position alignment",
+                           anchors.front().tick);
     }
     return true;
 }
@@ -446,6 +460,11 @@ SkMacro* SkMacro::loadFromPath(std::filesystem::path const& path) {
     skkbot2::log::info("LOADED '{}' | main: inputs={} anchors={} frames={} | chainLinks={} varianceSlots={} hintTps={}",
         stem, macro->inputs.size(), macro->anchors.size(), macro->perFrames.size(),
         macro->persistenceAttempts.size(), macro->varianceOverrides.size(), macro->framerate);
+    if (macro->startedMidRun()) {
+        skkbot2::log::info("LOADED '{}' origin: mid-run recording - timeline starts at tick {} p1=({:.0f},{:.0f}); "
+                           "playback aligns by player position",
+            stem, macro->recordFirstTick(), macro->recordStartX(), macro->recordStartY());
+    }
     return macro;
 }
 

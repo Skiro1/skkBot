@@ -1,5 +1,8 @@
+#include <imgui.h>
+
 #include "skkBot.hpp"
 #include "format/skk3_format.hpp"
+#include "gui/blur.hpp"
 #include "gui/skkbot_gui.hpp"
 #include "logger/logger.hpp"
 #ifdef GEODE_IS_WINDOWS
@@ -10,6 +13,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/utils/Keyboard.hpp>
 #include <Geode/utils/general.hpp>
+#include <Geode/utils/string.hpp>
 #include <imgui-cocos.hpp>
 
 #include <algorithm>
@@ -21,8 +25,8 @@ using namespace skkbot2::gui;
 
 $on_mod(Loaded) {
     auto& logger = skkbot2::Logger::get();
-    logger.setLevel(skkbot2::Logger::None);
-    logger.setFileLogging(false);
+    logger.setLevel(skkbot2::Logger::Debug);
+    logger.setFileLogging(true);
 
     logger.info("========================================");
     logger.info("skkBot2 v{} initializing (M1: SKK3 Record/Play + TPS)", MOD_VERSION);
@@ -73,35 +77,41 @@ $on_mod(Loaded) {
             // Rasterize a real TTF at a DPI-aware size so text is crisp (the
             // default imgui font is tiny and gets upscaled -> blurry), and so
             // Cyrillic renders instead of boxes.
+            // Roboto: a plainer grotesque than the old Inter, bundled in the
+            // mod's resources.
             auto& io = ImGui::GetIO();
             float factor = std::max(1.0f, geode::utils::getDisplayFactor());
             int fontSize = static_cast<int>(std::round(18.0f * factor));
 
-            const char* candidates[] = {
-                "C:\\Windows\\Fonts\\segoeui.ttf",
-                "C:\\Windows\\Fonts\\arial.ttf",
-                "C:\\Windows\\Fonts\\tahoma.ttf",
-                "C:\\Windows\\Fonts\\verdanab.ttf",
+            const auto resDir = Mod::get()->getResourcesDir();
+            ImFontConfig cfg;
+            cfg.OversampleH = 3;
+            cfg.OversampleV = 3;
+            cfg.GlyphExtraAdvanceX = -0.45f;
+
+            auto fontFile = [&](const char* name) {
+                return geode::utils::string::pathToString(resDir / name);
             };
-            ImFont* loaded = nullptr;
-            for (const char* path : candidates) {
-                ImFont* f = io.Fonts->AddFontFromFileTTF(path, static_cast<float>(fontSize));
-                if (f) {
-                    loaded = f;
-                    break;
-                }
-            }
+
+            ImFont* loaded = io.Fonts->AddFontFromFileTTF(
+                fontFile("font_main.ttf").c_str(), static_cast<float>(fontSize), &cfg);
             if (loaded) {
                 io.FontDefault = loaded;
                 io.FontGlobalScale = 1.0f;
                 skkbot2::Logger::get().info(
-                    "skkBot2 ImGui custom font loaded (size {})", fontSize);
+                    "skkBot2 Roboto font loaded (size {})", fontSize);
             } else {
                 skkbot2::Logger::get().warn(
-                    "skkBot2 could not load a system font; using default");
+                    "skkBot2 could not load Roboto font; using default");
             }
+            // ONE font for the whole bot: every label, readout, number and the
+            // wordmark render in the same regular Roboto loaded above. The old
+            // semibold (logo) and mono (readout) faces are intentionally gone.
         })
         .draw([] {
+            // Reset blur regions for new ImGui frame
+            skkbot2::gui::blur::newFrame();
+
             // Issue any capture pending from the renderer's last pts boundary
             // BEFORE the GUI overlay is drawn, so the bot menu never leaks
             // into the video (the capture reads a fresh backbuffer).
@@ -112,6 +122,7 @@ $on_mod(Loaded) {
             // laid out (and vertex-converted) at the real window size — the same
             // height it has outside a render.
             renderer.useWindowViewForUi();
+
             skkbot2::gui::get().draw();
         });
 
@@ -142,6 +153,20 @@ $on_mod(Loaded) {
             return ListenerResult::Propagate;
         }
         gui.handleKey(key, down, repeat);
+        return ListenerResult::Propagate;
+    }).leak();
+
+    // Dispatch right and middle mouse clicks to ImGui (gd-imgui-cocos only touches left click).
+    MouseInputEvent().listen([](MouseInputData& data) {
+        if (ImGuiCocos::get().isInitialized()) {
+            auto& io = ImGui::GetIO();
+            int btn = -1;
+            if (data.button == MouseInputData::Button::Right) btn = 1;
+            else if (data.button == MouseInputData::Button::Middle) btn = 2;
+            if (btn >= 0) {
+                io.AddMouseButtonEvent(btn, data.action == MouseInputData::Action::Press);
+            }
+        }
         return ListenerResult::Propagate;
     }).leak();
 

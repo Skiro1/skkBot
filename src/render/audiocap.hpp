@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 #include <functional>
@@ -8,6 +8,8 @@
 
 namespace skkbot2 {
 namespace render {
+
+void enableFmodUpdateHook(bool enable);
 
 // Realtime audio capture for the renderer (Silicate-style).
 //
