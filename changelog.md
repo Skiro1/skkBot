@@ -1,3 +1,58 @@
+# v0.1.2 (2026-10-24)
+Major feature update introducing the ultra-compressed SKC format, universal third-party replay import, high-performance rendering pipeline, FPS bypass, redesigned trajectory simulation, and extensive customization.
+
+## New
+- **Ultra-compressed SKC format (`.skc`)**:
+  - New inputs-only macro format using adaptive range coding (~1–2 bytes per input event) without storing heavy physics states.
+  - Supports both recording and playback.
+  - *Note: currently in active development / beta; platformer mode may experience desyncs on deaths/checkpoints; CBS and COS accuracy modes are not yet supported for SKC.*
+- **Universal Replay Import & Playback**:
+  - Full playback support for popular third-party macro formats: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay (`.ttr3`), ToastyReplay Lite (`.ttrl`), and Xenon (`.xe`).
+  - Pure input dispatch: external physics state injections are safely bypassed, allowing GD's native physics engine to simulate the macro deterministically.
+- **Custom FPS Bypass**:
+  - Added configurable Display FPS target (e.g. 60, 144, 240, 360, up to 1000 FPS) with automatic integration into GD's native custom FPS and vertical sync management.
+- **Frame Stepper (Beta)**:
+  - Step through physics ticks frame-by-frame using on-screen buttons or dedicated hotkeys for precise frame inspection.
+- **Layout Mode**:
+  - Added Layout Mode toggle for enhanced visibility and level debugging.
+- **Keybinds System**:
+  - Dedicated Keybinds screen with fully customizable hotkeys for all primary bot actions (Menu, Record, Play, Clear, Frame Stepper, Trajectory, Hitboxes, Layout Mode, Safe Mode).
+- **UI Typography & Font Customization**:
+  - Added options to select custom UI fonts and adjust UI Font Scale directly from the Settings tab.
+- **Safe Mode**:
+  - Added Safe Mode toggle to guard against accidental inputs and unintended state mutations.
+- **Dynamic FFmpeg Downloader**:
+  - FFmpeg binaries are no longer packed inside the `.geode` file (slimming package size down from hundreds of MBs to ~3 MB).
+  - Built-in mirror speed benchmark automatically tests and downloads the required libraries from GitHub or Codeberg on demand.
+- **SKK Format Updated (SKK3)**:
+  - Added target display FPS field to `.skk` metadata alongside TPS and physics state bundles.
+
+## Improvements & Performance
+- **High-Performance Video Render Pipeline**:
+  - Hardware encoding optimizations for Intel QSV (`preset=veryfast`, `async_depth=4`), AMD AMF (`quality=speed`, `usage=lowlatency`), and NVIDIA NVENC.
+  - Expanded PBO pool to 16 slots with 16-frame ring buffer and fast batch ramp-up (`m_batchLimit=3`, `kGrowStreak=2`).
+  - Zero-overhead OpenGL pipeline: eliminated per-frame `glGetError` stalls and redundant synchronous `glGetIntegerv` driver queries.
+  - Independent render clock ensuring uniform frame delivery without speed fluctuations.
+- **Enhanced TPS Engine**:
+  - Improved step-grid midhooks and unified micro-substep accumulator for stable, deterministic execution at any tickrate.
+- **Reworked Trajectory Preview (Beta)**:
+  - Re-engineered lightweight dual-hypothesis trajectory predictor (Hold / Release).
+  - Computation moved from physics ticks to Cocos scene rendering (`TrajectoryDrawNode::visit`), completely eliminating in-game physics lag.
+- **Project License**:
+  - Official project license updated to **GNU General Public License v3.0 or later** (GPL-3.0-or-later).
+
+## Fixes
+- **Windows Cyrillic & Non-ASCII Path Crash**:
+  - Replaced MSVC `path.string()` calls with exception-safe UTF-8 conversions (`skk::pathToUtf8`), resolving fatal game crashes on Windows when user profiles or level names contain Cyrillic or non-ASCII characters.
+- **UI Visual Glitches & Contrast Polish**:
+  - Fixed dark text on disabled action buttons (such as "START RENDER") by making disabled button labels crisp white.
+  - Fixed `AUDIO_DEFERRED_WAIT` log spam when leaving levels or canceling renders.
+  - Fixed hitboxes toggle triggering on text clicks.
+  - Standardized accordion sections (`SPEED`, `NOCLIP`, `FRAME STEPPER`, etc.) with unified metrics, smooth animations, and click-gating.
+- Checkpoint restore stability and memory leak prevention during rapid restarts.
+
+---
+
 # v0.1.1 (2026-10-04)
 Minor update bringing redesigned modern UI, engine stability fixes and expanded customization.
 
