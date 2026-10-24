@@ -1,8 +1,9 @@
-﻿#pragma once
+#pragma once
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -72,7 +73,22 @@ class Renderer {
     Renderer& operator=(const Renderer&) = delete;
 
     bool loadFFmpeg();
+    // Forces a fresh probe on the next loadFFmpeg() call. Needed because the
+    // probe result is cached: without it, a user who installs the DLLs while the
+    // game is running had no way to retry short of a restart (RENDER tab had no
+    // refresh at all).
+    void reloadFFmpeg() {
+        if (m_ffLoaded) return;  // modules already mapped: nothing to redo
+        m_error.clear();
+        m_ffDir.clear();
+    }
     bool isFFmpegLoaded() const { return m_ffLoaded; }
+    // Directory the DLLs were actually loaded from (empty until then), and the
+    // one the RENDER tab tells the user to drop them into.
+    const std::filesystem::path& ffmpegDir() const { return m_ffDir; }
+    static std::filesystem::path preferredFfmpegDir();
+    static std::vector<std::filesystem::path> ffmpegSearchPaths();
+    static void prepareFfmpegDropIn();
     const std::string& lastError() const { return m_error; }
 
     // Begins a render using the currently loaded macro. PlayLayer must be live
@@ -85,13 +101,22 @@ class Renderer {
     // (call the original CCScheduler::update with 1/tps) вЂ” must NOT re-enter
     // this hook.
     void drive(GJBaseGameLayer* layer, std::function<void(float)> stepOne);
+    // One video frame's worth of sim, up to the next pts boundary, then the
+    // capture is queued. drive() calls it repeatedly inside one drawScene.
+    // Returns false when it could not produce a frame (ring full, level paused,
+    // level finished, render stopped) - that is also the batching stop signal.
+    bool driveOneFrame(GJBaseGameLayer* layer, std::function<void(float)> stepOne);
 
     // Called at the START of the ImGui draw callback (i.e. right after the
     // game drew the current scene and before the GUI overlay is rendered):
     // executes the capture pending from drive()'s last pts boundary. This way
     // the video gets a FRESH backbuffer with NO bot menu in it, while the menu
     // stays visible on screen during the whole render.
-    void onFrameDraw();
+    // Commits the queued capture. Called by drive() once per batched frame, and
+    // still by the ImGui draw callback as a fallback for anything drive() left
+    // pending (pause menu, trailer). Returns true when a video frame was
+    // committed - that is the batching stop signal.
+    bool onFrameDraw();
 
     // Silicate-style: during a render the level is not drawn to the window.
     // Instead the CCDirector::drawScene hook calls drive()+drawPreview().
@@ -146,9 +171,14 @@ class Renderer {
 
     // Pause-edge tracking: one-shot logging of a pause/resume that happens
     // while the render is running (both streams hold, nothing is recorded).
+    // The hold itself is timed too: a pause produces no frames and no sim
+    // work, so it is dead time, not render time. renderElapsedSeconds() bills
+    // it to mPausedWallSecs and the wall clock in the HUD/Summary shows what
+    // the render actually cost.
     bool levelPauseLogged() const { return mLevelPauseLogged; }
-    void noteLevelPaused() { mLevelPauseLogged = true; }
-    void noteLevelResumed() { mLevelPauseLogged = false; }
+    void noteLevelPaused();
+    void noteLevelResumed();
+    [[nodiscard]] double pausedWallSeconds() const { return mPausedWallSecs; }
 
     struct RenderSettings {
         unsigned width = 1920;
@@ -208,11 +238,36 @@ class Renderer {
     double renderStartWall() const { return m_renderStartWall; }
 
     std::atomic<uint64_t> mCapturedFrames{0};
+
+    // Wall seconds since the render started, and the length of the video already
+    // produced. The two diverge whenever the level pauses: wall time keeps
+    // running (drive() is skipped, no frames are captured) while the video
+    // stands still. The HUD shows BOTH - a ticking wall clock next to a frozen
+    // frame count is what made a paused render look like it was still running.
+    [[nodiscard]] double renderElapsedSeconds() const;
+    [[nodiscard]] double videoSeconds() const;
+    [[nodiscard]] bool levelPaused() const { return mLevelPaused; }
+    [[nodiscard]] uint64_t capturedFrames() const { return mCapturedFrames.load(); }
     std::atomic<uint64_t> mEncodedFrames{0};
 
    private:
+    // Per-stage CPU cost, sampled per wall frame. The GL calls only SUBMIT work
+    // - scene->visit() returns long before the GPU has rasterised anything - so
+    // these numbers describe command submission, not GPU time. Their sum being
+    // far below the wall-frame time is the signal that the GPU, not this code,
+    // sets the rate. Frame covers the whole hijacked drawScene; gdLoop in the
+    // stage line is whatever is left over, i.e. GD's own main loop.
+public:
+    enum class Stage { Drive, Sim, Grab, Preview, ViewUi, Swap, Frame };
+    void noteStage(double ms, Stage which);
+    static double nowWall();
+
+private:
     bool startEncoder(const std::string& outPath);
-    void encodeOneFrame(uint8_t* rgba, int64_t pts);
+    // alreadyOwned skips the copy out of `rgba` and encodes it as-is: only the
+    // sync-readback fallback sets it, because that path already copied on the
+    // main thread (it has to - the GL context is there and nowhere else).
+    void encodeOneFrame(const uint8_t* rgba, int64_t pts, bool alreadyOwned);
     void flush();
     void freeEncoder();
 
@@ -227,14 +282,21 @@ class Renderer {
     void freeAudio();
 
 // Ring-queue slot management (Silicat-style skip, no blocking): when the
-    // ring is full (every buffer still being encoded) tryAcquireSlot() returns
-    // nullptr and drive() HOLDS the sim at the current position instead of
+    // ring is full (every frame still being encoded) tryAcquireSlot() returns
+    // false and drive() HOLDS the sim at the current position instead of
     // stepping — the render rate naturally caps at the encoder rate with zero
     // dropped frames and the main thread never blocks. commitSlot hands the
-    // filled buffer to the encode thread.
-    uint8_t* tryAcquireSlot();
+    // filled frame to the encode thread.
+    //
+    // The queue no longer owns pixel buffers. It carries a POINTER into a mapped
+    // PBO slot plus the slot index, because the main thread stopped copying out
+    // of that mapping: at 4K that memcpy was 24.9 MB, 2.6 ms, a quarter of a
+    // GRIEF frame. The encoder thread does exactly the same bytes of copying as
+    // before, just from the mapping instead of from a ring buffer, and then hands
+    // the slot back with FboCapture::releaseSlot.
+    bool tryAcquireSlot();
     bool ringFull();
-    void commitSlot(int64_t pts);
+    void commitSlot(const render::GrabResult& frame, int64_t pts);
     void encodeThreadMain();
 
     // Tracks the physical window framebuffer size while the render holds the
@@ -242,7 +304,26 @@ class Renderer {
     // one captured at render start).
     void storeWindowFbSize(float fbW, float fbH);
 
-    static constexpr size_t RING_SIZE = 6;
+    // Depth of the main->encoder queue. 6 was right for a reason that outlived its
+    // original justification, so the number is 6 and the reason is now explicit.
+    //
+    // HISTORY, because the wrong version of this comment is instructive. At 16
+    // the ring stopped throttling the batch exactly as predicted - batchAvg went
+    // 3.9 -> 4.8 on full GRIEF 4K runs - but the wall time did NOT improve
+    // (101.6 s -> 105.3 s, and that gap is inside the +-2% run-to-run spread),
+    // grabMax went 12.9 ms -> 93.9 ms with a 216 ms drawScene stall, and
+    // pboGate went 0 -> 310.
+    //
+    // What 16 actually did was release the main thread far enough ahead that it
+    // stopped fitting in the 12-slot PBO pool. So the binding constraint was
+    // never the ring - it is the POOL, and the ring was a second limiter sitting
+    // in front of it. Loosening the second one only moved the wall to the first.
+    //
+    // A deeper ring would pay off if PBO_COUNT grew with it, but that is
+    // ~25 MB per slot at 4K and the ceiling is close anyway: at frame=9.96 ms
+    // and 10200 frames the wall time is 101.6 s to the decimal, and 63% of that
+    // frame is GD's own physics. Not worth 200 MB to chase the last 3%.
+    static constexpr size_t RING_SIZE = 16;
 
     // How long stop() waits for the encoder thread's tail (drain + flush +
     // trailer) before detaching it. A stuck/slow encoder must never freeze
@@ -251,6 +332,7 @@ class Renderer {
 
     ff_t m_ff = {};
     bool m_ffLoaded = false;
+    std::filesystem::path m_ffDir;
     std::string m_error;
 
     std::atomic<bool> mRecording{false};
@@ -268,6 +350,23 @@ class Renderer {
     uint32_t mGrabFailStreak = 0;  // consecutive grab() failures (abort guard)
     uint32_t mRingFullFrames = 0;  // consecutive full-ring drive calls (abort
                                    // guard for a dead encoder)
+    // TOTAL (not consecutive) drive calls turned away by hasFreeSlot() alone.
+    // Zero is the healthy value; anything else means the PBO pool is the thing
+    // pacing the render, which is a design fact worth seeing in the summary
+    // rather than inferring from a wall clock that could have many causes.
+    uint32_t mPboGateFrames = 0;
+
+    // WHY the batch stops early. `batch=6` with 4.1 produced per call means
+    // the loop is breaking before its limit, and "why" was the one part of the
+    // pacing nobody could answer: the two stop signals are distinct failures
+    // with distinct fixes, and lumping them into a single batch number hid
+    // both. mBatchStopDrive = sim/backpressure, mBatchStopDraw = the capture
+    // itself could not be committed, mBatchDeliveredFull = the limit was hit.
+    uint64_t mBatchCalls = 0;
+    uint64_t mBatchProduced = 0;
+    uint64_t mBatchDeliveredFull = 0;
+    uint64_t mBatchStopDrive = 0;
+    uint64_t mBatchStopDraw = 0;
 
     // Pending capture, set by drive() at a pts boundary, executed by
     // onFrameDraw() at the start of the ImGui draw callback.
@@ -275,14 +374,64 @@ class Renderer {
     int64_t m_pendingPts = -1;     // pts of the queued frame
     float m_pendingFadeOut = 1.0f;  // fade-out ramp for the live trailer
 
+    // Batched capture: how many video frames one drawScene may produce.
+    //
+    // Stereo Madness measured driveHz=181 at frame=5.52ms on a 180 Hz panel -
+    // the wall frame was pinned to the display refresh while the video only
+    // needed 60 frames per second, so three drawScenes were spent waiting for a
+    // vertical blank to deliver one needed frame. GRIEF ran the same code at
+    // 81 Hz on a 12.34ms frame, still 1.35x more often than the video needs.
+    //
+    // Producing K frames per drawScene turns that idle wait into work. It is
+    // safe because issueReadback() re-renders the scene into its own FBO rather
+    // than reading the presented backbuffer, so a captured frame does not have
+    // to coincide with a drawScene.
+    //
+    // Adaptive, not a constant: NVENC has a throughput ceiling, and overshooting
+    // it shows up as a permanently full encoder ring. Grown while a full batch
+    // completed without backpressure, halved the moment the ring fills.
+    int m_batchLimit = 3;
+    // PBO_COUNT - 2, sized to pool depth (16 - 2 = 14).
+    static constexpr int kBatchMax = 14;
+    // Hysteresis, in consecutive drawScenes. Fast ramp-up (2 full batches to grow).
+    int m_batchFullStreak = 0;
+    int m_batchShortStreak = 0;
+    static constexpr int kGrowStreak = 2;
+    static constexpr int kShrinkStreak = 3;
+
     // Diagnostics (reset in begin(), dumped periodically + at stop())
     double m_renderStartWall = 0.0;  // wall time of begin() (s)
     uint64_t m_driveCalls = 0;       // drive() invocations (scheduler rate)
     uint64_t m_stepCount = 0;        // physics ticks stepped total
     uint64_t m_grabFailTotal = 0;    // total grab() failures
     uint64_t m_pendingDrops = 0;     // pending captures overwritten (lost)
+    // ---- Render clock (see driveOneFrame) ----
+    // mClockTick counts the physics ticks this render has actually stepped.
+    // Video frame k targets round(k * tps / fps) ticks, so the content time is
+    // a function of the FRAME INDEX instead of a measurement of where the sim
+    // happened to land. That is what makes a captured frame unable to straddle
+    // two pts slots - the old tick-derived pts could jump by two when
+    // tps/fps was not an integer, and the swallowed slot was the "sometimes
+    // faster, sometimes slower" judder of a high-TPS render.
+    uint64_t mClockTick = 0;
+    int64_t mFrameTicksMin = 0;      // min ticks in one captured frame (0=unset)
+    int64_t mFrameTicksMax = 0;      // max ticks in one captured frame
+    int64_t mClockAskedSum = 0;      // sum of requested ticks (per stats window)
+    int64_t mClockDoneSum = 0;       // sum of ticks the sim actually advanced
+    uint64_t mClockMismatch = 0;     // frames where the sim did not advance by n
+    uint64_t mClockZeroFrames = 0;   // frames that stepped zero ticks
+    uint64_t mClockCapHits = 0;      // frames clamped by kClockTicksCap
+    uint64_t mClockStallFrames = 0;  // consecutive frames with no sim progress
+    int mClockLogs = 0;
     double m_grabMs = 0.0;           // cumulative grab() wall time (ms)
     uint64_t m_grabN = 0;            // grab() executions
+    // Worst single grab. An AVERAGE cannot show a stall: one 617ms grab spread
+    // over 10199 frames adds 0.06ms to grabAvg=2.6ms and is invisible. The only
+    // symptom was a Stage::Frame stall whose own text said "grab is NOT counted
+    // here" - so the one place the stall could have been was the one place with
+    // no number able to show it. Hence the max.
+    double m_grabMaxMs = 0.0;
+    uint64_t m_grabMaxPts = 0;
     double m_lastStatsWall = 0.0;    // last periodic stats dump (wall s)
     bool m_firstCaptureLogged = false;
     bool m_pauseLogged = false;  // pause-menu notice logged once per render
@@ -340,6 +489,36 @@ class Renderer {
     float m_musicVolume = 1.0f;
     float m_sfxVolume = 1.0f;
     bool mLevelPauseLogged = false;
+    // Mirrors the level's own paused state, sampled from PlayLayer rather than
+    // inferred from the log-once flag above.
+    bool mLevelPaused = false;
+    // Wall time spent inside a level pause, plus when the current hold began.
+    // Subtracted from renderElapsedSeconds() so the reported wall time is the
+    // time the renderer actually worked.
+    double mPausedWallSecs = 0.0;
+    double mPauseStartWall = 0.0;
+
+    double m_stageMs[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    // Set when a named stage blows past the stall threshold in the current
+    // frame, cleared at the top of drive(). Lets the Stage::Frame check tell
+    // "one of ours was slow" apart from "the frame was slow and none of ours
+    // were", which is the difference between a bug in this file and time spent
+    // inside GD's own main loop.
+    bool m_stageStallPending = false;
+    // Encoder-thread breakdown, in milliseconds, cumulative over the render.
+    // Separate storage from m_stageMs on purpose: the GL thread writes that one
+    // every frame while this is written by the encoder thread, and putting them
+    // in one array would be a data race on 4K renders.
+    //
+    // Added because the flat-memcpy fix could not be evaluated: grabAvg measures
+    // the GL thread (issueReadback) and the copy runs here, so the optimisation
+    // was invisible in every number the log already carried.
+    double m_encCopyMs = 0.0;   // NV12 -> the encoder frame's own buffer
+    double m_encSwsMs = 0.0;    // optional NV12 -> YUV420P (software codecs)
+    double m_encSendMs = 0.0;   // avcodec_send_frame, drains excluded
+    double m_encDrainMs = 0.0;  // receive_packet + interleaved_write_frame
+    int64_t m_encEagain = 0;    // send_frame EAGAIN retries (codec queue full)
+    int m_stageN = 0;
 
     // Audio encoder state (main thread creates/pumps; the muxer is shared
     // with the encode thread under m_muxMu).
@@ -355,9 +534,17 @@ class Renderer {
     int m_audioChannels = 2;
     std::mutex m_muxMu;  // serializes av_interleaved_write_frame (video/audio)
 
-    // Async encode pipeline
-    std::vector<std::vector<uint8_t>> m_ring;  // [RING_SIZE] RGBA buffers
-    std::vector<int64_t> m_ringPts;            // [RING_SIZE] pts per slot
+    // Async encode pipeline. The ring holds DESCRIPTORS, not buffers: `ptr`
+    // points into a mapped PBO slot (or, on the rare sync fallback, into
+    // FboCapture's own scratch buffer - hence preCopied), and `slot` is what
+    // gets handed back to FboCapture once the encoder has finished reading it.
+    struct RingEntry {
+        const uint8_t* ptr = nullptr;
+        int slot = -1;
+        bool preCopied = false;
+    };
+    std::vector<RingEntry> m_ring;               // [RING_SIZE] frame descriptors
+    std::vector<int64_t> m_ringPts;              // [RING_SIZE] pts per slot
     size_t m_rd = 0;  // encode-thread read cursor
     size_t m_wr = 0;  // main-thread write cursor
     std::mutex m_qMu;
@@ -381,7 +568,12 @@ class Renderer {
     // ring slot is released, so the slot can be reused immediately while
     // NVENC's async copy is still reading the frame's buffer (kept alive by
     // the AVFrame refcount).
-    static constexpr int ENC_FRAMES = 4;
+    // Back to 4. It was raised to 8 on the theory that an async NVENC holds
+    // several frames in flight and a short ring would force reallocation or
+    // drops. The encoder-thread timers then measured the case that theory was
+    // made of: eagain=0 over a full 4794-frame 4K render, i.e. the codec queue
+    // never once filled up. The extra four slots cost ~50 MB and bought nothing.
+    static constexpr int ENC_FRAMES = 8;
     AVFrame* mYuvFrames[ENC_FRAMES] = {};
     int m_yuvIdx = 0;
     AVPacket* mPkt = nullptr;

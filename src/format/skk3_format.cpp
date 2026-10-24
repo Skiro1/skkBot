@@ -1580,6 +1580,32 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
     writeLE<uint32_t>(output, macro.rngSeed);
     writeLE<uint8_t>(output, static_cast<uint8_t>(sanitizeAccuracyMode(static_cast<int>(macro.accuracyMode))));
     writeLE<double>(output, macro.duration);
+    // The header is a sequence of optional fields, each read only if the bytes
+    // are there. Appending the display rate is therefore backward compatible
+    // with no version bump: an old file simply stops early and means "follow
+    // the tick rate", which is what it always meant.
+    //
+    // THREE states now, and only one of them is "do not write the field":
+    //   +0.0  no display rate was captured - the bytes are omitted
+    //   -0.0  captured with FPS on at exactly the tick rate -> "follow tps"
+    //    n>0  captured with FPS on at n != tps -> pinned
+    // Minus zero compares equal to plus zero everywhere, so it has to be tested
+    // with signbit and not with `== 0.0`. It survives the raw double write
+    // below, which is the only reason it can be used as a marker at all.
+    const double rateTps = validTps(macro.framerateHint) ? macro.framerateHint : 240.0;
+    const bool followTps =
+        macro.displayFps == 0.0 && std::signbit(macro.displayFps);
+    const bool pinned = macro.displayFps > 0.0 && std::isfinite(macro.displayFps) &&
+        std::abs(macro.displayFps - rateTps) > 1e-3;
+    // A POSITIVE number equal to the tick rate is normalised to the marker here,
+    // not dropped. Dropping it would turn "FPS on, follow tps" into "no FPS
+    // information at all", which is a different instruction on playback - and a
+    // writer that stores the same statement two ways is how two sources of
+    // truth start.
+    const bool equalsTps = macro.displayFps > 0.0 && std::isfinite(macro.displayFps) && !pinned;
+    if (followTps || pinned || equalsTps) {
+        writeLE<double>(output, equalsTps ? std::copysign(0.0, -1.0) : macro.displayFps);
+    }
 
     if (output.size() > std::numeric_limits<uint32_t>::max()) {
         return {};
@@ -1719,6 +1745,20 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
     if (metadataCtx.remaining() >= sizeof(double)) {
         macro.duration = readLE<double>(metadataCtx);
         if (!validTime(macro.duration)) return fail("invalid SKK3 duration");
+    } else if (metadataCtx.remaining() != 0) {
+        return fail("invalid SKK3 metadata");
+    }
+    if (metadataCtx.remaining() >= sizeof(double)) {
+        macro.displayFps = readLE<double>(metadataCtx);
+        // Three states live in this one double: -0.0 = "captured with FPS on at
+        // exactly the tick rate", +n = pinned, and the field being ABSENT = the
+        // macro carries no display rate at all. -0.0 passes the range check
+        // because it compares equal to zero; do not "simplify" this to
+        // `<= 0.0`, which would reject the middle state.
+        if (!std::isfinite(macro.displayFps) ||
+            (macro.displayFps != 0.0 && (macro.displayFps < 1.0 || macro.displayFps > 1'000'000.0))) {
+            return fail("invalid SKK3 display fps");
+        }
     } else if (metadataCtx.remaining() != 0) {
         return fail("invalid SKK3 metadata");
     }
@@ -2238,6 +2278,7 @@ Macro fromSkMacro(SkMacro const& macro) {
     result.levelName = macro.levelName;
     result.author = macro.author;
     result.framerateHint = tps;
+    result.displayFps = macro.displayFps;
     result.duration = macro.duration;
     result.startPosX = macro.startPosX;
     result.startPosY = macro.startPosY;
@@ -2311,6 +2352,7 @@ SkMacro toSkMacro(Macro const& macro) {
     result.levelName = macro.levelName;
     result.levelId = macro.levelId;
     result.framerate = tps;
+    result.displayFps = macro.displayFps;
     result.duration = macro.duration;
     result.gameVersion = static_cast<uint32_t>(std::min<uint64_t>(
         macro.gameVersion,
@@ -2386,6 +2428,147 @@ SkMacro toSkMacro(Macro const& macro) {
     }
     result.exactCbsTiming = exactTiming;
     result.accuracyMode = sanitizeAccuracyMode(static_cast<int>(macro.accuracyMode));
+    return result;
+}
+
+// The header self-test. Its subject is one specific promise, and it is the
+// reason the display rate was added as an OPTIONAL trailing field rather than a
+// version bump: a .skk written before the field existed has to keep loading.
+//
+// The proof is structural rather than a stored old fixture. There is no legacy
+// file to compare against, because there has never been one - kWireVersion has
+// always been an exact-match check, so every pre-existing .skk on disk was
+// written by the immediately previous build. What that build wrote is exactly
+// what THIS build writes when displayFps is 0: the field is omitted, not
+// zero-filled. So "encode with no display rate" IS the old shape, byte for
+// byte, and comparing the two headers measures the compatibility claim instead
+// of asserting it.
+//
+// What this must NOT become: a size-based guess that accepts either header
+// length. A reader that sniffs 4-vs-8 bytes is a reader that will one day read
+// one format as the other, and the whole reason this field is optional is that
+// the old shape is the ONLY thing the reader has to recognise - as itself.
+HeaderSelfTestResult selfTestHeader() {
+    HeaderSelfTestResult result;
+
+    auto headerLenOf = [](std::vector<uint8_t> const& bytes) -> size_t {
+        // Written at a fixed offset: magic(4) version(2) reserved(2) flags(4).
+        if (bytes.size() < kHeaderSize) return 0;
+        return static_cast<size_t>(bytes[12]) |
+               (static_cast<size_t>(bytes[13]) << 8) |
+               (static_cast<size_t>(bytes[14]) << 16) |
+               (static_cast<size_t>(bytes[15]) << 24);
+    };
+
+    Macro base;
+    base.levelId = 4242;
+    base.levelName = "selftest";
+    base.framerateHint = 240.0;
+    base.duration = 1.5;
+    // A couple of inputs, so the payload is not empty and a length comparison
+    // cannot pass by both sides failing to write anything at all.
+    for (int i = 0; i < 8; ++i) {
+        Input in;
+        in.timeSeconds = static_cast<double>(i * 12) / 240.0;
+        in.button = 1;
+        in.player2 = false;
+        in.pressed = (i % 2) == 0;
+        base.inputs.push_back(in);
+    }
+
+    // Case 1: no display rate. This is the old shape, and it must still be a
+    // valid file that decodes with the field at its "the macro carries no
+    // display rate" default (+0.0) rather than at whatever the bytes happened
+    // to contain.
+    Macro plain = base;
+    plain.displayFps = 0.0;
+    const auto plainBytes = serialize(plain);
+    if (plainBytes.empty()) {
+        result.detail = "serialize refused a macro with no display rate";
+        return result;
+    }
+    std::string error;
+    auto plainBack = deserialize(plainBytes, &error);
+    if (!plainBack) {
+        result.detail = "old-shape header did not decode: " + error;
+        return result;
+    }
+    if (plainBack->displayFps != 0.0 || std::signbit(plainBack->displayFps)) {
+        result.detail = "old-shape header decoded a display rate that was never written";
+        return result;
+    }
+    if (plainBack->framerateHint != 240.0 || plainBack->inputs.size() != base.inputs.size()) {
+        result.detail = "old-shape header lost the tick rate or the inputs";
+        return result;
+    }
+
+    // Case 2: a real display rate. The header must grow by exactly one field
+    // and nothing else, and the value has to come back.
+    const size_t plainHeader = headerLenOf(plainBytes);
+    Macro pinned = base;
+    pinned.displayFps = 60.0;
+    const auto pinnedBytes = serialize(pinned);
+    if (pinnedBytes.empty()) {
+        result.detail = "serialize refused a macro with a display rate";
+        return result;
+    }
+    const size_t pinnedHeader = headerLenOf(pinnedBytes);
+    if (pinnedHeader != plainHeader + sizeof(double)) {
+        result.detail = "display rate grew the header by " +
+                        std::to_string(pinnedHeader - plainHeader) + " bytes, expected 8";
+        return result;
+    }
+    auto pinnedBack = deserialize(pinnedBytes, &error);
+    if (!pinnedBack || pinnedBack->displayFps != 60.0) {
+        result.detail = "display rate did not survive the round-trip";
+        return result;
+    }
+
+    // Case 3: a value equal to the tick rate is stored, but AS THE MARKER. A
+    // file carrying 240 would be one number with two homes; a file carrying
+    // nothing would say "FPS was off", which is not what was recorded. -0.0 is
+    // the third option and the only correct one.
+    Macro equalRate = base;
+    equalRate.displayFps = 240.0;
+    const auto equalBytes = serialize(equalRate);
+    if (headerLenOf(equalBytes) != plainHeader + sizeof(double)) {
+        result.detail = "a display rate equal to the tick rate was not stored at all";
+        return result;
+    }
+    auto equalBack = deserialize(equalBytes, &error);
+    if (!equalBack || !(equalBack->displayFps == 0.0 &&
+                        std::signbit(equalBack->displayFps))) {
+        result.detail = "a display rate equal to the tick rate did not come back as "
+                        "the follow-tps marker";
+        return result;
+    }
+
+    // Case 4: the marker written directly. Same rule as case 3, but through the
+    // other door - captureForStorage produces -0.0 itself, so the writer must
+    // pass it through rather than trusting every caller to hand it 240.
+    Macro marker = base;
+    marker.displayFps = -0.0;
+    const auto markerBytes = serialize(marker);
+    if (headerLenOf(markerBytes) != plainHeader + sizeof(double)) {
+        result.detail = "the follow-tps marker was not stored";
+        return result;
+    }
+    auto markerBack = deserialize(markerBytes, &error);
+    if (!markerBack || markerBack->displayFps != 0.0 ||
+        !std::signbit(markerBack->displayFps)) {
+        result.detail = "the follow-tps marker did not survive the round-trip";
+        return result;
+    }
+    const auto markerAgain = serialize(*markerBack);
+    auto markerAgainBack = deserialize(markerAgain, &error);
+    if (!markerAgainBack || markerAgainBack->displayFps != 0.0 ||
+        !std::signbit(markerAgainBack->displayFps)) {
+        result.detail = "the follow-tps marker is not stable across a re-write";
+        return result;
+    }
+
+    result.ok = true;
+    result.oldShapeHeaderBytes = plainHeader;
     return result;
 }
 

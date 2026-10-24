@@ -16,13 +16,18 @@ that replaces the cocos frontend of the old skkBot.
 - **Per-frame persistence-attempt** recording + playback, practice-mode support,
   frame stepper (forward), dead-cell hold-sync on checkpoints
 - **Checkpoint system** with `PlayerStateBundle` (54 fields) and Rubber-Banding reconcile
-- **Single macro format `.skk` (SKK3)**: zstd-22 compression, dense wire encoding
-  (varint/zigzag/XOR + RLE), per-frame delta layout, checkpoints, persistence,
-  triple-RNG boundaries
-- **Built-in video renderer** (bundled FFmpeg): FBO + PBO ring, GPU NV12 output,
+- **Supported Macro Formats**:
+  - **.skk (SKK3)**: native state-verified binary format with physics snapshots, checkpoints, persistence attempts, triple-RNG boundaries, and target display FPS (Recording & Playback).
+  - **.skc (SKC)**: ultra-compressed inputs-only format (~1–2 bytes/action) using adaptive range coding without heavy physics snapshots (Recording & Playback, beta).
+  - **Third-Party Formats (Playback only)**: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay (`.ttr3`), ToastyReplay Lite (`.ttrl`), Xenon (`.xe`). External physics injection is safely ignored.
+- **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output,
   full encoder list (libx264, libx265, NVENC, AMF, QSV, AV1, VP9/VP8, MPEG-4, ProRes,
   MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–200 Mbps, audio AAC/MP3/Opus/Vorbis/
-  FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**
+  FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**.
+  FFmpeg DLLs are kept outside the .geode file to minimize size. The bot can automatically test
+  mirror download speed (GitHub vs Codeberg), download and install the required DLLs to
+  `geode/mods/skiro1.skk-bot/ffmpeg/` on the fly.
+  Manual links: [Codeberg dll.zip](https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip), [GitHub dll.zip](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip).
 - **Modern ImGui GUI**: intuitive modern interface with tab navigation (Record,
   Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
 - **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,

@@ -2,6 +2,8 @@
 
 #include "physics/step_grid_hooks.hpp"
 
+#include "core/hotpath.hpp"
+
 #include <Geode/Geode.hpp>
 #include <logger/logger.hpp>
 #include <safetyhook.hpp>
@@ -30,11 +32,23 @@ namespace {
     // 0x237DCE: "mov [rbp+0xA0], edx" - stores the physics step-loop's initial
     // counter; the loop runs the counter up to (excluding) 2, so seeding it
     // with 2-N yields exactly N iterations (negative starts included).
-    void physStepCountMidhook(safetyhook::Context& ctx) {
-        if (g_forcedSteps > 0) {
-            ctx.rdx = 2 - g_forcedSteps;
-        }
-    }
+void physStepCountMidhook(safetyhook::Context& ctx) {
+      // Counts the forced physics steps. This is the number that has to be
+      // compared against another renderer, because the two do not step physics
+      // the same way: this hook pins the step loop to exactly g_forcedSteps
+      // iterations of g_forcedTimestep, so one CCScheduler::update advances the
+      // level by g_forcedSteps * g_forcedTimestep - 1/240s at steps=1, NOT by
+      // the dt=1/60 that was handed to the scheduler.
+      //
+      // A render that needs 1/60s per video frame therefore has to call the
+      // scheduler several times, and the loop around it re-runs the per-step
+      // bookkeeping each time. Whether that is where the extra wall time goes
+      // is exactly the open question, so it gets measured rather than argued.
+      ++skkbot2::hot::stats().calls[static_cast<size_t>(skkbot2::hot::PhysStep)];
+      if (g_forcedSteps > 0) {
+          ctx.rdx = 2 - g_forcedSteps;
+      }
+  }
 
     // 0x238F6E: post-loop bookkeeping reads xmm9 as the time actually consumed
     // by the step loop; report exactly N * timestep so the engine's internal

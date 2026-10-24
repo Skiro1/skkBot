@@ -1,6 +1,13 @@
 #pragma once
 
+#include "logger/logger.hpp"
+#include "../utils.hpp"
+
 #include <cstdint>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -12,6 +19,7 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 #endif
@@ -64,6 +72,9 @@ struct ff_t {
     FFMPEG_FN(sws_getContext);
     FFMPEG_FN(sws_scale);
     FFMPEG_FN(sws_freeContext);
+
+    FFMPEG_FN(av_log_set_callback);
+    FFMPEG_FN(av_log_set_level);
 };
 
 #undef FFMPEG_FN
@@ -113,7 +124,32 @@ static const char* const FFMPEG_SYMBOLS[] = {
     "sws_getContext",
     "sws_scale",
     "sws_freeContext",
+    "av_log_set_callback",
+    "av_log_set_level",
 };
+
+inline std::string g_lastFfLogMsg;
+inline void clearLastFfLogMsg() { g_lastFfLogMsg.clear(); }
+inline const std::string& getLastFfLogMsg() { return g_lastFfLogMsg; }
+
+inline void ffLogCallback(void* ptr, int level, const char* fmt, va_list vl) {
+    if (level > AV_LOG_INFO) return;
+    char line[1024];
+    vsnprintf(line, sizeof(line), fmt, vl);
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ')) {
+        line[--len] = '\0';
+    }
+    if (len == 0) return;
+    if (level <= AV_LOG_ERROR) {
+        g_lastFfLogMsg = line;
+        skkbot2::log::error("[FFMPEG] {}", line);
+    } else if (level <= AV_LOG_WARNING) {
+        skkbot2::log::warn("[FFMPEG] {}", line);
+    } else {
+        skkbot2::log::info("[FFMPEG] {}", line);
+    }
+}
 
 // Formats an av error code through the loaded table (only valid after a
 // successful ffLoadFunctions call).
@@ -124,21 +160,65 @@ inline std::string ffErrString(ff_t* table, int code) {
     return buf;
 }
 
+// Windows resolves the IMPORTS of a DLL through the process search path, not
+// through the directory of the DLL that imports it. avcodec-63.dll therefore
+// cannot find avutil-61.dll just because it was opened by its full path.
+//
+// The previous loader relied on FFMPEG_DLLS being ordered dependencies-first and
+// on "already loaded by name" matching, which works only while every file comes
+// from a single, complete, same-version set. One missing or mismatched DLL and
+// the whole table reported "no FFmpeg DLLs could be loaded" with no hint why.
+// Registering the directory as a user search directory makes the dependencies
+// resolvable regardless of order, and makes a user-supplied DLL set work from
+// any folder.
+inline void ffRegisterDllDir(std::filesystem::path const& dir) {
+    static std::vector<std::wstring> registered;
+    const std::wstring wide = dir.wstring();
+    for (auto const& seen : registered) {
+        if (seen == wide) return;
+    }
+    registered.push_back(wide);
+    // LOAD_LIBRARY_SEARCH_USER_DIRS has to be part of the default set for
+    // LoadLibraryExW's flag of the same name to mean anything.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+                             LOAD_LIBRARY_SEARCH_USER_DIRS);
+    AddDllDirectory(wide.c_str());
+}
+
 // Loads all DLLs from the given directory and fills the function table.
 // Returns false and leaves errorMsg set if any required symbol is missing.
-inline bool ffLoadFunctions(ff_t* table, const std::string& dir,
+// `errorMsg` names the directory and the first failing DLL with GetLastError()
+// so a user can tell "the folder is wrong" from "the file is not a DLL".
+inline bool ffLoadFunctions(ff_t* table, std::filesystem::path const& dir,
                             std::string& errorMsg) {
+    ffRegisterDllDir(dir);
+
     std::vector<HMODULE> mods;
+    std::string firstError;
     for (const char* dll : FFMPEG_DLLS) {
-        std::string path = dir + "\\" + dll;
-        HMODULE mod = LoadLibraryW(
-            std::wstring(path.begin(), path.end()).c_str());
+        std::error_code ec;
+        const std::filesystem::path full = dir / dll;
+        if (!std::filesystem::exists(full, ec)) {
+            if (firstError.empty()) {
+                firstError = std::string(dll) + " is missing";
+            }
+            continue;
+        }
+        // LOAD_LIBRARY_SEARCH_USER_DIRS lets the import table resolve the other
+        // FFmpeg DLLs from the directory registered above.
+        HMODULE mod = LoadLibraryExW(
+            full.wstring().c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (mod) {
             mods.push_back(mod);
+        } else if (firstError.empty()) {
+            firstError = std::string(dll) + " failed (error " +
+                         std::to_string(GetLastError()) + ")";
         }
     }
     if (mods.empty()) {
-        errorMsg = "no FFmpeg DLLs could be loaded from " + dir;
+        errorMsg = "no FFmpeg DLLs in " + skk::pathToUtf8(dir);
+        if (!firstError.empty()) errorMsg += " (" + firstError + ")";
         return false;
     }
 
@@ -159,6 +239,12 @@ inline bool ffLoadFunctions(ff_t* table, const std::string& dir,
         }
         i++;
     }
+    if (table->av_log_set_callback) {
+        table->av_log_set_callback(ffLogCallback);
+    }
+    if (table->av_log_set_level) {
+        table->av_log_set_level(AV_LOG_INFO);
+    }
     return true;
 }
 
@@ -171,7 +257,8 @@ struct ff_t {};
 inline std::string ffErrString(ff_t*, int code) {
     return "av-error " + std::to_string(code);
 }
-inline bool ffLoadFunctions(ff_t*, const std::string&, std::string& errorMsg) {
+inline bool ffLoadFunctions(ff_t*, std::filesystem::path const&,
+                           std::string& errorMsg) {
     errorMsg = "renderer is not available on this platform";
     return false;
 }

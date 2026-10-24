@@ -1,4 +1,4 @@
-﻿#include "capture.hpp"
+#include "capture.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/cocos/shaders/ccGLStateCache.h>
@@ -7,6 +7,7 @@
 #include <chrono>
 #include <vector>
 
+#include <map>
 #include "../logger/logger.hpp"
 
 using namespace geode::prelude;
@@ -147,10 +148,19 @@ bool FboCapture::initShaders() {
 }
 
 static GLuint makeTexture(GLenum internal, GLsizei w, GLsizei h) {
+    // WebGL2 validates internalformat against format, so the sized formats we
+    // use for the NV12 planes need their own upload format: GL_R8 pairs with
+    // GL_RED and GL_RG8 with GL_RG. GL_RGBA8 keeps GL_RGBA.
+    GLenum fmt = GL_RGBA;
+    if (internal == GL_R8) {
+        fmt = GL_RED;
+    } else if (internal == GL_RG8) {
+        fmt = GL_RG;
+    }
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+    glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, fmt, GL_UNSIGNED_BYTE,
                  nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -166,6 +176,15 @@ bool FboCapture::init(unsigned width, unsigned height) {
     m_height = height;
     m_nv12Size = static_cast<size_t>(width) * height * 3 / 2;
     m_fade = 1.0f;
+    // Per-render diagnostics. These were never reset, so the summary mixed
+    // every render the session had ever done: Stereo Madness on 2026-10-18
+    // reported "scene visit 189% of grab" because visitN was 15553 while the
+    // render produced 5350 frames - 10201 of those visits belonged to the
+    // GRIEF render before it. GRIEF's own number was right only because it was
+    // the first render of the session. destroy() resets m_issued but never
+    // touched these two.
+    m_visitMs = 0.0;
+    m_visitN = 0;
 
     if (!initShaders()) {
         return false;
@@ -199,21 +218,37 @@ bool FboCapture::init(unsigned width, unsigned height) {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Y pass (full-res luma)
-    m_yTex = makeTexture(GL_RGBA8, static_cast<GLsizei>(width),
+    // Y pass (full-res luma). GL_R8, not GL_RGBA8: the shader writes only .r and
+    // the readback reads only GL_RED, so an RGBA8 target wasted 3 of every 4
+    // bytes written - 33 MB of render-target traffic per 4K frame instead of
+    // 8.3 MB. Same for the UV plane below, which only needs two channels.
+    m_yTex = makeTexture(GL_R8, static_cast<GLsizei>(width),
                          static_cast<GLsizei>(height));
     glGenFramebuffers(1, &m_yFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, m_yFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                            m_yTex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        skkbot2::log::error(
+            "[RENDER] Y plane FBO incomplete - the luma target must be a "
+            "colour-renderable single-channel format");
+        return false;
+    }
 
-    // UV pass (half-res chroma)
-    m_uvTex = makeTexture(GL_RGBA8, static_cast<GLsizei>(width / 2),
+    // UV pass (half-res chroma). GL_RG8 - the shader writes .rg and the
+    // readback reads GL_RG, so RGBA8 was writing twice the bytes it kept.
+    m_uvTex = makeTexture(GL_RG8, static_cast<GLsizei>(width / 2),
                           static_cast<GLsizei>(height / 2));
     glGenFramebuffers(1, &m_uvFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, m_uvFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                            m_uvTex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        skkbot2::log::error(
+            "[RENDER] UV plane FBO incomplete - the chroma target must be a "
+            "colour-renderable two-channel format");
+        return false;
+    }
 
     // Triple-buffered async readback (Y plane + UV plane per slot)
     const size_t yBytes = static_cast<size_t>(width) * height;
@@ -224,8 +259,16 @@ bool FboCapture::init(unsigned width, unsigned height) {
         glBufferData(GL_PIXEL_PACK_BUFFER, yBytes + uvBytes, nullptr,
                      GL_STREAM_READ);
         m_fence[i] = 0;
+        m_mapped[i] = nullptr;
+        m_encBusy[i].store(false, std::memory_order_relaxed);
+        m_pts[i] = -1;
+        m_seq[i] = 0;
     }
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    m_issued = 0;
+    m_syncBuf.assign(m_nv12Size, 0);
+    m_syncBusy.store(false, std::memory_order_relaxed);
+    m_syncBusySkips = 0;
 
     // don't leave our FBO bound вЂ” the game must keep rendering to the screen
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
@@ -251,6 +294,14 @@ void FboCapture::destroy() {
     }
     for (int i = 0; i < PBO_COUNT; i++) {
         if (m_pbo[i]) {
+            // A mapped slot must be unmapped before its buffer is deleted or
+            // the driver is left holding storage it can no longer give back.
+            if (m_mapped[i]) {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[i]);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                m_mapped[i] = nullptr;
+                m_encBusy[i].store(false, std::memory_order_relaxed);
+            }
             if (m_fence[i]) {
                 glDeleteSync(reinterpret_cast<GLsync>(m_fence[i]));
                 m_fence[i] = 0;
@@ -287,27 +338,52 @@ void FboCapture::destroy() {
 
 // Diagnostics: logs the FIRST occurrence of each (op, error) pair so a
 // broken pipeline step is pinpointed instead of silently timing out fences.
+// In release/performance builds, glGetError() calls are bypassed to prevent
+// CPU-GPU command stream pipeline stalls on every frame.
 static void logGLErr(const char* where) {
+#ifdef SKKBOT_DEBUG_GL
     GLenum e = glGetError();
     if (e == GL_NO_ERROR) {
         return;
     }
-    static std::string s_seen;
-    std::string key = std::string(where) + ":" + std::to_string(e);
-    if (s_seen.find(key) != std::string::npos) {
+    static std::map<std::string, int> s_count;
+    const std::string key = std::string(where) + ":" + std::to_string(e);
+    int& n = s_count[key];
+    ++n;
+    if (n > 3 && n % 1000 != 0) {
         return;
     }
-    s_seen += key + ";";
-    skkbot2::log::error("[RENDER] GL error {:#x} after {}", 
-                        static_cast<unsigned>(e), where);
+    skkbot2::log::error("[RENDER] GL error {:#x} after {} (occurrence #{})",
+                        static_cast<unsigned>(e), where, n);
+#else
+    (void)where;
+#endif
 }
 
 // Re-renders the game scene into m_sceneTex at the OUTPUT size (Silicate-
 // style). The cocos view is silently set to the output size by
 // Renderer::begin() for the whole render, so visit() produces the level at
-// exactly m_width x m_height with the exact same camera/zoom as the sim вЂ”
+// exactly m_width x m_height with the exact same camera/zoom as the sim —
 // nothing depends on the visible window anymore. Our own FBO is bound first;
 // the game's FBO bindings are restored by the caller.
+//
+// The scene->visit() inside is timed into g_lastVisitMs. This traversal is the
+// duplicate under investigation: the preview blit already put a full scene on
+// screen this frame, and this walks the same ~34k nodes a second time. Whether
+// it is worth removing depends entirely on what that costs, and the stage
+// timers could not answer it because glDrawArrays only queues work - the CPU
+// side of the traversal is invisible to them, while the GPU side drains later
+// inside swap.
+static double g_lastVisitMs = 0.0;
+
+// Same clock as renderer's nowS(), which is private to renderer.cpp and not
+// reachable from here. steady_clock either way, in seconds.
+static double nowCapture() {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 static void renderSceneInto(unsigned w, unsigned h, GLuint fbo) {
     auto* scene = CCDirector::get()->getRunningScene();
     if (!scene) {
@@ -317,7 +393,9 @@ static void renderSceneInto(unsigned w, unsigned h, GLuint fbo) {
     glViewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    const double visitT0 = nowCapture();
     scene->visit();
+    g_lastVisitMs = (nowCapture() - visitT0) * 1e3;
     // The scene leaves arbitrary GL state behind (program, cull, scissor,
     // depth): normalize what the Y/UV passes below rely on.
     glDisable(GL_CULL_FACE);
@@ -333,32 +411,35 @@ static void renderSceneInto(unsigned w, unsigned h, GLuint fbo) {
 // issues the async readback. Must run on the GL thread (main thread). Runs
 // after drawScene. The game's own FBO bindings are restored at the end.
 void FboCapture::issueReadback(int64_t pts) {
+    // Slot selection happens BEFORE any GL state is touched, so the
+    // "everything is held" path can bail out without having to restore
+    // anything. It is backpressure that slipped past the hasFreeSlot() probe
+    // the renderer asks before stepping the simulation, so this frame's capture
+    // is skipped rather than overwriting a frame somebody is still reading.
+    int slot = -1;
+    if (!pickIssueSlot(&slot)) {
+        static uint64_t s_noSlot = 0;
+        if (++s_noSlot <= 3 || (s_noSlot % 100) == 0) {
+            skkbot2::log::warn("[RENDER] no free PBO slot (#{}) - frame skipped",
+                               s_noSlot);
+        }
+        return;
+    }
+
     GLint prevFbo = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
     GLint prevReadFbo = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
     GLint prevViewport[4];
     glGetIntegerv(GL_VIEWPORT, prevViewport);
-    GLint prevProgram = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
-    GLint prevActiveTex = 0;
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
-    GLint prevTexBind = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTexBind);
 
-    const int slot = static_cast<int>(m_issued % PBO_COUNT);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[slot]);
-    if (m_fence[slot]) {
-        // shouldn't happen (3-deep pipeline), but be safe: wait and reuse
-        glClientWaitSync(reinterpret_cast<GLsync>(m_fence[slot]),
-                         GL_SYNC_FLUSH_COMMANDS_BIT, 1'000'000'000ull);
-        glDeleteSync(reinterpret_cast<GLsync>(m_fence[slot]));
-        m_fence[slot] = 0;
-    }
-    // This slot now carries the frame for THIS pts. The harvest reads it back
-    // two grabs from now; recording the pts here is what keeps timestamp and
-    // pixels in lockstep (Silicat's m_ptsQueue push-time labeling).
+    // This slot now carries the frame for THIS pts. The harvest claims the
+    // OLDEST such slot a few grabs later; recording the pts here is what keeps
+    // timestamp and pixels in lockstep (Silicat's m_ptsQueue push-time
+    // labeling).
     m_pts[slot] = pts;
+    m_seq[slot] = m_issued;
 
     // --- Pass 0: scene -> m_sceneTex (output size) ---
     // Re-render the level into our own FBO at the output resolution instead
@@ -366,6 +447,23 @@ void FboCapture::issueReadback(int64_t pts) {
     // player sees at the default zoom, and is immune to window size / camera
     // zoom drift during the render.
     renderSceneInto(m_width, m_height, m_sceneFbo);
+    m_visitMs += g_lastVisitMs;
+    m_visitN++;
+    // Drain the scene's own GL errors. GD raises INVALID_OPERATION inside
+    // scene->visit() every frame (verified: it survives every change to our
+    // own passes), and glGetError returns the OLDEST pending error - so leaving
+    // it queued would attribute GD's fault to the Y pass and make every check
+    // below meaningless. Verified against a rendered frame: the planes are
+    // correct, so this is noise, not a broken capture.
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        if (GLenum e = glGetError(); e != GL_NO_ERROR) {
+            skkbot2::log::info(
+                "[RENDER] scene visit() leaves GL error {:#x} pending (startup check)",
+                static_cast<unsigned>(e));
+        }
+    }
 
     // --- Pass 1: m_sceneTex -> Y ---
     glBindFramebuffer(GL_FRAMEBUFFER, m_yFbo);
@@ -377,8 +475,12 @@ void FboCapture::issueReadback(int64_t pts) {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, m_sceneTex);
     glUniform1i(m_uTexY, 1);
+    // The luma target must NOT be bound to a texture unit while it is the
+    // bound framebuffer's colour attachment - that is a feedback loop and the
+    // draw comes back GL_INVALID_OPERATION (0x502). Leave unit 0 empty; the
+    // program only samples unit 1.
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_yTex);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(m_vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     glBindVertexArray(0);
@@ -395,7 +497,7 @@ void FboCapture::issueReadback(int64_t pts) {
     glBindTexture(GL_TEXTURE_2D, m_sceneTex);
     glUniform1i(m_uTexUV, 1);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_uvTex);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(m_vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     glBindVertexArray(0);
@@ -417,7 +519,10 @@ void FboCapture::issueReadback(int64_t pts) {
 
     m_fence[slot] =
         reinterpret_cast<uintptr_t>(glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
-    logGLErr("glFenceSync");
+    if (!m_fence[slot]) {
+        GLenum e = glGetError();
+        skkbot2::log::error("[RENDER] glFenceSync failed: {:#x}", static_cast<unsigned>(e));
+    }
     m_issued++;
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -449,29 +554,12 @@ void FboCapture::issueReadback(int64_t pts) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_BLEND);
 
-    // Restore program / active unit / unit-0 texture binding. The capture
-    // passes above used raw glBindTexture/glUseProgram/glActiveTexture, which
-    // leaves cocos's GL state cache (ccGLBindTexture2D, ccGLUseProgram) out of
-    // sync: the next cached call would SKIP the real glBind/glUse because the
-    // cache still matches the pre-render value. Since imgui-cocos draws the
-    // bot menu through those cached wrappers in the same frame (our grab runs
-    // inside ImGui's m_drawCall, before renderFrame paints the text), a stale
-    // cache paints the font texture with the wrong GL state в†’ the menu text
-    // garbles during a render. ccGLInvalidateStateCache() forces the wrappers
-    // to re-issue real GL calls next time they're used.
-    if (prevProgram) {
-        glUseProgram(static_cast<GLuint>(prevProgram));
-    }
-    if (prevActiveTex) {
-        glActiveTexture(static_cast<GLenum>(prevActiveTex));
-    }
-    // v57.2: bind unconditionally вЂ” when prevTexBind was 0 the old `if`
-    // skipped the restore, leaving unit 0 pinned to our yTex/uvTex. With the
-    // cocos state cache still claiming the font atlas is bound, imgui's
-    // ccGLBindTexture2D(atlas) in the frames between captures skipped the real
-    // bind and painted glyphs from the capture texture (garbled/fat menu
-    // text).
-    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTexBind));
+    // Unbind unit-0 texture, reset active unit/program, and invalidate cocos cache.
+    // ccGLInvalidateStateCache() forces cocos and imgui-cocos wrappers to
+    // re-issue real GL calls next time they're used.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
     ccGLInvalidateStateCache();
 }
 
@@ -486,12 +574,6 @@ void FboCapture::syncReadback(uint8_t* dst) {
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
     GLint prevViewport[4];
     glGetIntegerv(GL_VIEWPORT, prevViewport);
-    GLint prevProgram = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
-    GLint prevActiveTex = 0;
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
-    GLint prevTexBind = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTexBind);
 
     const size_t yBytes = static_cast<size_t>(m_width) * m_height;
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -518,19 +600,9 @@ void FboCapture::syncReadback(uint8_t* dst) {
     glEnable(GL_BLEND);
 
     // Same cocos state-cache resync as issueReadback (see there).
-    if (prevProgram) {
-        glUseProgram(static_cast<GLuint>(prevProgram));
-    }
-    if (prevActiveTex) {
-        glActiveTexture(static_cast<GLenum>(prevActiveTex));
-    }
-    // v57.2: bind unconditionally вЂ” when prevTexBind was 0 the old `if`
-    // skipped the restore, leaving unit 0 pinned to our yTex/uvTex. With the
-    // cocos state cache still claiming the font atlas is bound, imgui's
-    // ccGLBindTexture2D(atlas) in the frames between captures skipped the real
-    // bind and painted glyphs from the capture texture (garbled/fat menu
-    // text).
-    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTexBind));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
     ccGLInvalidateStateCache();
 }
 
@@ -598,53 +670,162 @@ void FboCapture::displayPreview(float winW, float winH) {
     }
 }
 
-bool FboCapture::grab(uint8_t* dst, int64_t pts, int64_t* outPts) {
-    if (!dst || !m_pbo[0]) {
-        return false;
-    }    // Harvest the oldest issued slot (6-deep pipeline). Its fence is normally
-    // long signaled; the wait below is only a fallback for GPU lag under heavy
-    // load вЂ” but it MUST be long enough, because if we give up here the slot
-    // is recycled and that frame is lost forever.
-    const int slot = static_cast<int>((m_issued + PBO_COUNT - 2) %
-                                      PBO_COUNT);
-    bool haveData = m_issued >= 2 && m_fence[slot] != 0;
-    const int lastIssued = static_cast<int>((m_issued - 1 + PBO_COUNT) %
-                                            PBO_COUNT);
+// --- Slot bookkeeping for the pointer handover -----------------------------
+//
+// Four states per slot, all of them readable from m_mapped / m_fence:
+//
+//   free      m_mapped == nullptr && m_fence == 0
+//   pending   m_mapped == nullptr && m_fence != 0   (GPU still writing)
+//   held      m_mapped != 0                         (somebody is reading)
+//   retired   m_mapped != 0 && m_fence == 0         (read out, waiting to be
+//                                                     unmapped once returned)
+//
+// The rule that makes the whole thing safe is one line: a slot may be given a
+// new glReadPixels ONLY in the free state. Everything else follows from it.
 
+bool FboCapture::pickIssueSlot(int* slot) const {
+    // Round-robin from where the last issue left off, so back-to-back issues
+    // still rotate through the ring instead of hammering one slot.
+    const unsigned start = m_issued % PBO_COUNT;
+    for (int i = 0; i < PBO_COUNT; i++) {
+        const int s = static_cast<int>((start + i) % PBO_COUNT);
+        if (m_mapped[s] == nullptr && m_fence[s] == 0) {
+            *slot = s;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FboCapture::pickHarvestSlot(int* slot) const {
+    int best = -1;
+    unsigned bestSeq = 0;
+    for (int s = 0; s < PBO_COUNT; s++) {
+        if (m_mapped[s] != nullptr || m_fence[s] == 0) {
+            continue;
+        }
+        if (best < 0 || m_seq[s] < bestSeq) {
+            best = s;
+            bestSeq = m_seq[s];
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+    *slot = best;
+    return true;
+}
+
+bool FboCapture::hasFreeSlot() const {
+    // A slot counts as available if it is free NOW **or** if the encoder thread
+    // has already handed it back and it is only waiting to be unmapped.
+    //
+    // That second clause is a deadlock fix, not an optimisation. The only place
+    // slots are unmapped is the top of grab(), and grab() is only reached AFTER
+    // this gate has said yes. A gate counting only currently-free slots is
+    // therefore a gate waiting on code that sits behind it: once the pool ran
+    // dry the main thread refused to step, so it never called grab(), so the
+    // returned slots were never unmapped, so the pool stayed dry. Measured
+    // 2026-10-19 01:11: pboGate=1801, stopDrive=1801, batchAvg=0.074, and the
+    // render sat there until the 30 s stall guard killed it.
+    //
+    // Counting a returned slot is safe because the promise is kept: grab() calls
+    // unmapReturnedSlots() before issueReadback(), so by the time the issue runs
+    // that slot really is free. This was invisible while RING_SIZE=6, because
+    // the ring kept the main thread from ever getting far enough ahead to drain
+    // the pool - the ring was accidentally throttling the bug away.
+    for (int s = 0; s < PBO_COUNT; s++) {
+        if (m_mapped[s] == nullptr && m_fence[s] == 0) {
+            return true;
+        }
+        if (m_mapped[s] != nullptr && !m_encBusy[s].load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void FboCapture::releaseSlot(int slot) {
+    if (slot < 0 || slot >= PBO_COUNT) {
+        return;
+    }
+    m_encBusy[slot].store(false, std::memory_order_release);
+}
+
+void FboCapture::releaseSync() {
+    m_syncBusy.store(false, std::memory_order_release);
+}
+
+void FboCapture::unmapReturnedSlots() {
+    for (int s = 0; s < PBO_COUNT; s++) {
+        if (m_mapped[s] == nullptr || m_encBusy[s].load(std::memory_order_acquire)) {
+            continue;
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[s]);
+        // A FALSE here would mean the GPU clobbered our mapping, i.e. somebody
+        // issued a readback into a slot we still owned - the exact failure the
+        // state machine exists to prevent, so it is worth saying out loud.
+        if (glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_FALSE) {
+            skkbot2::log::warn("[RENDER] glUnmapBuffer reported data loss on "
+                               "slot {} - ownership bug", s);
+        }
+        m_mapped[s] = nullptr;
+        if (m_fence[s]) {
+            glDeleteSync(reinterpret_cast<GLsync>(m_fence[s]));
+            m_fence[s] = 0;
+        }
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+}
+
+bool FboCapture::grab(int64_t pts, GrabResult* out) {
+    if (!out || !m_pbo[0]) {
+        return false;
+    }
+    // Anything the encoder has finished with becomes free before we pick.
+    unmapReturnedSlots();
+
+    int slot = -1;
     bool got = false;
-    if (haveData) {
+    if (m_issued >= 1 && pickHarvestSlot(&slot)) {
+        // Its fence is normally long signaled; the wait below is only a fallback
+        // for GPU lag under heavy load - but it MUST be long enough, because
+        // giving up here loses that frame's data for good.
         glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[slot]);
         GLenum st = GL_TIMEOUT_EXPIRED;
-        for (int tryWait = 0; tryWait < 5 && st == GL_TIMEOUT_EXPIRED;
-             tryWait++) {
+        for (int tryWait = 0; tryWait < 5 && st == GL_TIMEOUT_EXPIRED; tryWait++) {
             st = glClientWaitSync(reinterpret_cast<GLsync>(m_fence[slot]),
                                   GL_SYNC_FLUSH_COMMANDS_BIT, 50'000'000ull);
         }
         if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
-            void* mapped = glMapBufferRange(
-                GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
-                GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+            void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
+                                            GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
             if (!mapped) {
                 // Some drivers reject UNSYNC on pack buffers still owned by a
-                // pending glReadPixels вЂ” retry the plain (blocking) map.
+                // pending glReadPixels - retry the plain (blocking) map.
                 mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
                                           GL_MAP_READ_BIT);
             }
             if (mapped) {
-                std::memcpy(dst, mapped, m_nv12Size);
-                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                // THE POINT OF THE CHANGE: no memcpy here. The mapping stays
+                // alive (m_mapped[slot]) and the encoder thread reads straight
+                // out of it, so the 24.9 MB that used to cross the main thread
+                // at 4K never crosses it at all.
+                m_mapped[slot] = static_cast<uint8_t*>(mapped);
+                m_encBusy[slot].store(true, std::memory_order_release);
+                out->data = m_mapped[slot];
+                out->slot = slot;
+                out->preCopied = false;
+                out->pts = m_pts[slot];
                 got = true;
-                if (outPts) {
-                    *outPts = m_pts[slot];
-                }
             } else {
                 logGLErr("glMapBufferRange");
                 skkbot2::log::warn("[RENDER] capture map failed (fence was "
                                    "signaled)");
             }
         } else {
-            // Fence not done even after ~250ms: skip this slot. The pipeline
-            // is 6 deep, so this only happens if the GPU is severely stalled.
+            // Fence not done even after ~250ms: skip this slot. Only reachable
+            // when the GPU is severely stalled.
             static uint64_t s_failLog = 0;
             if (++s_failLog <= 3 || (s_failLog % 20) == 0) {
                 skkbot2::log::warn(
@@ -657,27 +838,42 @@ bool FboCapture::grab(uint8_t* dst, int64_t pts, int64_t* outPts) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     }
 
-    if (!got && m_issued >= 2) {
+    if (!got && m_issued >= 1) {
         // PBO harvest failed (map error / fence timeout): fall back to a
-        // synchronous readback of the pass output. Slower, but the render
-        // keeps producing frames instead of stalling. The pass buffers hold
-        // the MOST RECENT issue (one grab newer than the harvest slot), so
-        // the returned frame is labeled with that issue's pts вЂ” the pairing
-        // stays exact. (Gated on m_issued >= 2 so the cold-start grabs return
-        // false instead of double-delivering the warmup frame.)
-        static uint64_t s_fbLog = 0;
-        if (++s_fbLog <= 3 || (s_fbLog % 30) == 0) {
-            skkbot2::log::warn("[RENDER] sync-readback fallback (#{})",
-                               s_fbLog);
-        }
-        syncReadback(dst);
-        got = true;
-        if (outPts) {
-            *outPts = m_pts[lastIssued];
+        // synchronous readback of the pass output. Slower, but the render keeps
+        // producing frames instead of stalling. The pass buffers hold the MOST
+        // RECENT issue, so the returned frame is labeled with that issue's pts
+        // and the pairing stays exact.
+        //
+        // Unlike the PBO path this copy happens HERE, on the main thread: the
+        // GL context is here and nowhere else. The frame therefore travels as a
+        // finished buffer (preCopied) and the encoder must not copy it again -
+        // and the next fallback may not start until the encoder has released
+        // this one.
+        if (m_syncBusy.load(std::memory_order_acquire)) {
+            ++m_syncBusySkips;
+            if (m_syncBusySkips <= 3) {
+                skkbot2::log::warn("[RENDER] sync fallback skipped: previous "
+                                   "one still held by the encoder (#{})",
+                                   m_syncBusySkips);
+            }
+        } else {
+            static uint64_t s_fbLog = 0;
+            if (++s_fbLog <= 3 || (s_fbLog % 30) == 0) {
+                skkbot2::log::warn("[RENDER] sync-readback fallback (#{})", s_fbLog);
+            }
+            syncReadback(m_syncBuf.data());
+            m_syncBusy.store(true, std::memory_order_release);
+            const int lastIssued = static_cast<int>((m_issued - 1) % PBO_COUNT);
+            out->data = m_syncBuf.data();
+            out->slot = -1;
+            out->preCopied = true;
+            out->pts = m_pts[lastIssued];
+            got = true;
         }
     }
 
-    // Issue the readback of the CURRENT scene (even if we had no data yet вЂ”
+    // Issue the readback of the CURRENT scene (even if we had no data yet -
     // this warms the pipeline).
     issueReadback(pts);
 

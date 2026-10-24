@@ -18,6 +18,8 @@
 // independent of record / play / noclip.
 
 #include <Geode/Geode.hpp>
+#include "../core/hotpath.hpp"
+#include "../trajectory/trajectory.hpp"
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -432,8 +434,16 @@ class $modify(WTSPlayerObject, PlayerObject) {
         return value;
     }
 
-    void update(float deltaFactor) {
-        m_fields->currentPos = getRealPosition();
+void update(float deltaFactor) {
+          // Never run wave trail tracking on trajectory ghosts
+          if (skk::trajectory::isSimulating()) {
+              PlayerObject::update(deltaFactor);
+              return;
+          }
+          // Counts only, no clock read: this fires once per PlayerObject per
+          // tick, so a timer here would cost more than it measures.
+          skkbot2::hot::Timed skkbot2Count(skkbot2::hot::WtsPlayerUpdate);
+          m_fields->currentPos = getRealPosition();
         m_fields->gotHereFromUpdate = true;
         PlayerObject::update(deltaFactor);
         m_fields->nextPosNoCollision = getRealPosition();
@@ -443,6 +453,8 @@ class $modify(WTSPlayerObject, PlayerObject) {
 
     void updateRotation(float p0) {
         PlayerObject::updateRotation(p0);
+
+        if (skk::trajectory::isSimulating()) return;
 
         if (!skk::wavetrail::dragEnabled() || !skk::wavetrail::trailContextActive() ||
             !m_fields->gotHereFromUpdate) {
@@ -595,6 +607,9 @@ class $modify(WTSPlayerObject, PlayerObject) {
 
     // Spider orb.
     bool pushButton(PlayerButton button) {
+        if (skk::trajectory::isSimulating()) {
+            return PlayerObject::pushButton(button);
+        }
         const int TOGGLE_RING = 1594;
         const int TELEPORT_RING = 3027;
         const int SPIDER_RING = 3004;
@@ -686,7 +701,13 @@ class $modify(WTSBaseGameLayer, GJBaseGameLayer) {
 
     void toggleDualMode(GameObject* portal, bool state, PlayerObject* playerTouchingPortal,
                         bool p4) {
-        if (!skk::wavetrail::dragEnabled() || !state || playerTouchingPortal != m_player2) {
+        // Both players must be real objects we hooked: the backup below
+        // dereferences m_player2 through WTSPlayerObject, and after GD's swap
+        // m_player1 may have been detached. A dual-level trigger that calls in
+        // with a null playerTouchingPortal while m_player2 is still null used to
+        // slip past the guard and crash on the null m_player2.
+        if (!skk::wavetrail::dragEnabled() || !state || !playerTouchingPortal
+            || !m_player1 || !m_player2 || playerTouchingPortal != m_player2) {
             GJBaseGameLayer::toggleDualMode(portal, state, playerTouchingPortal, p4);
             return;
         }
@@ -695,6 +716,11 @@ class $modify(WTSBaseGameLayer, GJBaseGameLayer) {
         WTSPlayerObject::Fields fieldsBackup =
             *static_cast<WTSPlayerObject*>(m_player2)->m_fields.operator->();
         GJBaseGameLayer::toggleDualMode(portal, state, playerTouchingPortal, p4);
-        *static_cast<WTSPlayerObject*>(m_player1)->m_fields.operator->() = fieldsBackup;
+        // Only carry the state over if the swap actually happened. If GD took an
+        // early-out (dual already active), m_player1 is still the ORIGINAL P1 and
+        // the copy below would silently overwrite P1's trail state with P2's.
+        if (m_player1 && m_player1 != playerTouchingPortal) {
+            *static_cast<WTSPlayerObject*>(m_player1)->m_fields.operator->() = fieldsBackup;
+        }
     }
 };

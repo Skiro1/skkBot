@@ -1,6 +1,7 @@
 #include "skkBot.hpp"
 #include "render/renderer.hpp"
 #include "render/audiocap.hpp"
+#include "gui/skkbot_gui.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
@@ -22,7 +23,7 @@ using namespace geode::prelude;
 
 // Video renderer integration (ported from skkBot v0.0.4):
 //   - CCDirector::drawScene hijack while rendering (Silicate-style): the
-//     level is NEVER drawn to the window during a render — the sim is stepped
+//     level is NEVER drawn to the window during a render вЂ” the sim is stepped
 //     tick-by-tick (Renderer::drive -> scheduler update), the last captured
 //     frame is blitted as a letterboxed preview, then swapBuffers runs the
 //     imgui-cocos hook which issues the frame capture.
@@ -71,6 +72,10 @@ bool tickPendingMusicRestart() {
     if (!s_musicRestartPending.load()) {
         return false;
     }
+    if (!Renderer::get().isRecording()) {
+        disarmMusicRestart();
+        return false;
+    }
     auto* pl = PlayLayer::get();
     static auto s_lastWaitLog = std::chrono::steady_clock::time_point{};
     if (!pl || !pl->m_musicPrepared) {
@@ -83,7 +88,7 @@ bool tickPendingMusicRestart() {
             skkbot2::log::debug("AUDIO_DEFERRED_WAIT pl={} prepared={}",
                 pl ? 1 : 0, pl ? (pl->m_musicPrepared ? 1 : 0) : -1);
         }
-        return false;  // still loading — keep waiting
+        return false;  // still loading вЂ” keep waiting
     }
     s_musicRestartPending.store(false);
     pl->startMusic();
@@ -167,9 +172,9 @@ void FMODSystemUpdateHook(FMOD::System* self) {
 }  // namespace skkbot2
 
 // ===================== RENDER DRAW LOOP =====================
-// CCDirector::drawScene hook — Silicate-style hijack during an active render.
+// CCDirector::drawScene hook вЂ” Silicate-style hijack during an active render.
 // Normally the game scene is drawn here; while rendering we instead:
-//   1. step the sim (drive()) — one physics step per dropped wall frame,
+//   1. step the sim (drive()) вЂ” one physics step per dropped wall frame,
 //      with capture queued at video-pts boundaries,
 //   2. blit the last captured scene letterboxed into the window (drawPreview),
 //   3. present. The imgui swapBuffers hook captures the new frame afterwards.
@@ -194,7 +199,7 @@ class $modify(CCDirector) {
             // cleared the pending capture so the menu doesn't leak into the
             // video. Restore the real window-size view so the pause menu (and
             // imgui-cocos, which sizes the bot menu off getFrameSize()) render
-            // at full window size — the output view is re-applied lazily by
+            // at full window size вЂ” the output view is re-applied lazily by
             // onFrameDraw() before the next capture.
             // Both streams freeze: drive() is not called, so no video frame is
             // queued and no audioPump runs - the pause is NOT recorded, it only
@@ -215,7 +220,7 @@ class $modify(CCDirector) {
         }
         // Silicate parity: before the level has started (fade-in/spawn), the
         // vanilla drawScene callback is the only thing that advances the intro
-        // sequence — the scheduler that drive() steps is gated on m_started.
+        // sequence вЂ” the scheduler that drive() steps is gated on m_started.
         if (!pl->m_started) {
             CCDirector::drawScene();
             return;
@@ -223,26 +228,41 @@ class $modify(CCDirector) {
         // Silicate-style view lock: the cocos view is held at the OUTPUT size
         // for the whole render (applied ONCE here instead of per-capture).
         renderer.acquireView();
+        // Everything measured so far accounted for ~1.9ms of a 10.28ms frame.
+        // This timer covers the WHOLE hijacked frame; whatever it does not
+        // account for is GD's own main-loop overhead, and whatever it does is
+        // either our code or the GPU blocking us in swapBuffers below.
+        const double frameT0 = skkbot2::render::Renderer::nowWall();
         // Step the sim tick-by-tick (each step = one scheduler update), blit
         // the preview, then present. swapBuffers runs the imgui hook which
         // issues the capture for this frame.
         renderer.drive(pl, [this](float physicsDt) {
             this->m_pScheduler->update(physicsDt);
         });
+        // The preview is the render's only live feedback. Skipping it (there was a
+        // version that did, under "hide menu while rendering") left a BLACK
+        // WINDOW for the whole render and froze every HUD counter, so it read
+        // as a hang. The blit stays; the ImGui pass is what actually got
+        // skipped, because that one never reaches the video.
         renderer.drawPreview();
         // Keep the bot menu at real-window scale: imgui-cocos reads
         // getFrameSize() in newFrame()/renderFrame(), so switch the view back
         // to the WINDOW size before presenting (the output view is re-applied
         // by onFrameDraw()->acquireView() on the next render frame).
+        const double viewT0 = skkbot2::render::Renderer::nowWall();
         renderer.useWindowViewForUi();
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - viewT0, skkbot2::render::Renderer::Stage::ViewUi);
+        const double swapT0 = skkbot2::render::Renderer::nowWall();
         this->m_pobOpenGLView->swapBuffers();
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - swapT0, skkbot2::render::Renderer::Stage::Swap);
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - frameT0, skkbot2::render::Renderer::Stage::Frame);
     }
 };
 
 // ===================== VIEW SIZE GATE =====================
 // While a render holds the cocos view at the OUTPUT size (silicate
 // acquireView), GD's own window resize / framebuffer notifications must NOT
-// reach the cocos view — they would fight the output projection mid-render.
+// reach the cocos view вЂ” they would fight the output projection mid-render.
 // The renderer swallows the events (returns true) and remembers the new
 // physical window size so restoreView() can still restore the CURRENT window
 // after the render. Outside a render these pass through untouched.
@@ -304,7 +324,7 @@ class $modify(FMODAudioEngine) {
         if (ac.active()) {
             // Full freeze: the mixer may advance ONLY inside pump()'s update
             // window (m_shouldUpdateFmod). Any engine update reaching here
-            // outside the window is swallowed — the mixer stays put.
+            // outside the window is swallowed вЂ” the mixer stays put.
             if (!ac.shouldUpdateFmod()) {
                 return;
             }

@@ -4,14 +4,16 @@
 #include "utils.hpp"
 #include "lang/localization.hpp"
 #include "format/replay.hpp"
+#include "format/GBR/gbr.hpp"
 #include "format/skk_format.hpp"
 #include "core/practice_fix_bridge.hpp"
 #include "core/noclip_accuracy.hpp"
 #include "core/replay_timing.hpp"
 #include "core/rng_lock.hpp"
+#include "core/playback_fps.hpp"
 #include "core/gameplay_layer.hpp"
+#include "core/paths.hpp"
 #include "hacks/autoclicker.hpp"
-#include "trajectory/trajectory.hpp"
 #include "render/renderer.hpp"
 
 #include <Geode/Bindings.hpp>
@@ -56,6 +58,25 @@ namespace skk::branding {
         return std::string(kProductName) + " " + versionBadge();
     }
 }
+
+namespace skk::hitboxes {
+    void forceRefresh();
+}
+
+// Physical player input, observed at the only place it can be observed with
+// certainty: UILayer::keyDown / keyUp / ccTouch*. Playback injects straight into
+// m_queuedButtons and never goes through here, so anything reaching these
+// functions was pressed by a person. Implemented in replay_engine.cpp next to
+// the hook that fires it.
+namespace skkbot2 {
+// One physical press. `kind` is prose ("key down"), `key` is the raw
+// cocos2d::enumKeyCodes value; key 0 means a mouse touch rather than a key.
+void notePlayerInput(char const* kind, int key);
+
+// Session tally, then reset. Called when a run ends so the cap on individual
+// lines does not cost the totals.
+void dumpPlayerInputTally(char const* reason);
+}  // namespace skkbot2
 
 enum MacroMode {
     MODE_DISABLED,
@@ -105,12 +126,9 @@ public:
     };
 
     static constexpr double kBaseTickRate = 240.0;
-    // Trajectory overlay length is a fixed constant — no user control. These
-    // bounds belong to the separate pathLength (replay path) helper below.
-    static constexpr int kTrajectoryLengthDefault = 300;
-    static constexpr int kTrajectoryLengthMin = 1;
-    static constexpr int kTrajectoryLengthMax = 60000;
-    static constexpr int kTrajectoryPredictionStepMax = 250000;
+    static constexpr int kTrajectoryLengthDefault = 150;
+    static constexpr int kTrajectoryLengthMin = 10;
+    static constexpr int kTrajectoryLengthMax = 1200;
 
     MacroMode engineMode = MODE_DISABLED;
     ValidationResult validationStatus = RESULT_OK;
@@ -148,6 +166,11 @@ public:
     bool fastPlayback = false;
     bool respawnTimeOverrideEnabled = false;
     int respawnTimeOverrideMs = 1000;
+    // Strips the level to its gameplay layout (blueprint): decorations + colour
+    // triggers hidden, authored colours/glow removed, background/ground/line
+    // repainted to a flat palette. Purely visual, no gameplay effect. Backing
+    // field for hacks/layout_mode.cpp; see that file for the reference ports
+    // (GDH "Layout Mode", EclipseMenu, Neverhook).
     bool layoutMode = false;
     int layoutModeBackgroundR = 160;
     int layoutModeBackgroundG = 160;
@@ -175,15 +198,15 @@ public:
     float noclipDeathColorG = 0.0f;
     float noclipDeathColorB = 0.0f;
 
+    // Safe Mode (existing field): suppresses GD's progress accounting so a run
+    // cannot bank score, jumps or attempts. Single master toggle Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it always
+    // freezes attempts AND jumps. The per-effect switches that used to back this
+    // were removed at the user's request (the extra two settings are gone from
+    // the GUI); both effects stayed on, which is also what GDH "Safe Mode"
+    // (hacks/core/safe_mode.cpp) and EclipseMenu "Safe Mode"
+    // (hacks/Global/SafeMode.cpp) do. Backing field for hacks/safe_mode.cpp.
     bool safeMode = false;
     bool persistenceMode = false;
-
-    // TRAJECTORY overlay (RECORD tab): predicts the flight path by running GD's
-    // own physics on hidden fake players — one line per player holding the jump
-    // button, one releasing it (GDH / Neverhook / EclipseMenu approach).
-    // Visual only: the trace suppresses every world-mutating call and restores
-    // what it touched. The length is kTrajectoryLengthDefault, not a setting.
-    bool showTrajectory = false;
 
     // WAVE TRAIL FIX (drag-fix + draw-fix, always-on, visual only):
     // waveTrailFix is the master switch. dragFix rebuilds the streak geometry
@@ -201,8 +224,6 @@ public:
     float waveTrailOpacity = 1.0f;
     float waveTrailOutlineOpacity = 0.65f;
     bool waveTrailEditor = true;
-    bool trajectoryBothSides = false;
-    bool creatingTrajectory = false;
 
     bool showHitboxes = false;
     bool hitboxFill = false;
@@ -210,6 +231,10 @@ public:
     bool noclipHitboxOnDeath = false;
     bool hitboxTrail = false;
     int hitboxTrailLength = 240;
+
+    bool showTrajectory = false;
+    bool trajectoryBothSides = false;
+    int pathLength = kTrajectoryLengthDefault;
 
     int noclipTotalFrames = 0;
     int noclipUnsafeFrames = 0;
@@ -226,8 +251,6 @@ public:
     bool rngLocked = true;
     static constexpr unsigned int rngSeedVal = 100;
     uintptr_t capturedRngState = 0;
-
-    int pathLength = kTrajectoryLengthDefault;
 
     double gameSpeed = 1.0;
     double tickRate = 240.0;
@@ -302,7 +325,7 @@ public:
     // Countdown budget for the substep-grid probe (processCommands trace in
     // record/play logs). Armed on capture/play start; 0 disables logging.
     int substepProbe = 0;
-    // Center tick of a permanent ±24-label substep trace window, armed on the
+    // Center tick of a permanent Р В РІР‚в„ўР вЂ™Р’В±24-label substep trace window, armed on the
     // last playback death so both the next PLAY attempt and the next RECORD
     // pass through the same window emit per-substep traces (half/last, dt,
     // levelTime, step) - lets record and playback phase grids be compared
@@ -348,6 +371,47 @@ public:
     double sessionFirstLevelTime = 0.0;
     double sessionLastLevelTime = 0.0;
     bool sessionLevelTimeInit = false;
+    // Lock delta audit.
+    //
+    // Always on, so this is not a session setting but a measurement of the frame
+    // clock: how far the measured dt strays from the interval that replaces it,
+    // and what the planner decides as a result. lockDroppedCarry is the SIGNED
+    // sum of that difference - positive means real frames were longer than the
+    // pinned interval, negative means shorter.
+    long long lockPlanCount = 0;
+    long long lockWantedSum = 0;
+    long long lockStepSum = 0;
+    long long lockMaxWanted = 0;
+    // How many frames the step cap actually bit on. Steady state and a stall
+    // backlog look identical in every other counter, and this is the number that
+    // says whether the cap is a guard or a tax: it should be 0 in a healthy run
+    // and non-zero on exactly the frames where the display fell behind.
+    // Delivered vs requested display rate. The bug this project shipped on
+    // 19.10.2026 was advancing the clock by 1/360 while the machine delivered
+    // 1/240; the log printed the requested rate and never the delivered one, so
+    // a third of the speed looked like a judgement call rather than a fact.
+    //
+    // Starts at 1.0, not 0.0: it is the fraction of frames that MISSED the
+    // interval, and `displayHolds` is `fraction < 0.25`. At 0.0 the verdict is
+    // therefore "the display is holding the pin" before a single frame has been
+    // measured - a test that cannot fail for its first window. Starting at 1.0
+    // means the honest measured frame time is used until evidence arrives, and
+    // evidence is the only thing that can turn the substitution on.
+    double lockOffCadenceFraction = 1.0;
+    long long lockOffCadenceInWindow = 0;
+    long long lockWindowFrames = 0;
+    double lockDeliveredTotal = 0.0;
+    long long lockDeliveredFrames = 0;
+    bool lockWarnedSlow = false;
+    long long lockCapHits = 0;
+    long long lockZeroFrames = 0;
+    double lockDroppedCarry = 0.0;
+    double lockMaxDtSkew = 0.0;
+    bool lockEverOn = false;
+    bool lockLoggedOn = false;
+    // Frame number at which lock delta was first seen doing something, so a report
+    // can say where in the macro it engaged rather than only that it did.
+    int lockFirstPlanFrame = -1;
     int processSliceSkips = 0;
     // True while the tick planner's quantized dt is inside the engine update
     // (getModifiedDelta must pass it through, not re-quantize).
@@ -365,7 +429,7 @@ public:
     // whole pin+physics+reconcile cycle, i.e. what the eye actually renders
     // against the recorded frame for the same effective tick. Unlike
     // playDriftMax (which reads pre-reconcile preP1x and always shows the
-    // ±1.95px phase saw), this excludes the measurement artifact.
+    // Р В РІР‚в„ўР вЂ™Р’В±1.95px phase saw), this excludes the measurement artifact.
     float renderDriftMax = 0.0f;
     int renderDriftMaxTick = -1;
     int renderDriftLastLogTick = -100000;
@@ -442,6 +506,7 @@ public:
     bool hasSavedLayerClickOnSteps = false;
     bool playbackTickRateOverrideActive = false;
     double savedPlaybackTickRate = kBaseTickRate;
+    bool playbackFpsOverrideActive = false;
     SkAttemptSegment persistenceCaptureAttempt;
     bool persistenceCaptureDeathRecorded = false;
     size_t persistencePlaybackAttemptIndex = 0;
@@ -501,9 +566,37 @@ public:
     }
 
     int tickOffset = 0;
+    // The effective tick of the most recent pre-step dispatch. The trajectory
+    // ghost mirrors the bot's own grid, not a clock it re-derives: every real
+    // physics step reads actions with `tick <= effectiveTick`, and the window
+    // advances by exactly one per step, so the ghost's i-th step must ask for
+    // `lastDispatchEffectiveTick + 1 + i`. Deriving this from FrameClock or
+    // levelTime instead put every macro press one or two ticks off.
+    int lastDispatchEffectiveTick = -1;
     bool startPosActive = false;
     std::string startPosWarning;
     bool startPosWarningIsKey = false;
+
+    // Macro-list keys carry their format, because a stem can legitimately exist
+    // twice: the SAME name saved once as SKK (.skk) and once as SKC (.sc).
+    // Keying on the bare stem deduped them into one row, so the SKK copy became
+    // invisible whenever a SKC macro of the same name was present - and the
+    // delete path removed BOTH files. Key is now "<stem> [<ext>]"; these two
+    // split it back apart at every boundary (display, load, info, delete).
+    static std::string macroEntryKey(std::string const& stem, std::string const& ext) {
+        return stem + " [" + ext + "]";
+    }
+    static std::string macroEntryStem(std::string const& entry) {
+        auto const pos = entry.rfind(" [");
+        return pos == std::string::npos ? entry : entry.substr(0, pos);
+    }
+    static std::string macroEntryExt(std::string const& entry) {
+        auto const pos = entry.rfind(" [");
+        if (pos == std::string::npos) {
+            return {};
+        }
+        return entry.substr(pos + 2, entry.size() - pos - 3);
+    }
 
     std::vector<std::string> storedMacros;
     // Bumped by every reloadMacroList() disk scan so shells can cheaply re-sync
@@ -577,7 +670,7 @@ public:
         cbsMacros.clear();
         platformerMacros.clear();
         skMacros.clear();
-        auto directory = geode::prelude::Mod::get()->getSaveDir() / "replays";
+        auto directory = skkbot2::paths::replays();
         std::error_code ec;
         if (!std::filesystem::exists(directory, ec) || ec) {
             return;
@@ -585,9 +678,11 @@ public:
 
         std::unordered_set<std::string> usableStems;
 
-        auto addUsable = [&](std::string const& stem) {
-            if (usableStems.insert(stem).second) {
-                storedMacros.push_back(stem);
+        auto addUsable = [&](std::string const& stem, std::string const& ext) {
+            // Keyed on stem AND extension: DF2.skc and DF2.skk are two distinct
+            // macros and both must be reachable.
+            if (usableStems.insert(stem + ext).second) {
+                storedMacros.push_back(macroEntryKey(stem, ext));
             }
         };
 
@@ -603,26 +698,36 @@ public:
                 return static_cast<char>(std::tolower(ch));
             });
 
-            // Only .skk macros are supported. Ignore every other extension.
-            if (extension != ".skk") {
+            // .skk/.skc are native. .gdr2 and .slc are shared formats read from other bots
+            // and converted into SKC on load - their macros become playable here,
+            // but we never write either (our output stays lossless .skc).
+            if (extension != ".skk" && extension != ".skc" &&
+                extension != ".gdr2" && extension != ".slc" && extension != ".nhm" && extension != ".xe" &&
+                extension != ".re4" && extension != ".ttrl" && extension != ".ttr3" &&
+        extension != ".echo" &&
+        extension != ".ast" &&
+                !skk::gbr::looksLikeGbrByExtension(extension)) {
                 continue;
             }
 
             // Always surface the file in the list so the user can see it even
-            // if it fails to parse (e.g. a corrupt or foreign .skk). Metadata
+            // if it fails to parse (e.g. a corrupt or foreign .skk/.skc). Metadata
             // like CBS/platformer tags are only set when the file parses.
-            addUsable(stem);
-            skMacros.insert(stem);
+            addUsable(stem, extension);
 
-            std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(path));
-            if (!macro) {
-                continue;
-            }
-            if (macro->accuracyMode == AccuracyMode::CBS) {
-                cbsMacros.insert(stem);
-            }
-            if (macro->platformerMode) {
-                platformerMacros.insert(stem);
+            if (extension == ".skk") {
+                skMacros.insert(stem);
+
+                std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(path));
+                if (!macro) {
+                    continue;
+                }
+                if (macro->accuracyMode == AccuracyMode::CBS) {
+                    cbsMacros.insert(stem);
+                }
+                if (macro->platformerMode) {
+                    platformerMacros.insert(stem);
+                }
             }
         }
 
@@ -649,6 +754,11 @@ public:
         }
         pendingAction = PendingAction::None;
         pendingActionName.clear();
+        // Disarm the queued playback START too. Cancelling the pending action
+        // used to leave this latched, and every "is playback busy?" test that
+        // consults it then stayed true forever Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ which is what kept the Frame
+        // Stepper master toggle greyed out after a cancelled PLAY.
+        pendingPlaybackStart = false;
     }
 
     // Loads a .skk macro by name from the replays dir into memory (no playback).
@@ -656,7 +766,7 @@ public:
         if (engineMode != MODE_DISABLED) return false;
         if (name.empty()) return false;
         namespace fs = std::filesystem;
-        auto dir = Mod::get()->getSaveDir() / "replays";
+        auto dir = skkbot2::paths::replays();
         auto file = dir / (name + ".skk");
         if (!fs::exists(file)) return false;
         std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(file));
@@ -804,6 +914,11 @@ public:
             activeMacro->name = level->m_levelName;
         }
         activeMacro->framerate = tickRate;
+        // Same capture, same rule as the tick rate one line above: what the
+        // menu is running right now, stored only if it says something the
+        // framerate does not already say.
+        activeMacro->displayFps =
+            skkbot2::fps::captureForStorage(tickRate).toWire();
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeMacro->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeMacro->hasPlatformerModeMetadata = true;
@@ -824,6 +939,7 @@ public:
             activeSk->name = level->m_levelName;
         }
         activeSk->framerate = tickRate;
+        activeSk->displayFps = skkbot2::fps::captureForStorage(tickRate).toWire();
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeSk->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeSk->twoPlayerMode = playLayer->m_levelSettings->m_twoPlayerMode;
@@ -941,7 +1057,7 @@ public:
             // concrete tick and map position. Also logs a few frames around the
             // interesting inputs.
             if (list && !list->empty()) {
-                std::string inDump = (Mod::get()->getSaveDir() / "inputs_dump.txt").string();
+                auto inDump = skkbot2::paths::file("inputs_dump.txt");
                 std::ofstream idump(inDump, std::ios::trunc);
                 if (idump.is_open()) {
                     idump << "inputs dump: macro='" << activeSk->name << "' total=" << list->size() << "\n";
@@ -991,7 +1107,7 @@ public:
             // in the level (position + linked exit), to correlate the recorded
             // jump table (perframe_jumps.txt) with real portal placements.
             if (auto* pl = PlayLayer::get()) {
-                std::string portalDump = (Mod::get()->getSaveDir() / "portal_objects.txt").string();
+                auto portalDump = skkbot2::paths::file("portal_objects.txt");
                 std::ofstream pd(portalDump, std::ios::trunc);
                 if (pd.is_open()) {
                     pd << "portal_objects dump: macro='" << activeSk->name << "'\n";
@@ -1030,7 +1146,7 @@ public:
                 int64_t tickSpan = (int64_t)pfs.back().tick - (int64_t)pfs.front().tick;
                 int64_t missingTicks = std::max<int64_t>(0, tickSpan - (int64_t)pfs.size());
                 const double kPFJumpThreshold = 30.0;
-                std::string dumpPath = (Mod::get()->getSaveDir() / "perframe_jumps.txt").string();
+                auto dumpPath = skkbot2::paths::file("perframe_jumps.txt");
                 std::ofstream dump(dumpPath, std::ios::trunc);
                 if (dump.is_open()) {
                     dump << "BUG-06 perframe_jumps dump: macro='" << activeSk->name << "'\n";
@@ -1105,9 +1221,7 @@ public:
             if (auto* endLayer = playLayer->getChildByType<EndLevelLayer>(0)) {
                 endLayer->removeFromParentAndCleanup(true);
             }
-            if (playLayer->m_isPracticeMode) {
-                playLayer->togglePracticeMode(false);
-            }
+            // Do not force disable practice mode
             if (playLayer->m_levelSettings && playLayer->m_levelSettings->m_platformerMode) {
                 playLayer->resetLevelFromStart();
             } else {
@@ -1221,6 +1335,31 @@ public:
                 sessionFirstLevelTime, sessionLastLevelTime, ltDelta, estTicks,
                 estTicks > 0 ? static_cast<double>(sessionPlanCount) / static_cast<double>(estTicks) : 0.0);
         }
+        // Lock delta session epilogue.
+        //
+        // Always on, so unlike the setting it replaced there is no "was it
+        // switched off" case to guard - every run produces one of these. The
+        // numbers to read are lockMaxDtSkew (how far the wall clock strayed from
+        // the pinned interval, i.e. how much work the substitution did) and the
+        // steps-per-frame average against the tps/fps ratio it should equal.
+        if (lockPlanCount > 0) {
+            skkbot2::log::info(
+                "lock-delta epilogue: engaged at frame {}, {} frames planned, "
+                "{} steps over {} wanted (avg {:.3f}/frame), worst frame wanted "
+                "{}, {} frames ran nothing, cap hit {} times, display delivered "
+                "{:.1f} fps with {:.1f}% of frames late, measured-dt minus "
+                "interval summed {:.4f}s, worst single frame {:.4f}s",
+                lockFirstPlanFrame, lockPlanCount, lockStepSum, lockWantedSum,
+                static_cast<double>(lockWantedSum) / static_cast<double>(lockPlanCount),
+                lockMaxWanted, lockZeroFrames, lockCapHits,
+                lockDeliveredTotal > 0.0
+                    ? static_cast<double>(lockDeliveredFrames) / lockDeliveredTotal
+                    : 0.0,
+                lockOffCadenceFraction * 100.0,
+                lockDroppedCarry, lockMaxDtSkew);
+            lockLoggedOn = false;
+        }
+        skkbot2::dumpPlayerInputTally("run ended");
         resetPlayDriftMeter();
         resetSessionStepGridStat();
         pendingPlaybackStart = false;
@@ -1231,6 +1370,11 @@ public:
         macroInputActive = false;
         respawnTickIndex = -1;
         tickAccumulator = 0.0f;
+        // Hand back a pinned display rate. haltExecution is the one place
+        // every SKK stop funnels through - GUI stop, macro swapped, editor
+        // exit - so it is where the pin has to be released, or it survives the
+        // session that set it and slows down ordinary play.
+        ::skkbot2::fps::release();
         resetTimingTracking();
         resetDeferredInputState();
         if (auto* playLayer = PlayLayer::get()) {
@@ -1288,6 +1432,23 @@ public:
         phaseSampleCounter = 0;
         sessionSampleLastLevelTime = 0.0;
         sessionSampleStepsWindow = 0;
+        lockPlanCount = 0;
+        lockWantedSum = 0;
+        lockStepSum = 0;
+        lockMaxWanted = 0;
+        lockOffCadenceFraction = 1.0;
+        lockOffCadenceInWindow = 0;
+        lockWindowFrames = 0;
+        lockDeliveredTotal = 0.0;
+        lockDeliveredFrames = 0;
+        lockWarnedSlow = false;
+        lockCapHits = 0;
+        lockZeroFrames = 0;
+        lockDroppedCarry = 0.0;
+        lockMaxDtSkew = 0.0;
+        lockEverOn = false;
+        lockLoggedOn = false;
+        lockFirstPlanFrame = -1;
     }
 
     bool hasMacro() const {
@@ -1467,6 +1628,23 @@ public:
         return std::max(1.0, framerate);
     }
 
+    // The display rate the ACTIVE macro declares. The wire value is decoded by
+    // MacroDisplayRate::fromWire, which is the only place the sign of zero is
+    // read: +0.0 = the macro carries nothing (FPS was off when it was
+    // recorded), -0.0 = fps == tps, n = pinned. All three engage on playback;
+    // the middle one used to be indistinguishable from the first and did
+    // nothing, so a macro recorded with fps == tps played on whatever the menu
+    // had at the time.
+    skkbot2::fps::MacroDisplayRate activeMacroDisplayRate() const {
+        double fps = 0.0;
+        if (skMode && activeSk) {
+            fps = activeSk->displayFps;
+        } else if (!skMode && activeMacro) {
+            fps = activeMacro->displayFps;
+        }
+        return skkbot2::fps::MacroDisplayRate::fromWire(fps);
+    }
+
     double activePlaybackTickRate() const {
         double macroTps = activeMacroFramerate();
         double requiredTps = macroTps;
@@ -1483,17 +1661,67 @@ public:
         return mode == AccuracyMode::CBS ? AccuracyMode::CBS : AccuracyMode::Vanilla;
     }
 
-    void syncAccuracyFromGame() {
-        if (replayAccuracyEnvironmentActive) {
-            return;
-        }
-        if (auto* gameManager = GameManager::get()) {
-            bool cbs = gameManager->getGameVariable("0177");
-            bool cos = gameManager->getGameVariable("0176");
-            selectedAccuracyMode = cbs ? AccuracyMode::CBS : AccuracyMode::Vanilla;
-            cosEnabled = cos;
-        }
+    // Adopt GD's live CBS / COS state so a change made in GD's own options Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ or by
+// another mod Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ shows up in our menu instead of a stale value.
+//
+// Source of truth, in order:
+//   1. GJBaseGameLayer::m_clickBetweenSteps / m_clickOnSteps Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the fields GD
+//      itself gates on (2.2081 GJBaseGameLayer.cpp:1180 reads
+//      m_clickBetweenSteps). Authoritative while a level is on screen.
+//   2. Game vars 0177 / 0176 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ our own persisted state, used when no game layer
+//      exists (main menu / option screens). GD's own code never touches these
+//      two keys, so they must not be treated as a mirror of GD's settings.
+//
+// An adopted value is mirrored into our saved values, otherwise the next launch
+// resurrects the old ones from gui_accuracy / gui_cos. Returns true when
+// something actually changed.
+//
+// Skipped while a replay owns the accuracy environment: the replay applies its
+// own mode there and the user's live choice is restored by
+// endReplayAccuracyEnvironment(), not by the menu.
+bool syncAccuracyFromGame() {
+    if (replayAccuracyEnvironmentActive) {
+        return false;
     }
+
+    bool cbs = false;
+    bool cos = false;
+    const char* source = "none";
+
+    if (auto* layer = skk::gameplay::activeLayer()) {
+        cbs = layer->m_clickBetweenSteps;
+        cos = layer->m_clickOnSteps;
+        source = "layer";
+    } else if (auto* gameManager = GameManager::get()) {
+        cbs = gameManager->getGameVariable("0177");
+        cos = gameManager->getGameVariable("0176");
+        source = "gamevar";
+    } else {
+        return false;
+    }
+
+    bool changed = false;
+    AccuracyMode fromGame = cbs ? AccuracyMode::CBS : AccuracyMode::Vanilla;
+
+    if (selectedAccuracyMode != fromGame) {
+        selectedAccuracyMode = fromGame;
+        Mod::get()->setSavedValue("gui_accuracy", static_cast<int>(fromGame));
+        changed = true;
+        skkbot2::Logger::get().info(
+            "skkBot2: accuracy picked up from GD [{}] -> {}", source,
+            fromGame == AccuracyMode::CBS ? "CBS" : "Vanilla");
+    }
+
+    if (cosEnabled != cos) {
+        cosEnabled = cos;
+        Mod::get()->setSavedValue("gui_cos", cos);
+        changed = true;
+        skkbot2::Logger::get().info("skkBot2: COS picked up from GD [{}] -> {}",
+                                    source, cos ? "on" : "off");
+    }
+
+    return changed;
+}
 
     static void applyRuntimeAccuracyMode(AccuracyMode mode, bool cosEnabled) {
         mode = runtimeAccuracyModeFor(mode);
@@ -1547,12 +1775,42 @@ public:
             } else if (tickRate != declaredTps) {
                 tickRate = declaredTps;
             }
+
+            // The display rate, on the same contract: taken from the macro,
+            // re-asserted idempotently on every arm, handed back in
+            // endReplayAccuracyEnvironment().
+            //
+            // Inside this guard because the flag is really "this is PLAYBACK,
+            // not capture" - it is false on the recording call. That distinction
+            // is the whole reason: at record time the macro's number was just
+            // read OUT of the menu setting a line earlier, so applying it back
+            // would be circular. It would also freeze the FPS row for the length
+            // of a recording and log a pin that was never a change. At play time
+            // the number comes from the FILE and applying it is the entire
+            // point of storing it.
+            const auto declaredFps = activeMacroDisplayRate();
+            if (!playbackFpsOverrideActive) {
+                if (skkbot2::fps::beginMacro(declaredFps)) {
+                    playbackFpsOverrideActive = true;
+                }
+            } else {
+                skkbot2::fps::updateMacro(declaredFps);
+            }
         }
 
         applyRuntimeAccuracyMode(mode, cosEnabled);
     }
 
     void endReplayAccuracyEnvironment() {
+        if (playbackFpsOverrideActive) {
+            // Before the tick rate is handed back, not after: endMacro() puts
+            // the menu's own FPS state back AND drops the pin, so leaving it to
+            // run after the tick rate is restored would leave one frame where
+            // the display is back at its old rate and the budget still sized
+            // for the macro's.
+            skkbot2::fps::endMacro();
+            playbackFpsOverrideActive = false;
+        }
         if (playbackTickRateOverrideActive) {
             tickRate = savedPlaybackTickRate;
             playbackTickRateOverrideActive = false;
@@ -1582,9 +1840,9 @@ public:
     }
 
     // Hand the tick rate back to the menu's own setting WITHOUT ending the
-    // replay's accuracy environment — the TPS toggle in the GUI uses this when
+    // replay's accuracy environment Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the TPS toggle in the GUI uses this when
     // the user turns it off mid-playback, so the clock returns to whatever the
-    // menu declared at arm time (the "тот TPS что был в меню" behaviour) while
+    // menu declared at arm time (the "Р В Р Р‹Р Р†Р вЂљРЎв„ўР В Р’В Р РЋРІР‚СћР В Р Р‹Р Р†Р вЂљРЎв„ў TPS Р В Р Р‹Р Р†Р вЂљР Р‹Р В Р Р‹Р Р†Р вЂљРЎв„ўР В Р’В Р РЋРІР‚Сћ Р В Р’В Р вЂ™Р’В±Р В Р Р‹Р Р†Р вЂљРІвЂћвЂ“Р В Р’В Р вЂ™Р’В» Р В Р’В Р В РІР‚В  Р В Р’В Р РЋР’ВР В Р’В Р вЂ™Р’ВµР В Р’В Р В РІР‚В¦Р В Р Р‹Р В РІР‚в„–" behaviour) while
     // CBS / click-between-steps stay engaged for the running replay.
     void dropPlaybackTickRateOverride() {
         if (playbackTickRateOverrideActive) {
@@ -1595,48 +1853,6 @@ public:
 
     double runtimeTickRate() const {
         return std::max(1.0, tickRate);
-    }
-
-    double trajectoryPredictionTickRate() const {
-        return std::max(runtimeTickRate(), kBaseTickRate);
-    }
-
-    static int sanitizeTrajectoryLength(int length) {
-        return std::clamp(length, kTrajectoryLengthMin, kTrajectoryLengthMax);
-    }
-
-    double trajectoryPredictionDuration() const {
-        return static_cast<double>(sanitizeTrajectoryLength(pathLength)) / kBaseTickRate;
-    }
-
-    int trajectoryPredictionStepCountForRate(double predictionTickRate) const {
-        if (!std::isfinite(predictionTickRate) || predictionTickRate <= 0.0) {
-            return 0;
-        }
-
-        double stepCount = std::ceil(trajectoryPredictionDuration() * predictionTickRate);
-        if (!std::isfinite(stepCount) || stepCount <= 0.0) {
-            return 0;
-        }
-
-        return static_cast<int>(std::clamp(stepCount, 0.0, static_cast<double>(kTrajectoryPredictionStepMax)));
-    }
-
-    int trajectoryPredictionStepCount() const {
-        return trajectoryPredictionStepCountForRate(trajectoryPredictionTickRate());
-    }
-
-    int trajectoryPredictionStepCount(float simulationDelta) const {
-        double predictionTickRate = trajectoryPredictionTickRate();
-        if (std::isfinite(simulationDelta) && simulationDelta > 0.0f) {
-            predictionTickRate = std::max(kBaseTickRate, 60.0 / static_cast<double>(simulationDelta));
-        }
-
-        return trajectoryPredictionStepCountForRate(predictionTickRate);
-    }
-
-    float trajectorySimulationDelta() const {
-        return static_cast<float>(60.0 / runtimeTickRate());
     }
 
     double effectiveTimeScale() const {
@@ -2172,9 +2388,10 @@ public:
                 // the exact state the segment runs under, not a formula guess.
                 // Teleport persists unchanged across a fast_srand respawn,
                 // so taking it here (first captured frame) reproduces the
-                // capture path precisely. Shake is not locked.
+                // capture path precisely. Shake is captured the same way now
+                // that it is locked for both SKK and SKC.
                 boundary.primary = liveTriple.primary;
-                boundary.shake = 0;
+                boundary.shake = skk::shakeStateGet();
                 boundary.teleport = liveTriple.teleport;
                 activeSk->rngBoundaries.push_back(boundary);
                 skkbot2::log::info("RECORD rng boundary: tick={} progress={} "
@@ -2187,6 +2404,46 @@ public:
             if (recSk->inputs.empty()) {
                 return;
             }
+
+            // Gravity-flip forensic window (record side).
+            //
+            // A UFO that touches a gravity portal during RECORD looked correct but
+            // the macro replayed it frozen at that instant, so either the sampling
+            // point lags a tick behind the portal effect or playback fails to apply
+            // it. Both are visible only if we dump the recorded bits around the
+            // transition: if the flip first appears one tick AFTER the live player
+            // already changed, the record is the culprit; if the recorded flip is on
+            // time, playback is. captureTick() runs on the step-grid hook
+            // (stepCount@0x237DCE), which fires BEFORE GD's collision pass, so the
+            // lag is the prime suspect.
+            if (player1 && recSk->perFrames.size() >= 1) {
+                auto const& back = recSk->perFrames.back();
+                const bool nowUD = (back.p1vis & kVisualUpsideDown) != 0;
+                const bool nowG = (back.p1vis & kVisualGravityNegative) != 0;
+                const bool prevUD = recSk->perFrames.size() >= 2
+                    ? (recSk->perFrames[recSk->perFrames.size() - 2].p1vis & kVisualUpsideDown) != 0
+                    : nowUD;
+                const bool prevG = recSk->perFrames.size() >= 2
+                    ? (recSk->perFrames[recSk->perFrames.size() - 2].p1vis & kVisualGravityNegative) != 0
+                    : nowG;
+                if (nowUD != prevUD || nowG != prevG) {
+                    const size_t from = recSk->perFrames.size() > 4 ? recSk->perFrames.size() - 4 : 0;
+                    std::string win;
+                    for (size_t i = from; i < recSk->perFrames.size(); ++i) {
+                        auto const& f = recSk->perFrames[i];
+                        win += fmt::format(" [t={} g={} ud={}]", f.tick,
+                            (f.p1vis & kVisualGravityNegative) ? 1 : 0,
+                            (f.p1vis & kVisualUpsideDown) ? 1 : 0);
+                    }
+                    skkbot2::log::info(
+                        "REC grav flip: tick={} live(g={} ud={}) mode={} p1vis=0x{:02x} window:{}",
+                        tick, player1->m_gravity < 0.0 ? 1 : 0,
+                        player1->m_isUpsideDown ? 1 : 0,
+                        (back.p1vis & kVisualModeMask) >> kVisualModeShift,
+                        static_cast<int>(back.p1vis), win);
+                }
+            }
+
             recSk->recordAnchor(tick, player1, player2, isPlatformer, isDual);
         }
     }
@@ -2365,7 +2622,10 @@ public:
         rng.fastRandState = GameToolbox::getfast_srand();
         rng.locked = rngLocked;
         rng.seed = rngSeedVal;
-        rng.shakeState = 0; // shake (camera) is not locked
+        // Shake is locked for BOTH SKK and SKC now, so it must be captured
+        // like any other locked stream - otherwise a checkpoint taken
+        // mid-attempt stores 0 and the practice restore cannot rewind it.
+        rng.shakeState = skk::shakeStateGet();
         rng.teleportState = *skk::gdTeleportRng();
         return rng;
     }
@@ -2489,6 +2749,7 @@ public:
     // when no checkpoint bundle matches (level start, no checkpoints).
     int respawnStepTickForGameTick(int gameTick);
     void restoreLockedRngState(uintptr_t rngState);
+    void restoreLockedShakeState(uint64_t shakeState);
     void pruneStoredRestorePoints(PlayLayer* playLayer, int restoredTick);
     void clearFrameStepState();
     int computeFrameStepMusicTimeMS(PlayLayer* playLayer) const;

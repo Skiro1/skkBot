@@ -196,6 +196,9 @@ struct Macro {
     std::string levelName;
     std::string author;
     double framerateHint = 240.0;
+    // Display rate the macro was recorded under; 0 = follow framerateHint. The
+    // only rate that reaches the wire file, and only when it differs.
+    double displayFps = 0.0;
     double duration = 0.0;
     float startPosX = 0.0f;
     float startPosY = 0.0f;
@@ -266,5 +269,16 @@ struct PerFrameSelfTestResult {
     std::string failDetail; // which field diverged, or rewrite byte count
 };
 PerFrameSelfTestResult selfTestPerFrameCodec();
+
+// The header self-test: proves that a file written WITHOUT the display rate -
+// which is byte for byte what the previous build wrote, since the field is
+// omitted rather than zero-filled - still decodes, and that a file WITH one
+// grows its header by exactly that field and nothing else.
+struct HeaderSelfTestResult {
+    bool ok = false;
+    size_t oldShapeHeaderBytes = 0;
+    std::string detail;
+};
+HeaderSelfTestResult selfTestHeader();
 
 }

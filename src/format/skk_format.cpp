@@ -1,6 +1,7 @@
 #include "skk_format.hpp"
 #include "skk3_format.hpp"
 #include "core/replay_timing.hpp"
+#include "core/paths.hpp"
 #include "core/rng_lock.hpp"
 #include "utils.hpp"
 
@@ -151,7 +152,7 @@ void SkMacro::recordAnchor(std::vector<PlaybackAnchor>& target, int tick, Player
     anchor.rng.locked = rngLocked;
     anchor.rng.seed = rngSeed;
     anchor.rng.fastRandState = GameToolbox::getfast_srand();
-    anchor.rng.shakeState = 0; // camera shake is no longer locked
+    anchor.rng.shakeState = skk::shakeStateGet();
     anchor.rng.teleportState = *skk::gdTeleportRng();
 
     if (!target.empty() && target.back().tick == tick) {
@@ -376,10 +377,11 @@ bool SkMacro::persistToDirectory(std::filesystem::path const& directory) {
         return false;
     }
 
+    // One rule for both engines: an exact name+extension match gets _1.
     pending.name = ReplayStorage::makeUniqueReplayNameInDirectory(
         directory,
         pending.name,
-        pending.persistedName
+        ".skk"
     );
     pending.persistedName = pending.name;
 
@@ -469,7 +471,7 @@ SkMacro* SkMacro::loadFromPath(std::filesystem::path const& path) {
 }
 
 SkMacro* SkMacro::loadFromDisk(std::string const& filename) {
-    auto directory = Mod::get()->getSaveDir() / "replays";
+    auto directory = skkbot2::paths::replays();
     if (!std::filesystem::exists(directory) && !std::filesystem::create_directory(directory)) {
         return nullptr;
     }

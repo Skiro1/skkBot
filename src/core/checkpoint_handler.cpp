@@ -2,6 +2,7 @@
 #include "core/full_player_checkpoint.hpp"
 #include "core/broken_object_tracker.hpp"
 #include "hacks/autoclicker.hpp"
+#include "logger/logger.hpp"
 
 #include <cmath>
 
@@ -82,44 +83,19 @@ namespace {
         else if (state.flags.swing)  player->toggleSwingMode(true, true);
         else if (state.flags.robot)  player->toggleRobotMode(true, true);
 
-        // toggleMode() re-initializes sprite frames assuming normal upright gravity.
-        // Re-apply upsideDown and gravity states immediately so that robot/spider/ship
-        // armatures are properly flipped.
-        player->m_isUpsideDown = state.flags.upsideDown;
-        player->m_stateFlipGravity = state.flags.upsideDown ? 1 : 0;
-        if (state.environment.gravity != 0.0) {
-            player->m_gravity = state.environment.gravity;
-        }
-    }
-
-    // Force a full re-init of the current mode's sprite/armature even when the
-    // mode flag is UNCHANGED across the checkpoint. reconcileVehicleVisual bails
-    // early when the mode is the same, but a plain flag re-write leaves the
-    // mode's animation node in a stale bind-pose after loadFromCheckpoint (the
-    // 'T-pose' symptom). Only invoked from the checkpoint-restore path (never
-    // from per-tick AnchorReconciler), so the heavier deactivate+activate is
-    // deliberate and idempotent for the active mode.
-    static void forceCurrentModeVisual(PlayerObject* player, PlayerStateBundle const& state) {
-        if (!player) {
-            return;
-        }
-        deactivateActiveVehicleVisual(player);
-        if (state.flags.ship)        player->toggleFlyMode(true, true);
-        else if (state.flags.ball)   player->toggleRollMode(true, true);
-        else if (state.flags.bird)   player->toggleBirdMode(true, true);
-        else if (state.flags.wave)   player->toggleDartMode(true, true);
-        else if (state.flags.spider) player->toggleSpiderMode(true, true);
-        else if (state.flags.swing)  player->toggleSwingMode(true, true);
-        else if (state.flags.robot)  player->toggleRobotMode(true, true);
-
-        // toggleMode() re-initializes sprite frames assuming normal upright gravity.
-        // Re-apply upsideDown and gravity states immediately so that robot/spider/ship
-        // armatures are properly flipped.
-        player->m_isUpsideDown = state.flags.upsideDown;
-        player->m_stateFlipGravity = state.flags.upsideDown ? 1 : 0;
-        if (state.environment.gravity != 0.0) {
-            player->m_gravity = state.environment.gravity;
-        }
+        // Reference parity: this function is byte-for-byte
+        // ToastyReplay-main/src/core/checkpoint_handler.cpp:37-58. It
+        // deliberately does NOT touch m_isUpsideDown, any sprite visibility or
+        // updatePlayerScale() — restoreState writes m_isUpsideDown itself, and
+        // GDH/silicate/ToastyReplay all leave the mode sprites entirely to
+        // GD's own toggle. The extra machinery this function used to carry
+        // (flipGravity + updatePlayerScale + enforceModeSpriteVisibility) hid
+        // the robot for the whole session after a single restore.
+        skkbot2::log::debug(
+            "mode reconcile: was(rob={} shp={} bal={} drt={} spd={} swg={}) -> now(rob={}) robotSprite={}",
+            player->m_isRobot ? 1 : 0, player->m_isShip ? 1 : 0, player->m_isBall ? 1 : 0,
+            player->m_isDart ? 1 : 0, player->m_isSpider ? 1 : 0, player->m_isSwing ? 1 : 0,
+            player->m_isRobot ? 1 : 0, player->m_robotSprite ? (player->m_robotSprite->isVisible() ? "vis" : "hidden") : "null");
     }
 }
 
@@ -694,12 +670,34 @@ CheckpointStateBundle CheckpointStateManager::capture(
     checkpoint.clickReleased[4] = !isHeld(playLayer->m_player2, 2);
     checkpoint.clickReleased[5] = !isHeld(playLayer->m_player2, 3);
 
+    // Deep Practice Fix: GJBaseGameLayer / PlayLayer physics and collision block state
+    checkpoint.player1CollisionBlock = playLayer->m_player1CollisionBlock;
+    checkpoint.player2CollisionBlock = playLayer->m_player2CollisionBlock;
+    checkpoint.extraDelta = playLayer->m_extraDelta;
+    checkpoint.unk32d0 = playLayer->m_unk32d0;
+    checkpoint.unk32ec = playLayer->m_unk32ec;
+    checkpoint.currentStep = playLayer->m_currentStep;
+    checkpoint.unk3380 = playLayer->m_unk3380;
+    checkpoint.gameObjectPhysics = playLayer->m_gameState.m_gameObjectPhysics;
+
     return checkpoint;
 }
 
 void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointStateBundle const& checkpoint) {
     if (!playLayer) {
         return;
+    }
+
+    // Deep Practice Fix: restore PlayLayer physics/collision states
+    playLayer->m_player1CollisionBlock = checkpoint.player1CollisionBlock;
+    playLayer->m_player2CollisionBlock = checkpoint.player2CollisionBlock;
+    playLayer->m_extraDelta = checkpoint.extraDelta;
+    playLayer->m_unk32d0 = checkpoint.unk32d0;
+    playLayer->m_unk32ec = checkpoint.unk32ec;
+    playLayer->m_currentStep = checkpoint.currentStep;
+    playLayer->m_unk3380 = checkpoint.unk3380;
+    if (!checkpoint.gameObjectPhysics.empty()) {
+        playLayer->m_gameState.m_gameObjectPhysics = checkpoint.gameObjectPhysics;
     }
 
     PlayerStateRestorer::restoreState(playLayer->m_player1, checkpoint.player1);
@@ -854,27 +852,27 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
         };
 
         applyFullP1(checkpoint.fullP1, playLayer->m_player1);
-        if (playLayer->m_player2) {
+        // BUG-18 follow-up: fullP2 is only CAPTURED inside a dual/2p context
+        // (see store). Applying it whenever m_player2 merely exists wrote a
+        // default-constructed bundle — position (0,0), every mode flag false,
+        // zero velocity/scale — onto a live player. hasFullPlayer2 is the gate
+        // BUG-18 set up; the reduced/full P1 calls below were simply missed.
+        if (playLayer->m_player2 && checkpoint.hasFullPlayer2) {
             applyFullP1(checkpoint.fullP2, playLayer->m_player2);
         }
 
-        // Rebuild the current mode's sprite/armature after the full-state write.
-        // Without this the mode animation can be left in a bind-pose (T-pose)
-        // because reconcileVehicleVisual skips the toggle when the mode flag is
-        // unchanged. Position/rotation were just re-pinned by applyFullP1, so
-        // the toggle refresh (which may reset visual transform) is harmless.
-        forceCurrentModeVisual(playLayer->m_player1, checkpoint.player1);
-        if (playLayer->m_player2) {
-            forceCurrentModeVisual(playLayer->m_player2, checkpoint.player2);
-        }
+        // NOTE: there is deliberately NO forceCurrentModeVisual() here. It was a
+        // local addition no reference bot has (GDH checkpointData.hpp and
+        // silicate checkpoint/checkpoint.cpp write flags raw and never
+        // deactivate+activate the mode; ToastyReplay-main relies on
+        // reconcileVehicleVisual, which runs inside restoreState at the top of
+        // this function). Its unconditional toggleRobotMode(false) hid the robot
+        // sprite, and nothing ever showed it again — the robot stayed invisible
+        // for the rest of the session after a single restore.
 
-        // BUG-13: forceCurrentModeVisual can reset transforms the apply above
-        // just pinned — the ship's m_shipRotation (its FLIGHT ANGLE) is the
-        // visible one: without re-pinning it the respawned ship sits level
-        // instead of banked and the trajectory diverges from the recording.
-        // The complete snapshot re-pins every field (angle, rotation speed,
-        // fall start, colours, wave trail) AFTER the sprite rebuild, so the
-        // respawn continues the recorded flight exactly.
+        // The complete snapshot re-pins every remaining field (ship angle,
+        // rotation speed, fall start, colours, wave trail) after the mode has
+        // been reconciled, so the respawn continues the recorded flight exactly.
         if (checkpoint.hasFullPlayer) {
             checkpoint.fullPlayer1.apply(playLayer->m_player1);
             if (playLayer->m_player2 && checkpoint.hasFullPlayer2) {

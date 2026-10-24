@@ -1,5 +1,9 @@
 #include "logger.hpp"
+#include "core/paths.hpp"
+#include "utils.hpp"
 
+#include <cstdio>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
 
@@ -83,7 +87,7 @@ std::ofstream* Logger::selectLogFile() {
     std::ofstream& target = (m_sessionMode == SessionMode::Record)
         ? m_fileRecord : m_filePlay;
     if (!target.is_open()) {
-        fs::path logPath = Mod::get()->getSaveDir() / name;
+        fs::path logPath = skkbot2::paths::logFile(name);
         target.open(logPath, std::ios::app);
     }
     return &target;
@@ -91,11 +95,11 @@ std::ofstream* Logger::selectLogFile() {
 
 void Logger::openLogFile() {
     namespace fs = std::filesystem;
-    fs::path logPath = Mod::get()->getSaveDir() / "skkbot2.log";
+    fs::path logPath = skkbot2::paths::logFile(skkbot2::paths::kMainLogName);
 
     m_file.open(logPath, std::ios::app);
     if (!m_file.is_open()) {
-        log(Error, "Failed to open log file: " + logPath.string());
+        log(Error, "Failed to open log file: " + skk::pathToUtf8(logPath));
     }
 }
 
@@ -121,12 +125,18 @@ void Logger::log(Level level, const std::string& msg) {
 
     geode::log::info("{}", output);
 
-    if (m_fileLogging) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        std::ofstream* f = selectLogFile();
-        if (f && f->is_open()) {
-            *f << output << std::endl;
-            f->flush();
-        }
+    // Every line follows the user's file-logging switch, render diagnostics
+    // included. Until 19.10.2026 render.txt was written unconditionally, on the
+    // argument that the render summary cannot be reconstructed afterwards. That
+    // argument was right about the measurement and wrong about the consequence:
+    // it made a permanent write the operator could not switch off, so "no logs"
+    // was not actually available. See the note in logger.hpp.
+    if (!m_fileLogging) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (std::ofstream* f = selectLogFile(); f && f->is_open()) {
+        *f << output << std::endl;
+        f->flush();
     }
 }

@@ -5,10 +5,12 @@
 #include "core/checkpoint_handler.hpp"
 #include "core/broken_object_tracker.hpp"
 #include "core/physical_keys.hpp"
+#include "core/paths.hpp"
 #include "core/practice_fix_bridge.hpp"
 #include "core/playback_align.hpp"
 #include "hacks/physicsbypass.hpp"
 #include "trajectory/trajectory.hpp"
+#include "skc/skc_bot.hpp"
 
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
@@ -18,6 +20,8 @@
 // tolerances) moved to core/playback_align.hpp so the editor playtest path can
 // reuse the exact logic that powers the PlayLayer attempt takeovers.
 using namespace skk::playback_align;
+
+#include "core/frame_stepper.hpp"
 
 #include <Geode/utils/casts.hpp>
 #include <Geode/modify/CheckpointObject.hpp>
@@ -88,7 +92,7 @@ namespace {
         if (!engine->noclipPlayer1 && !engine->noclipPlayer2) {
             return false;
         }
-        if (TrajectoryPredictionService::get().isActiveSimulation()) {
+        if (skk::trajectory::isSimulating()) {
             return false;
         }
 
@@ -350,20 +354,21 @@ bool ReplayEngine::saveActiveMacro() {
         macroSaveInFlight = true;
         std::thread worker([this, live, snapshot = std::move(snapshot)]() mutable {
             std::error_code ec;
-            auto directory = geode::prelude::Mod::get()->getSaveDir() / "replays";
+            auto directory = skkbot2::paths::replays();
             if (!std::filesystem::exists(directory, ec)) {
                 std::filesystem::create_directories(directory, ec);
             }
             bool ok = false;
             std::string resolvedName = snapshot.name;
             if (!ec) {
+                // Exact name+.skk match gets _n+1, always - see makeUniqueReplayName.
                 snapshot.name = ReplayStorage::makeUniqueReplayNameInDirectory(
-                    directory, snapshot.name, snapshot.persistedName);
+                    directory, snapshot.name, ".skk");
                 snapshot.persistedName = snapshot.name;
                 resolvedName = snapshot.name;
                 ok = snapshot.saveToPath(directory / (snapshot.name + ".skk"));
             } else {
-                skkbot2::log::error("Could not prepare replay directory '{}': {}", directory.string(), ec.message());
+                skkbot2::log::error("Could not prepare replay directory '{}': {}", skk::pathToUtf8(directory), ec.message());
             }
             geode::queueInMainThread([this, live, ok, resolvedName = std::move(resolvedName), snapshot = std::move(snapshot)]() mutable {
                 macroSaveInFlight = false;
@@ -755,6 +760,15 @@ void ReplayEngine::restoreLockedRngState(uintptr_t rngState) {
     }
 }
 
+// Rewind the shake LCG as well. It used to be skipped ("camera shake is not
+// locked"), which made every practice restore leave the chain wherever the
+// failed attempt ended - the one locked stream with no restore path at all.
+void ReplayEngine::restoreLockedShakeState(uint64_t shakeState) {
+    if (shakeState != 0) {
+        skk::shakeStateSet(shakeState);
+    }
+}
+
 void ReplayEngine::pruneStoredRestorePoints(PlayLayer* playLayer, int restoredTick) {
     if (!playLayer || !playLayer->m_checkpointArray) {
         storedRestorePoints.clear();
@@ -983,9 +997,6 @@ bool ReplayEngine::tryLivePlaybackTakeover(GJBaseGameLayer* playLayer) {
     } else if (activeMacro) {
         executeIndex = findFirstInputAtTick(activeMacro->inputs, targetTick);
     }
-    if (auto* pl = typeinfo_cast<PlayLayer*>(playLayer); pl && pl->m_isPracticeMode) {
-        pl->togglePracticeMode(false);
-    }
     clearStartPosWarning();
     skkbot2::log::info("PLAY live takeover: live=({:.0f},{:.0f}) -> targetTick={} baseline={} offset={}",
         refX, refY, targetTick, baselineTick, tickOffset);
@@ -1118,7 +1129,7 @@ class $modify(RestorePointHandler, CheckpointObject) {
         auto* playLayer = PlayLayer::get();
         if (!playLayer
             || engine->engineMode != MODE_CAPTURE
-            || TrajectoryPredictionService::get().isActiveSimulation()) {
+            || skk::trajectory::isSimulating()) {
             return result;
         }
 
@@ -1145,8 +1156,8 @@ class $modify(BrokenObjectHook, GJBaseGameLayer) {
         GJBaseGameLayer::destroyObject(obj);
 
         auto* engine = ReplayEngine::get();
-        if (!engine || engine->engineMode != MODE_CAPTURE) return;
-        if (TrajectoryPredictionService::get().isActiveSimulation()) return;
+        if (!engine || engine->engineMode != MODE_CAPTURE
+            || skk::trajectory::isSimulating()) return;
 
         BrokenObjectTracker::get().registerBroken(obj);
     }
@@ -1202,8 +1213,33 @@ class $modify(MacroPlayLayer, PlayLayer) {
         // the same object instances, so the registry still survives attempts.
         skk::advRandomClear();
         bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
-        if (engine && !engine->replayAccuracyEnvironmentActive) {
-            engine->syncAccuracyFromGame();
+        if (auto* engine = ReplayEngine::get()) {
+            if (engine->replayAccuracyEnvironmentActive) {
+                // The replay owns the accuracy environment — it re-applies its
+                // own mode on every arm.
+            } else if (skk::skc::Bot::get().ownsTiming()) {
+                // An SKC session owns the clock. SKC labels every click with a
+                // count of processCommands calls and its format carries no
+                // sub-step offset, so CBS would split those steps in half and
+                // make the recorded stream not line up with the physics that
+                // produced it. SkcPlayLayer::resetLevel forces vanilla accuracy
+                // for exactly that reason - and this hook used to undo it a few
+                // frames later, on the same reset, by pushing the menu's
+                // selected mode back. The two modules were fighting over one
+                // setting with no rule for who wins; the session that owns the
+                // clock is the one whose answer has to hold.
+            } else {
+                // GD re-initialises m_clickBetweenSteps / m_clickOnSteps from
+                // its own source inside PlayLayer::init, which would wipe the
+                // mode the user picked in our menu. Re-apply our value instead
+                // of adopting the post-init one: syncAccuracyFromGame() is the
+                // menu's job and would here silently undo the user's choice.
+                // A change the user made in GD's own options while inside a
+                // level is already mirrored by the menu (it adopts straight from
+                // the layer field), so this re-apply is idempotent for it.
+                ReplayEngine::applyRuntimeAccuracyMode(engine->selectedAccuracyMode,
+                                                       engine->cosEnabled);
+            }
         }
         return ret;
     }
@@ -1634,7 +1670,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
         }
     }
 
+    void updateAttempts() {
+        PlayLayer::updateAttempts();
+    }
+
     void resetLevel() {
+        FrameStepper::get().onResetLevel();
         auto* engine = ReplayEngine::get();
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
@@ -1659,6 +1700,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
     }
 
     void resetLevelFromStart() {
+        FrameStepper::get().onResetLevel();
         auto* engine = ReplayEngine::get();
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
@@ -1690,9 +1732,6 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->captureReleaseSuppressUntil = static_cast<int>(
             m_gameState.m_levelTime * engine->runtimeTickRate()) + 1 + 8;
         engine->resetRecordedHoldShadow();
-        if (TrajectoryPredictionService::get().isActiveSimulation()) {
-            return PlayLayer::loadFromCheckpoint(checkpoint);
-        }
 
         if (!checkpoint) {
             engine->clearFrameStepState();
@@ -1746,8 +1785,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
             engine->captureIgnored = true;
             engine->stepPairCount = std::max(0, it->second.priorTick - 1);
             engine->stepPairFrac = 0.0;
-            engine->lastTickIndex = it->second.priorTick;
-            engine->restoreLockedRngState(it->second.rng.fastRandState);
+engine->lastTickIndex = it->second.priorTick;
+ engine->restoreLockedRngState(it->second.rng.fastRandState);
+ engine->restoreLockedShakeState(it->second.rng.shakeState);
 
             // Practice-restart boundary (capture): re-apply the checkpoint's
             // captured teleport AFTER the restore so the segment continues under
@@ -1892,8 +1932,9 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
                 engine->captureIgnored = true;
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
                 engine->stepPairFrac = 0.0;
-                engine->lastTickIndex = ref.priorTick;
-                engine->restoreLockedRngState(ref.rng.fastRandState);
+engine->lastTickIndex = ref.priorTick;
+ engine->restoreLockedRngState(ref.rng.fastRandState);
+ engine->restoreLockedShakeState(ref.rng.shakeState);
 
                 m_queuedButtons.clear();
                 PlayLayer::loadFromCheckpoint(checkpoint);
@@ -2052,17 +2093,21 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
             engine->disablePersistenceModeSafeguard();
             engine->haltExecution();
         } else if (wasCapturing || wasCapturingPersistence) {
+            // Completion ends the recording session in BOTH modes. The
+            // persistence-only branch (an upstream Toasty leak) neither halted
+            // nor saved, so MODE_CAPTURE stayed armed past the win screen and
+            // the next retry's restart-clear silently wiped the finished
+            // timeline — the Auto Save Mod that used to sit here was the same
+            // code commit 13774ee removed, and has now been deleted outright at
+            // the user's request. Only the HALT is kept: saving the macro here
+            // is what the SAVE button is for, and halting is an independent
+            // correctness fix that must not regress with it.
             engine->haltExecution();
             skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
         }
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (TrajectoryPredictionService::get().isActiveSimulation()) {
-            PlayLayer::destroyPlayer(player, object);
-            return;
-        }
-
         auto* engine = ReplayEngine::get();
         int deathTick = computePlaybackTick(this);
         bool deathPlayer2 = player && player == m_player2;
@@ -2186,6 +2231,7 @@ skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} f
             engine->storedRestorePoints.clear();
             engine->practiceFixQueue.clear();
             BrokenObjectTracker::get().clear();
+            FrameStepper::get().onPlayLayerDestroy();
             PlayLayer::onQuit();
         };
 

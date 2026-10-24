@@ -3,10 +3,18 @@
 #include "gui/beta_gui.hpp"
 
 #include "skkBot.hpp"
+#include "skc/skc_bot.hpp"
+#include "core/frame_stepper.hpp"
+#include "core/paths.hpp"
 #include "logger/logger.hpp"
+#include "render/ffdownloader.hpp"
 
 #include <Geode/Geode.hpp>
+#include <Geode/binding/PauseLayer.hpp>
 #include <imgui.h>
+// kNoPadWithHalfSpacing (see gui/beta_widgets.hpp) - pulled in from there
+// rather than from imgui_internal.h, which clashes with geode::prelude.
+#include "gui/beta_widgets.hpp"
 #include <imgui-cocos.hpp>
 
 #include <filesystem>
@@ -24,6 +32,21 @@
 using namespace geode::prelude;
 using namespace skkbot2::gui;
 
+namespace {
+PauseLayer* findOpenPauseLayer(CCNode* node) {
+    if (!node) return nullptr;
+    if (auto* pause = node->getChildByType<PauseLayer>(0)) return pause;
+    auto* children = node->getChildren();
+    if (!children) return nullptr;
+    for (unsigned i = 0; i < children->count(); ++i) {
+        if (auto* found = findOpenPauseLayer(static_cast<CCNode*>(children->objectAtIndex(i)))) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+}
+
 namespace skkbot2::gui {
 
 Gui& get() {
@@ -40,7 +63,68 @@ void Gui::init() {
     showFeatures = true;
     showMacroList = false;
     menuKeybind = mod->getSavedValue<int>("menu_keybind", 0xA5);
-    useBetaGui = mod->getSavedValue<bool>("gui_use_beta", true);
+    stepForwardKeybind = mod->getSavedValue<int>("keybind_step_forward", 0x43);
+    // Default moved G -> C. A saved 0x47 is the OLD default, not a user choice,
+    // so migrate it once вЂ” otherwise the new default never reaches anyone who
+    // ran a build before the change.
+    if (stepForwardKeybind == 0x47) {
+        stepForwardKeybind = 0x43;
+        mod->setSavedValue("keybind_step_forward", stepForwardKeybind);
+    }
+
+    // Keybind table. The two legacy keys above are the authoritative storage for
+    // Menu and StepForward (existing installs already have them); the rest read
+    // their own saved keys. Legacy defaults are migrated the same way the G->C
+    // move was: a value equal to a superseded default is treated as "not chosen
+    // yet" so the new default still reaches old installs.
+    // Only MENU, RESET LEVEL and STEP FORWARD ship with a default. Everything else
+    // is UNBOUND (0): transport keys and assist toggles are actions the user
+    // opts into, and pre-assigning letters silently steals keys the game or
+    // other mods may want. The rows stay listed in KEYBIND, so a bind is one
+    // click away. `legacyDef` carries the superseded default so existing installs
+    // get their stored value reset once to the new one.
+    static const struct {
+        Bind bind;
+        const char* label;
+        int def;
+        int group;
+        const char* saveKey;
+        int legacyDef;  // superseded default to migrate away from, 0 = none
+    } kBindDefs[] = {
+        { Bind::Menu,        "Open Menu",   0xA5, 0, "menu_keybind",           0    },
+        // "Reset Level" is GDH's own name for it (src/interface/imgui/windows/
+        // shortcuts.cpp:143, bind id "shortcut::reset_level"); its implementation
+        // there is a bare PlayLayer::resetLevel() (src/core/shortcuts.hpp:29-30).
+        // R was Record's old default; Record is now unbound, so the key is free.
+        { Bind::ResetLevel,   "Reset Level", 0x52, 0, "keybind_reset_level",    0x56 },
+        { Bind::Record,      "Record",      0,   1, "keybind_record",         0x52 },
+        { Bind::Play,        "Play",        0,   1, "keybind_play",           0x50 },
+        { Bind::StepForward, "Step Forward",0x43, 1, "keybind_step_forward",   0x47 },
+        { Bind::StepToggle,  "Step Toggle", 0,   1, "keybind_step_toggle",    0x54 },
+        { Bind::Hitboxes,    "Hitboxes",    0,   2, "keybind_hitboxes",       0x48 },
+        { Bind::Speedhack,   "Speedhack",   0,   2, "keybind_speedhack",      0x42 },
+        { Bind::Noclip,      "Noclip",      0,   2, "keybind_noclip",         0x4E },
+        { Bind::Trajectory,  "Trajectory",  0,   2, "keybind_trajectory",     0x59 },
+        { Bind::LayoutMode,  "Layout Mode", 0,   2, "keybind_layout_mode",    0x4C },
+    };
+
+    for (int i = 0; i < kBindCount; ++i) {
+        auto const& d = kBindDefs[i];
+        if (d.bind == Bind::Menu) {
+            bindKeys[i] = menuKeybind;
+        } else if (d.bind == Bind::StepForward) {
+            bindKeys[i] = stepForwardKeybind;
+        } else {
+            bindKeys[i] = mod->getSavedValue<int>(d.saveKey, d.def);
+            if (d.legacyDef && bindKeys[i] == d.legacyDef) {
+                bindKeys[i] = d.def;
+                mod->setSavedValue(d.saveKey, bindKeys[i]);
+            }
+        }
+    }
+    kbWaiting = -1;
+
+        useBetaGui = mod->getSavedValue<bool>("gui_use_beta", true);
 
     if (mod->getSavedValue<bool>("gui_show_features", true)) {
         showFeatures = true;
@@ -53,8 +137,36 @@ void Gui::init() {
     tpsEnabled = mod->getSavedValue<bool>("gui_tps_enabled", false);
     tpsValue = std::clamp(mod->getSavedValue<double>("gui_tps_value", 240.0), 1.0, 1000000.0);
     engine->tickRate = tpsEnabled ? tpsValue : 240.0;
+    // FPS: off by default so an existing install keeps the frame pacing it has.
+    // 0 is the special "follow TPS" value, so the clamp floor is 0 here rather
+    // than 1 - a negative number would be a third meaning nobody asked for.
+    fpsEnabled = mod->getSavedValue<bool>("gui_fps_enabled", false);
+    fpsValue = std::clamp(mod->getSavedValue<double>("gui_fps_value", 0.0), 0.0, 1000.0);
+    // LOCK FPS: the row and the checkbox are gone (19.10.2026). The step planner
+    // already advances the level exactly one frame per frame drawn whenever FPS
+    // equals TPS - dt == 1/fps == 1/tps == timestep, so the carry grows by one
+    // timestep and planSteps returns 1. Outside that case the toggle made
+    // playback run slower than real time, which is not what this bot is for.
+    //
+    // The saved key is cleared rather than merely ignored: leaving a "true" in
+    // the user's file after removing the control that could un-set it is the
+    // exact shape of the setting that comes back on a later version.
+    if (mod->getSavedValue<bool>("gui_fps_lock_delta", false)) {
+        mod->setSavedValue("gui_fps_lock_delta", false);
+        skkbot2::Logger::get().info(
+            "skkbot2: saved Lock FPS setting cleared - the control is gone");
+    }
+    skkbot2::fps::setEnabled(fpsEnabled);
+    skkbot2::fps::setTarget(fpsValue == 0.0 ? skkbot2::fps::kFollowTps : fpsValue);
     engine->gameSpeed = 1.0;
     speedhackEnabled = mod->getSavedValue<bool>("gui_speedhack_enabled", false);
+    musicSpeedSync = mod->getSavedValue<bool>("gui_music_speed_sync", false);
+    engine->layoutMode = mod->getSavedValue<bool>("gui_layout_mode", false);
+    // Safe Mode is a single master toggle, default OFF, and it always freezes
+    // attempts AND jumps. The per-effect switches (gui_safe_mode_freeze_*) and
+    // Auto Save Mod (gui_auto_save_mod) were removed вЂ” those saved values are
+    // simply ignored now, so nothing has to be migrated or deleted on disk.
+    engine->safeMode = mod->getSavedValue<bool>("gui_safe_mode", false);
     speedhackValue =
         std::max(0.01, mod->getSavedValue<double>("gui_speedhack_value", 1.0));
     engine->gameSpeed = speedhackEnabled ? speedhackValue : 1.0;
@@ -64,18 +176,17 @@ void Gui::init() {
     engine->noclipPlayer2 = mod->getSavedValue<bool>("gui_noclip_p2", true);
     engine->noclipDeathFlash = mod->getSavedValue<bool>("gui_noclip_flash", false);
 
-    // HITBOX OVERLAY — visual-only collision-box debug draw (see
+    // HITBOX OVERLAY вЂ” visual-only collision-box debug draw (see
     // src/hacks/hitboxes.cpp). Off by default; toggled from the RECORD tab.
     engine->showHitboxes = mod->getSavedValue<bool>("gui_hitboxes", false);
     engine->hitboxFill = mod->getSavedValue<bool>("gui_hitbox_fill", false);
 
-    // TRAJECTORY overlay (RECORD tab) — off by default, it simulates physics
-    // every frame while on. See src/hacks/trajectory.cpp. The length is a
-    // compile-time constant (ReplayEngine::kTrajectoryLengthDefault); there is
-    // no setting to restore.
+    // TRAJECTORY overlay (RECORD tab) вЂ” off by default, simulates future player trajectory
     engine->showTrajectory = mod->getSavedValue<bool>("gui_trajectory", false);
+    engine->trajectoryBothSides = mod->getSavedValue<bool>("gui_trajectory_both_sides", false);
+    engine->pathLength = std::clamp(mod->getSavedValue<int>("gui_trajectory_length", ReplayEngine::kTrajectoryLengthDefault), 10, 1200);
 
-    // WAVE TRAIL FIX — always-on visual-only trail rework (drag-fix +
+    // WAVE TRAIL FIX вЂ” always-on visual-only trail rework (drag-fix +
     // draw-fix). Defaults to on, like the reference mods.
     engine->waveTrailFix = mod->getSavedValue<bool>("gui_wavetrail", true);
     engine->waveTrailDragFix = mod->getSavedValue<bool>("gui_wavetrail_drag", true);
@@ -118,6 +229,10 @@ void Gui::init() {
         }
     }
 
+    macroBotType = static_cast<MacroBotType>(
+        std::clamp(mod->getSavedValue<int>("gui_macro_bot_type", 0), 0, 1)
+    );
+
     loadRenderSettings();
 
     refreshMacroList();
@@ -130,6 +245,8 @@ void Gui::saveSettings() {
     mod->setSavedValue("gui_show_features", showFeatures);
     mod->setSavedValue("gui_use_beta", useBetaGui);
     mod->setSavedValue("gui_tps_enabled", tpsEnabled);
+    mod->setSavedValue("gui_fps_enabled", fpsEnabled);
+    mod->setSavedValue("gui_fps_value", fpsValue);
     mod->setSavedValue("gui_tps_value", tpsValue);
     mod->setSavedValue("gui_speedhack_enabled", speedhackEnabled);
     mod->setSavedValue("gui_speedhack_value", speedhackValue);
@@ -139,6 +256,12 @@ void Gui::saveSettings() {
     mod->setSavedValue("gui_noclip_flash", engine->noclipDeathFlash);
     mod->setSavedValue("gui_hitboxes", engine->showHitboxes);
     mod->setSavedValue("gui_hitbox_fill", engine->hitboxFill);
+    // Trajectory was MISSING here: it was only ever written by the beta GUI's
+    // toggle, so a save round-trip silently dropped it and the on-screen state
+    // could diverge from what the menu shows after a reload.
+    mod->setSavedValue("gui_trajectory", engine->showTrajectory);
+    mod->setSavedValue("gui_trajectory_both_sides", engine->trajectoryBothSides);
+    mod->setSavedValue("gui_trajectory_length", engine->pathLength);
     mod->setSavedValue("gui_wavetrail", engine->waveTrailFix);
     mod->setSavedValue("gui_wavetrail_drag", engine->waveTrailDragFix);
     mod->setSavedValue("gui_wavetrail_draw", engine->waveTrailDrawFix);
@@ -153,6 +276,7 @@ void Gui::saveSettings() {
                        static_cast<int>(sanitizeAccuracyMode(
                            static_cast<int>(engine->selectedAccuracyMode))));
     mod->setSavedValue("gui_cos", engine->cosEnabled);
+    mod->setSavedValue("gui_macro_bot_type", static_cast<int>(macroBotType));
 
     auto& logger = skkbot2::Logger::get();
     mod->setSavedValue("gui_file_logging", logger.isFileLogging());
@@ -192,7 +316,9 @@ void Gui::selectMacroInList(std::string const& name) {
     refreshMacroList();
     selectedMacro = -1;
     for (int i = 0; i < static_cast<int>(macros.size()); ++i) {
-        if (macros[i] == name) {
+        // Callers pass a bare stem (macroName), while the list keys carry the
+        // format suffix, so compare on the stem part.
+        if (ReplayEngine::macroEntryStem(macros[i]) == name) {
             selectedMacro = i;
             break;
         }
@@ -216,6 +342,7 @@ void Gui::loadRenderSettings() {
     render.audioFadeIn = std::clamp(mod->getSavedValue<double>("gui_render_afadein", 0.0), 0.0, 10.0);
     render.audioFadeOut = std::clamp(mod->getSavedValue<double>("gui_render_afadeout", 0.0), 0.0, 10.0);
     renderEncoder = mod->getSavedValue<std::string>("gui_render_encoder", "");
+    renderHideMenu = mod->getSavedValue<bool>("gui_render_hidemenu", true);
 }
 
 void Gui::saveRenderSettings() {
@@ -234,6 +361,7 @@ void Gui::saveRenderSettings() {
     mod->setSavedValue("gui_render_afadein", render.audioFadeIn);
     mod->setSavedValue("gui_render_afadeout", render.audioFadeOut);
     mod->setSavedValue("gui_render_encoder", renderEncoder);
+    mod->setSavedValue("gui_render_hidemenu", renderHideMenu);
 }
 
 void Gui::startRender() {
@@ -243,7 +371,14 @@ void Gui::startRender() {
         return;
     }
     auto* engine = ReplayEngine::get();
-    if (engine->engineMode != MODE_EXECUTE) {
+    // SKC playback counts as a running macro. The renderer is engine-agnostic;
+    // the old MODE_EXECUTE-only gate rejected a perfectly valid SKC playback.
+    auto& guiRef = skkbot2::gui::get();
+    const bool skcOn = guiRef.macroBotType == Gui::MacroBotType::SKC;
+    auto& skcBot = skk::skc::Bot::get();
+    const bool skcRunning = skcOn && (skcBot.getState() == skk::skc::State::Playback ||
+                                      skcBot.isPlaybackArmed());
+    if (engine->engineMode != MODE_EXECUTE && !skcRunning) {
         Notification::create("Load a macro and start playback first",
                              NotificationIcon::Error)->show();
         return;
@@ -278,23 +413,31 @@ void Gui::startRender() {
     }
     skkbot2::Logger::get().info("Render started -> {} ({}x{}@{}fps)",
         renderer.lastOutputPath(), render.width, render.height, render.fps);
+    if (skcOn) {
+        // Single-line CCLabelBMFont: keep it short enough to fit.
+        Notification::create(
+            "SKC: no death chain - restart from frame 0",
+            NotificationIcon::Info, NOTIFICATION_LONG_TIME
+        )->show();
+    }
 }
 
 void Gui::drawRenderWindow() {
     auto& renderer = skkbot2::render::Renderer::get();
     auto* engine = ReplayEngine::get();
 
-    // Load FFmpeg the first time the window opens (7 DLLs, ~160 MB total —
+    // Load FFmpeg the first time the window opens (7 DLLs, ~160 MB total вЂ”
     // do not block mod load with it).
     if (!renderer.isFFmpegLoaded()) {
         if (renderer.loadFFmpeg()) {
-            // If the user has no saved encoder, auto-pick the most basic GPU
-            // H.264 encoder available (nvenc -> amf -> qsv), falling back to
-            // software libx264. No bogus "default" pseudo-entry anymore.
+            // If the user has no saved encoder, use libx264. It is in the build
+            // on every machine, so the default is the same everywhere instead of
+            // depending on which GPU happens to be installed; the hardware
+            // encoders stay available to pick on purpose.
             if (renderEncoder.empty()) {
                 const auto& encoders = renderer.availableEncoders();
                 const char* kPref[] = {
-                    "h264_nvenc", "h264_amf", "h264_qsv", "libx264",
+                    "libx264", "h264_nvenc", "h264_amf", "h264_qsv",
                 };
                 for (const char* want : kPref) {
                     auto it = std::find(encoders.begin(), encoders.end(), want);
@@ -313,7 +456,7 @@ void Gui::drawRenderWindow() {
 
     const bool ffLoaded = renderer.isFFmpegLoaded();
     const bool recording = renderer.isRecording();
-    // A render has run this session and is no longer active — "done" state.
+    // A render has run this session and is no longer active вЂ” "done" state.
     const bool done = !recording && renderer.renderStartWall() > 0.0 &&
                       renderer.mEncodedFrames.load() > 0;
     const uint64_t encoded = renderer.mEncodedFrames.load();
@@ -339,10 +482,41 @@ void Gui::drawRenderWindow() {
         renderWasRecording = recording;
 
         if (!ffLoaded) {
+            auto& dl = skkbot2::render::FFmpegDownloader::get();
+            const bool isDlBusy = dl.isBusy();
+            const bool dllsOnDisk = skkbot2::render::FFmpegDownloader::areDllsPresent();
+
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
             ImGui::TextWrapped("FFmpeg load failed: %s",
                                renderer.lastError().c_str());
             ImGui::PopStyleColor();
+
+            ImGui::TextWrapped("Target folder: %s",
+                               skk::pathToUtf8(skkbot2::render::Renderer::preferredFfmpegDir()).c_str());
+
+            if (isDlBusy) {
+                ImGui::ProgressBar(dl.progress(), ImVec2(-1, 0), dl.statusMessage().c_str());
+            } else if (!dllsOnDisk) {
+                if (ImGui::Button("Download FFmpeg DLLs", ImVec2(-1, 0))) {
+                    dl.startDownload([this](bool ok) {
+                        if (ok) {
+                            auto& r = skkbot2::render::Renderer::get();
+                            r.reloadFFmpeg();
+                            r.loadFFmpeg();
+                        }
+                    });
+                }
+            }
+
+            if (ImGui::Button("Open FFmpeg folder", ImVec2(-1, 0))) {
+                skkbot2::render::Renderer::prepareFfmpegDropIn();
+                openFolderInExplorer(
+                    skkbot2::render::Renderer::preferredFfmpegDir());
+            }
+            if (ImGui::Button("Reload FFmpeg", ImVec2(-1, 0))) {
+                renderer.reloadFFmpeg();
+                renderer.loadFFmpeg();
+            }
         }
         if (recording) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.1f, 1.0f, 0.2f, 1.0f));
@@ -392,7 +566,7 @@ void Gui::drawRenderWindow() {
                              ip0, ImVec2(ip0.x + imgW, ip0.y + imgH),
                              ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
             } else {
-                const char* msg = "No preview yet — start a render";
+                const char* msg = "No preview yet вЂ” start a render";
                 ImVec2 ts = ImGui::CalcTextSize(msg);
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.45f, 0.5f, 1.0f));
                 dl->AddText(ImVec2(p0.x + (prevSize.x - ts.x) * 0.5f,
@@ -454,14 +628,20 @@ void Gui::drawRenderWindow() {
             ImGui::TextUnformatted(pbuf);
 
             ImGui::Separator();
+            // Always open the videos DIRECTORY, never /select on the output
+            // file: a failed render deletes the file, and Explorer with a
+            // missing /select target falls back to "Documents".
             if (!renderer.lastOutputPath().empty()) {
                 ImGui::TextWrapped("Output: %s",
                                    renderer.lastOutputPath().c_str());
                 if (ImGui::Button("Open folder", ImVec2(-1, 0))) {
-                    openFolderFor(renderer.lastOutputPath().c_str());
+                    openFolderInExplorer(skkbot2::paths::videos());
                 }
             } else {
                 ImGui::TextDisabled("No output yet");
+                if (ImGui::Button("Open videos folder", ImVec2(-1, 0))) {
+                    openFolderInExplorer(skkbot2::paths::videos());
+                }
             }
         }
         ImGui::EndChild();
@@ -535,7 +715,8 @@ void Gui::drawRenderWindow() {
                                                : renderEncoder.c_str())) {
                     for (size_t i = 0; i < encoders.size(); ++i) {
                         if (ImGui::Selectable(encoders[i].c_str(),
-                                              cur == static_cast<int>(i))) {
+                                              cur == static_cast<int>(i),
+                                              kNoPadWithHalfSpacing)) {
                             renderEncoder = encoders[i];
                             renderer.setEncoder(renderEncoder);
                             changed = true;
@@ -564,7 +745,8 @@ void Gui::drawRenderWindow() {
                         for (const char* name : kAudioCodecs) {
                             if (!renderer.hasAudioCodec(name)) continue;
                             bool sel = preview == name;
-                            if (ImGui::Selectable(name, sel)) {
+                            if (ImGui::Selectable(name, sel,
+                                                      kNoPadWithHalfSpacing)) {
                                 std::snprintf(render.audioCodec,
                                               sizeof(render.audioCodec),
                                               "%s", name);
@@ -655,9 +837,17 @@ void Gui::drawRenderWindow() {
 
             ImGui::Separator();
 
+            auto& rGui = skkbot2::gui::get();
+            auto& rSkcBot = skk::skc::Bot::get();
+            const bool rSkcPlaying =
+                rGui.macroBotType == Gui::MacroBotType::SKC &&
+                (rSkcBot.getState() == skk::skc::State::Playback ||
+                 rSkcBot.isPlaybackArmed());
+            // Same fix as the beta GUI: this gate is what actually disabled the
+            // button under SKC, so startRender() was never reached.
             const bool canStart = !recording && ffLoaded && PlayLayer::get() &&
-                                  engine->engineMode == MODE_EXECUTE &&
-                                  engine->activeSk;
+                                  (engine->engineMode == MODE_EXECUTE ||
+                                   rSkcPlaying);
             ImGui::BeginDisabled(!canStart && !recording);
             if (recording) {
                 if (ImGui::Button("Stop Render", ImVec2(-1, 34))) {
@@ -750,9 +940,11 @@ void Gui::draw() {
     }
 
     auto* engine = ReplayEngine::get();
+    auto& bot = skk::skc::Bot::get();
+    bool isSkc = macroBotType == MacroBotType::SKC;
     bool inLevel = PlayLayer::get() != nullptr;
-    bool capturing = engine->engineMode == MODE_CAPTURE;
-    bool executing = engine->engineMode == MODE_EXECUTE;
+    bool capturing = isSkc ? (bot.getState() == skk::skc::State::Record) : (engine->engineMode == MODE_CAPTURE);
+    bool executing = isSkc ? (bot.getState() == skk::skc::State::Playback) : (engine->engineMode == MODE_EXECUTE);
 
     applyTheme();
 
@@ -767,9 +959,15 @@ void Gui::draw() {
     // Record / Play toggle buttons, mirroring the old skkBot pair. The buttons
     // also reflect a queued Record/Play (pressed while outside a level) and an
     // armed playback that is waiting for the next attempt.
-    bool recordQueued = engine->pendingAction == ReplayEngine::PendingAction::Record;
-    bool playQueued = engine->pendingAction == ReplayEngine::PendingAction::Play;
-    bool playArmed = playQueued || engine->pendingPlaybackStart;
+    bool recordQueued = isSkc
+        ? (bot.getPendingAction() == skk::skc::PendingAction::Record)
+        : (engine->pendingAction == ReplayEngine::PendingAction::Record);
+    bool playQueued = isSkc
+        ? (bot.getPendingAction() == skk::skc::PendingAction::Play)
+        : (engine->pendingAction == ReplayEngine::PendingAction::Play);
+    bool playArmed = isSkc
+        ? (playQueued || bot.isPlaybackArmed())
+        : (playQueued || engine->pendingPlaybackStart);
 
     // Status line - colored like the old skkBot.
     const char* statusStr = "Disabled";
@@ -782,6 +980,9 @@ void Gui::draw() {
         statusColor = ImVec4(0.1f, 1.0f, 0.2f, 1.0f);
     } else if (playArmed) {
         statusStr = "ARMED";
+        statusColor = ImVec4(1.0f, 0.8f, 0.1f, 1.0f);
+    } else if (recordQueued) {
+        statusStr = "QUEUED";
         statusColor = ImVec4(1.0f, 0.8f, 0.1f, 1.0f);
     }
     ImGui::PushStyleColor(ImGuiCol_Text, statusColor);
@@ -796,7 +997,7 @@ void Gui::draw() {
     float spacing = ImGui::GetStyle().ItemSpacing.x;
     float pairW = (rowW - spacing) / 2.0f;
 
-    bool saveBusy = engine->macroSaveBusy();
+    bool saveBusy = !isSkc && engine->macroSaveBusy();
 
     ImGui::BeginDisabled(executing || playQueued || saveBusy);
     if (ImGui::Button(capturing || recordQueued ? "Stop" : "Record", ImVec2(pairW, 26))) {
@@ -804,31 +1005,57 @@ void Gui::draw() {
             stopRecording(macroName);
             selectMacroInList(macroName);
         } else if (recordQueued) {
-            engine->clearPendingAction();
+            if (isSkc) {
+                bot.clearPendingAction();
+            } else {
+                engine->clearPendingAction();
+            }
         } else if (inLevel) {
             startRecording(macroName);
         } else {
-            engine->queueRecord(macroName);
+            if (isSkc) {
+                bot.setPendingAction(skk::skc::PendingAction::Record);
+            } else {
+                engine->queueRecord(macroName);
+            }
         }
     }
     ImGui::EndDisabled();
 
     ImGui::SameLine();
 
-    bool noMacroToPlay = !engine->hasMacroInputs() && macroName[0] == '\0';
+    bool noMacroToPlay = isSkc ? (!bot.hasInputs() && macroName[0] == '\0') : (!engine->hasMacroInputs() && macroName[0] == '\0');
     ImGui::BeginDisabled(capturing || recordQueued || saveBusy || (noMacroToPlay && !executing && !playArmed));
     if (ImGui::Button(executing || playArmed ? "Stop" : "Play", ImVec2(pairW, 26))) {
         if (executing) {
-            engine->haltExecution();
-            skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+            if (isSkc) {
+                bot.stop();
+                skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+            } else {
+                engine->haltExecution();
+                skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+            }
         } else if (playArmed) {
-            skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
-            engine->haltExecution();
-            engine->clearPendingAction();
-        } else if (inLevel) {
+            if (isSkc) {
+                if (bot.getPendingAction() == skk::skc::PendingAction::Play) {
+                    bot.clearPendingAction();
+                } else {
+                    bot.stop();
+                }
+                skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+            } else {
+                skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+                engine->haltExecution();
+                engine->clearPendingAction();
+            }
+        } else if (inLevel || (isSkc && skk::gameplay::asEditor())) {
             armPlayback(macroName);
         } else {
-            engine->queuePlayback(macroName);
+            if (isSkc) {
+                bot.setPendingAction(skk::skc::PendingAction::Play);
+            } else {
+                engine->queuePlayback(macroName);
+            }
         }
     }
     ImGui::EndDisabled();
@@ -1148,22 +1375,23 @@ void Gui::drawFeaturesWindow() {
         // the toggle ON, and turning the toggle off hands the rate back to the
         // menu's own value (dropPlaybackTickRateOverride) without disturbing
         // the replay's accuracy. Outside that, only WRITE engine->tickRate on
-        // an actual edit — writing it every frame (as the old
+        // an actual edit вЂ” writing it every frame (as the old
         // `engine->tickRate = tpsOn ? tpsValue : 240.0` did) stomps the
         // macro-declared TPS: a macro recorded at 360 TPS would silently fall
         // back to 240 the moment the GUI redraws, and so would every render
         // started while the TPS toggle was off.
-        const bool playbackOverriding =
-            engine->engineMode == MODE_EXECUTE && engine->playbackTickRateOverrideActive;
-        if (playbackOverriding) {
+        // SKC playback locks this too, same as the beta GUI.
+        const bool isPlaying = engine->engineMode == MODE_EXECUTE ||
+            (skkbot2::gui::get().macroBotType == Gui::MacroBotType::SKC &&
+             skk::skc::Bot::get().getState() == skk::skc::State::Playback);
+        if (isPlaying) {
             ImGui::BeginDisabled(true);
             float liveTps = static_cast<float>(engine->runtimeTickRate());
             ImGui::SliderFloat("TPS", &liveTps, 1.0f, 1000000.0f, "%.0f");
-            ImGui::EndDisabled();
+            ImGui::SameLine();
             bool on = true;
-            if (ImGui::Checkbox("##tps_enable", &on)) {
-                if (!on) engine->dropPlaybackTickRateOverride();
-            }
+            ImGui::Checkbox("##tps_enable", &on);
+            ImGui::EndDisabled();
         } else {
             engine->tickRate = tpsEnabled ? tpsValue : 240.0;
             ImGui::BeginDisabled(!tpsEnabled);
@@ -1193,6 +1421,78 @@ void Gui::drawFeaturesWindow() {
             }
         }
         ImGui::TextDisabled("Base: %.0f Hz", ReplayEngine::kBaseTickRate);
+
+        // FPS, directly under TPS for the same reason the beta GUI puts it
+        // there: the two are one decision - TPS sets the LENGTH of a step, FPS
+        // sets how many steps the display gets to run per frame. Unlike TPS it
+        // stays live during playback, because changing the frame rate moves
+        // steps between frames and never touches the step itself.
+        //
+        // 0 is the special value and means "follow TPS": one physics step per
+        // drawn frame. The consequence is written out under the slider rather
+        // than next to the value, where it crowded the number.
+        ImGui::SetNextItemWidth(-60.0f);
+        // Locked only while RECORDING; editable during playback, same rule as
+        // the beta GUI. The rate is a display decision, not part of the
+        // recorded input, so changing it mid-run is legitimate; during a
+        // capture it is locked because the macro's stored fps is taken at the
+        // start and a value changed halfway would describe neither half.
+        const auto& skcNow = skk::skc::Bot::get();
+        const bool fpsRecording = skcNow.isEnabled()
+            ? (skcNow.getState() == skk::skc::State::Record)
+            : (engine->engineMode == MODE_CAPTURE);
+        const bool fpsLocked = fpsRecording;
+        const bool fpsMacro = skkbot2::fps::macroHolds();
+        // What the macro put in force. 0 means "follow tps" - showing the tick
+        // rate here would push a pinned number back on the next frame, which
+        // the module reads as a hand edit and then honours over the macro.
+        const float macroFpsV = static_cast<float>(
+            skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0);
+        const bool macroFpsOn = skkbot2::fps::enabled();
+        float fpsSlider = fpsMacro ? macroFpsV : static_cast<float>(fpsValue);
+        bool fpsToggle = fpsMacro ? macroFpsOn : fpsEnabled;
+        if (!fpsLocked) {
+            bool edited = false;
+            if (ImGui::SliderFloat("FPS##fps", &fpsSlider, 0.0f, 1000.0f,
+                                   "%.0f")) {
+                edited = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("##fps_enable", &fpsToggle)) {
+                edited = true;
+            }
+            // Only a real edit touches the saved setting: writing the macro's
+            // mirrored number into fpsValue would make it the menu's value
+            // after the session, which endMacro() restores over.
+            if (edited) {
+                fpsValue = static_cast<double>(fpsSlider);
+                fpsEnabled = fpsToggle;
+                settingsDirty = true;
+            }
+            // Pushed every frame: the module tells a mirror from an edit by
+            // comparing against what the macro set, so the push has to happen
+            // for that comparison to exist.
+            skkbot2::fps::setEnabled(fpsToggle);
+            skkbot2::fps::setTarget(fpsSlider <= 0.0f ? skkbot2::fps::kFollowTps
+                                                      : static_cast<double>(fpsSlider));
+        } else {
+            ImGui::Text("FPS: %.0f  (recording)", fpsSlider);
+        }
+        // One line, same fact as the beta GUI's suffix: how many physics steps
+        // this frame rate asks for at the current tick rate. With FPS at 0 the
+        // display follows TPS and this reads 1, which is the whole story.
+        {
+            const double rate = engine->runtimeTickRate();
+            const double shown = static_cast<double>(fpsSlider);
+            const double eff = shown <= 0.0 ? rate : shown;
+            if (rate > 0.0 && eff > 0.0) {
+                ImGui::TextDisabled("%d steps/frame at %.0f tps",
+                                    static_cast<int>(std::ceil(rate / eff)), rate);
+            }
+        }
+
+        // LOCK FPS used to live here. See the load path for why it is gone and
+        // why the module is still fed an explicit false.
 
         ImGui::Separator();
         // Effective game speed: 1.0 while disabled, the slider value when on.
@@ -1248,7 +1548,8 @@ void Gui::drawFeaturesWindow() {
         if (ImGui::BeginCombo("##accuracymode", preview)) {
             for (auto const& opt : kAccuracyOptions) {
                 bool isSelected = (opt.mode == selected);
-                if (ImGui::Selectable(opt.name, isSelected)) {
+                if (ImGui::Selectable(opt.name, isSelected,
+                                                          kNoPadWithHalfSpacing)) {
                     engine->selectedAccuracyMode = opt.mode;
                     settingsDirty = true;
                     ReplayEngine::applyRuntimeAccuracyMode(engine->selectedAccuracyMode, engine->cosEnabled);
@@ -1333,15 +1634,30 @@ void Gui::drawSettingsWindow() {
                                        : "Classic menu interface.");
     }
 
-    if (ImGui::CollapsingHeader("Menu Keybind", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextUnformatted("Key to open/close the menu:");
-        if (keybindWaiting) {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Press a key... (Esc = cancel)");
-        } else {
-            ImGui::TextUnformatted(keyName(menuKeybind));
-            ImGui::SameLine();
-            if (ImGui::Button("Change", ImVec2(0, 0))) {
-                keybindWaiting = true;
+    // Every bind renders from the shared table so this legacy window and the
+    // Beta KEYBIND section can never drift apart.
+    if (ImGui::CollapsingHeader("Keybinds", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int lastGroup = -1;
+        for (int i = 0; i < kBindCount; ++i) {
+            const auto* info = bindInfo(i);
+            if (!info) continue;
+            if (info->group != lastGroup) {
+                lastGroup = info->group;
+                if (lastGroup > 0) ImGui::Separator();
+            }
+            ImGui::TextUnformatted(info->label);
+            if (kbWaiting == i) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "...");
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel##kb_cancel", ImVec2(0, 0))) kbWaiting = -1;
+            } else {
+                ImGui::SameLine();
+                ImGui::TextUnformatted(keyName(bindKeys[i]));
+                ImGui::SameLine();
+                char id[32];
+                std::snprintf(id, sizeof(id), "Change##kb_%d", i);
+                if (ImGui::Button(id, ImVec2(0, 0))) kbWaiting = i;
             }
         }
     }
@@ -1402,8 +1718,11 @@ void Gui::drawMacroListWindow() {
         for (int i = 0; i < static_cast<int>(macros.size()); ++i) {
             ImGui::PushID(i);
             bool selected = (i == selectedMacro);
+            // The list key is "<stem> [<ext>]"; showing it verbatim is what tells a
+            // same-named SKK/SKC pair apart. Displayed as-is.
             const char* label = macros[i].empty() ? "<unnamed>" : macros[i].c_str();
-            if (ImGui::Selectable(label, &selected)) {
+            if (ImGui::Selectable(label, &selected,
+                                  kNoPadWithHalfSpacing)) {
                 selectedMacro = i;
             }
             ImGui::PopID();
@@ -1417,8 +1736,12 @@ void Gui::drawMacroListWindow() {
         if (ImGui::Button("Load Selected", ImVec2(145, 0))) {
             if (selectedMacro >= 0 &&
                 selectedMacro < static_cast<int>(macros.size())) {
-                std::string nm = macros[selectedMacro];
-                if (loadMacroIntoMemory(nm)) {
+                // Split the key: the stem drives loadMacroIntoMemory's file
+                // resolution, the extension tells it WHICH same-named file.
+                const std::string entry = macros[selectedMacro];
+                const std::string nm = ReplayEngine::macroEntryStem(entry);
+                const std::string ex = ReplayEngine::macroEntryExt(entry);
+                if (loadMacroIntoMemory(nm, ex)) {
                     selectMacroInList(nm);
                     Notification::create(
                         fmt::format("Macro loaded: {}", nm),
@@ -1435,11 +1758,15 @@ void Gui::drawMacroListWindow() {
             if (selectedMacro >= 0 &&
                 selectedMacro < static_cast<int>(macros.size())) {
                 namespace fs = std::filesystem;
-                fs::path path = Mod::get()->getSaveDir() / "replays" /
-                                (macros[selectedMacro] + ".skk");
+                // Delete only the selected format, not both same-named files.
+                const std::string delEntry = macros[selectedMacro];
+                const std::string delStem = ReplayEngine::macroEntryStem(delEntry);
+                const std::string delExt = ReplayEngine::macroEntryExt(delEntry);
+                fs::path path = skkbot2::paths::replays() /
+                                (delStem + (delExt.empty() ? std::string(".skc") : delExt));
                 if (fs::remove(path)) {
                     Notification::create(
-                        fmt::format("Deleted: {}", macros[selectedMacro]),
+                        fmt::format("Deleted: {}", delEntry),
                         NotificationIcon::Info)->show();
                     refreshMacroList();
                 } else {
@@ -1454,21 +1781,316 @@ void Gui::drawMacroListWindow() {
     ImGui::End();
 }
 
+// Shared bind metadata, kept in one place: the KEYBIND rows, the capture
+// persistence and the global key handler all read this.
+static constexpr Gui::BindInfo kBindRows[Gui::kBindCount] = {
+    { Gui::Bind::Menu,        "Open Menu",   0xA5, 0 },
+    // Right under Open Menu: both are menu-level actions rather than gameplay
+    // assists, and Reset Level only makes sense from inside a level.
+    { Gui::Bind::ResetLevel,  "Reset Level", 0x52, 0 },
+    { Gui::Bind::Record,      "Record",      0,    1 },
+    { Gui::Bind::Play,        "Play",        0,    1 },
+    { Gui::Bind::StepForward, "Step Forward",0x43, 1 },
+    { Gui::Bind::StepToggle,  "Step Toggle", 0,    1 },
+    { Gui::Bind::Hitboxes,    "Hitboxes",    0,    2 },
+    { Gui::Bind::Speedhack,   "Speedhack",   0,    2 },
+    { Gui::Bind::Noclip,      "Noclip",      0,    2 },
+    { Gui::Bind::Trajectory,  "Trajectory",  0,    2 },
+    { Gui::Bind::LayoutMode,  "Layout Mode", 0,    2 },
+};
+
+// Saved-value key per bind. Menu and StepForward keep their legacy keys because
+// existing installs already store them there.
+// Saved-value key per bind, index-aligned with the Bind enum. Menu and
+    // StepForward keep their legacy keys because existing installs already store
+    // them there.
+static constexpr const char* kBindSaveKeys[Gui::kBindCount] = {
+    "menu_keybind", "keybind_reset_level",
+    "keybind_record", "keybind_play", "keybind_step_forward",
+    "keybind_step_toggle", "keybind_hitboxes", "keybind_speedhack",
+    "keybind_noclip", "keybind_trajectory", "keybind_layout_mode",
+};
+
+const Gui::BindInfo* Gui::bindInfo(int i) const {
+    if (i < 0 || i >= kBindCount) return nullptr;
+    return &kBindRows[i];
+}
+
+void Gui::persistBind(Bind b) {
+    int i = static_cast<int>(b);
+    if (i < 0 || i >= kBindCount) return;
+    const int key = bindKeys[i];
+    Mod::get()->setSavedValue(kBindSaveKeys[i], key);
+    // Keep the legacy fields in sync so any code still reading them (and the old
+    // ImGui settings window) sees the same values.
+    if (b == Bind::Menu) menuKeybind = key;
+    if (b == Bind::StepForward) stepForwardKeybind = key;
+}
+
+bool Gui::transportAllowedFor(Bind b) const {
+    auto* engine = ReplayEngine::get();
+    if (!engine) return false;
+
+    const bool isSkc = (macroBotType == MacroBotType::SKC);
+    auto& bot = skk::skc::Bot::get();
+
+    const bool recActive = isSkc
+        ? (bot.getState() == skk::skc::State::Record || bot.getPendingAction() == skk::skc::PendingAction::Record)
+        : (engine->engineMode == MODE_CAPTURE || engine->pendingAction == ReplayEngine::PendingAction::Record);
+    const bool playActive = isSkc
+        ? (bot.getState() == skk::skc::State::Playback || bot.isPlaybackArmed() || bot.getPendingAction() == skk::skc::PendingAction::Play)
+        : (engine->engineMode == MODE_EXECUTE || engine->pendingPlaybackStart || engine->pendingAction == ReplayEngine::PendingAction::Play);
+    const bool renderBusy = skkbot2::render::Renderer::get().isRecording();
+    const bool saveBusy = !isSkc && engine->macroSaveBusy();
+    const bool listOpen = showMacroList;
+    // The frame stepper drives CCScheduler::update by hand, so playback and
+    // recording cannot share it with it.
+    const bool stepperOn = FrameStepper::get().isEnabled();
+    const bool hasInputs = isSkc ? bot.hasInputs() : engine->hasMacroInputs();
+
+    if (b == Bind::Record) {
+        return !playActive && !renderBusy && !saveBusy && !listOpen && !stepperOn;
+    }
+    if (b == Bind::Play) {
+        return !recActive && !renderBusy && !saveBusy && !listOpen && !stepperOn &&
+               (hasInputs || playActive);
+    }
+    // Step keys only make sense while an attempt is running; the stepper's own
+    // guard also rejects them, but gating here avoids consuming the key.
+    return true;
+}
+
+bool Gui::runBind(Bind b) {
+    auto* engine = ReplayEngine::get();
+    if (!engine) return false;
+
+    const int i = static_cast<int>(b);
+    const char* label = kBindRows[i].label;
+
+    switch (b) {
+        case Bind::Record: {
+            if (macroBotType == MacroBotType::SKC) {
+                auto& bot = skk::skc::Bot::get();
+                if (bot.getState() == skk::skc::State::Record || bot.getPendingAction() == skk::skc::PendingAction::Record) {
+                    stopRecording(macroName);
+                    refreshMacroList();
+                    return true;
+                }
+                if (!transportAllowedFor(b)) return true;
+                if (PlayLayer::get()) {
+                    startRecording(macroName);
+                } else if (skk::gameplay::asEditor()) {
+                    skkbot2::log::info("RECORD (SKC) is only available in gameplay levels, not in the editor");
+                } else {
+                    bot.setPendingAction(skk::skc::PendingAction::Record);
+                }
+                refreshMacroList();
+                return true;
+            }
+
+            // STOP path first, deliberately NOT gated. The menu button does the
+            // same: it checks `recActive` before its own enabled state, so a
+            // hotkey must be able to stop what it started. Gating the stop on
+            // saveBusy / renderBusy / stepperOn would make a recording
+            // impossible to stop from the keyboard the moment a background save
+            // or the stepper went active.
+            if (engine->engineMode == MODE_CAPTURE) {
+                if (engine->pendingAction == ReplayEngine::PendingAction::Record) {
+                    engine->clearPendingAction();
+                } else {
+                    stopRecording(macroName);
+                }
+                refreshMacroList();
+                return true;
+            }
+
+            if (!transportAllowedFor(b)) {
+                skkbot2::Logger::get().info("skkBot2: hotkey RECORD refused ({} active)",
+                                            engine->engineMode == MODE_EXECUTE ? "playback"
+                                            : engine->pendingPlaybackStart ? "playback armed"
+                                            : engine->macroSaveBusy() ? "saving"
+                                            : skkbot2::render::Renderer::get().isRecording() ? "rendering"
+                                            : showMacroList ? "macro list"
+                                            : "stepper on");
+                return true;
+            }
+            if (PlayLayer::get()) {
+                startRecording(macroName);
+            } else if (skk::gameplay::asEditor()) {
+                // captureTick is gated on PlayLayer, so a queued record would
+                // fire in an unrelated later level. Refuse instead of queueing.
+                skkbot2::log::info("RECORD is only available in gameplay levels, not in the editor");
+            } else {
+                engine->queueRecord(macroName);
+            }
+            refreshMacroList();
+            return true;
+        }
+
+        case Bind::Play: {
+            if (macroBotType == MacroBotType::SKC) {
+                auto& bot = skk::skc::Bot::get();
+                if (bot.getState() == skk::skc::State::Playback || bot.isPlaybackArmed() ||
+                    bot.getPendingAction() == skk::skc::PendingAction::Play) {
+                    // STOP path, ungated and first, same reasoning as RECORD.
+                    bot.stop();
+                    skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+                    return true;
+                }
+                if (!transportAllowedFor(b)) return true;
+                if (PlayLayer::get()) {
+                    armPlayback(macroName);
+                } else if (skk::gameplay::asEditor()) {
+                    armPlayback(macroName);
+                } else {
+                    bot.setPendingAction(skk::skc::PendingAction::Play);
+                }
+                return true;
+            }
+
+            const bool playActive = engine->engineMode == MODE_EXECUTE ||
+                                    engine->pendingPlaybackStart ||
+                                    engine->pendingAction == ReplayEngine::PendingAction::Play;
+            // STOP path first and ungated, same reasoning as RECORD above.
+            if (playActive) {
+                skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
+                engine->haltExecution();
+                engine->clearPendingAction();
+                return true;
+            }
+
+            if (!transportAllowedFor(b)) {
+                skkbot2::Logger::get().info("skkBot2: hotkey PLAY refused ({} active)",
+                                            engine->engineMode == MODE_CAPTURE ? "recording"
+                                            : engine->macroSaveBusy() ? "saving"
+                                            : skkbot2::render::Renderer::get().isRecording() ? "rendering"
+                                            : showMacroList ? "macro list"
+                                            : !engine->hasMacroInputs() ? "no inputs"
+                                            : "stepper on");
+                return true;
+            }
+            if (PlayLayer::get()) {
+                armPlayback(macroName);
+            } else if (skk::gameplay::asEditor()) {
+                // The engine decides where it is: requestExecutionStart arms in
+                // build mode and the playtest-start hook aligns; already in a
+                // playtest it takes over in place. Never queue for a future level.
+                armPlayback(macroName);
+            } else {
+                engine->queuePlayback(macroName);
+            }
+            return true;
+        }
+
+        case Bind::StepForward: {
+            auto& stepper = FrameStepper::get();
+            stepper.setKeyHoldState(/*down=*/true, /*forward=*/true);
+            stepper.stepForward();
+            return true;
+        }
+
+        case Bind::StepToggle:
+            FrameStepper::get().toggle();
+            skkbot2::Logger::get().info("skkBot2: hotkey Step Toggle -> {}",
+                                        FrameStepper::get().isEnabled() ? "on" : "off");
+            return true;
+
+        case Bind::Hitboxes:
+            engine->showHitboxes = !engine->showHitboxes;
+            Mod::get()->setSavedValue("gui_hitboxes", engine->showHitboxes);
+            skk::hitboxes::forceRefresh();
+            skkbot2::Logger::get().info("skkBot2: hotkey Hitboxes -> {}",
+                                        engine->showHitboxes ? "on" : "off");
+            return true;
+
+        case Bind::Speedhack: {
+            speedhackEnabled = !speedhackEnabled;
+            Mod::get()->setSavedValue("gui_speedhack_enabled", speedhackEnabled);
+            // Same one-liner the Speed row uses: when the switch is off the game
+            // speed is pinned to 1.0 regardless of the slider value.
+            engine->gameSpeed = speedhackEnabled ? speedhackValue : 1.0;
+            skkbot2::Logger::get().info("skkBot2: hotkey Speedhack -> {} ({:.2f}x)",
+                                        speedhackEnabled ? "on" : "off", engine->gameSpeed);
+            return true;
+        }
+
+        case Bind::Noclip:
+            engine->collisionBypass = !engine->collisionBypass;
+            Mod::get()->setSavedValue("gui_noclip", engine->collisionBypass);
+            skkbot2::Logger::get().info("skkBot2: hotkey Noclip -> {}",
+                                        engine->collisionBypass ? "on" : "off");
+            return true;
+
+        case Bind::Trajectory:
+            engine->showTrajectory = !engine->showTrajectory;
+            Mod::get()->setSavedValue("gui_trajectory", engine->showTrajectory);
+            skkbot2::Logger::get().info("skkBot2: hotkey Trajectory -> {}",
+                                        engine->showTrajectory ? "on" : "off");
+            return true;
+
+        case Bind::LayoutMode:
+            engine->layoutMode = !engine->layoutMode;
+            Mod::get()->setSavedValue("gui_layout_mode", engine->layoutMode);
+            skkbot2::Logger::get().info("skkBot2: hotkey Layout Mode -> {}",
+                                        engine->layoutMode ? "on" : "off");
+            return true;
+
+        case Bind::ResetLevel: {
+            auto* pl = PlayLayer::get();
+            if (pl) {
+                if (auto* scene = cocos2d::CCDirector::sharedDirector()->getRunningScene()) {
+                    if (auto* pause = findOpenPauseLayer(scene)) {
+                        pause->onResume(nullptr);
+                    }
+                }
+                if (auto* endLayer = pl->getChildByType<EndLevelLayer>(0)) {
+                    endLayer->removeFromParentAndCleanup(true);
+                }
+                pl->m_hasCompletedLevel = false;
+                pl->resetLevel();
+                skkbot2::Logger::get().info("skkBot2: hotkey Reset Level (PlayLayer, practice={})", pl->m_isPracticeMode);
+                geode::log::info("skkBot2: hotkey Reset Level (PlayLayer, practice={})", pl->m_isPracticeMode);
+                return true;
+            }
+            if (skk::gameplay::isEditorPlaytest()) {
+                auto* editor = LevelEditorLayer::get();
+                if (editor) {
+                    editor->onStopPlaytest();
+                    editor->onPlaytest();
+                    skkbot2::Logger::get().info("skkBot2: hotkey Reset Level (EditorPlaytest)");
+                    geode::log::info("skkBot2: hotkey Reset Level (EditorPlaytest)");
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        case Bind::Menu:
+        default:
+            return false;
+    }
+}
+
 bool Gui::handleKey(int key, bool down, bool repeat) {
     // While capturing a new keybind: the next key (or Esc to cancel) sets it.
-    if (keybindWaiting) {
+    // Single armed slot (kbWaiting) instead of the old per-row bool pair.
+    if (kbWaiting >= 0) {
         if (down && !repeat) {
             if (key == 0x1B) { // Escape = cancel
-                keybindWaiting = false;
+                kbWaiting = -1;
+                skkbot2::Logger::get().info("skkBot2: keybind capture cancelled");
             } else {
-                menuKeybind = key;
-                keybindWaiting = false;
+                const int idx = kbWaiting;
+                bindKeys[idx] = key;
+                persistBind(static_cast<Bind>(idx));
+                kbWaiting = -1;
+                heldBind = -1;
                 // Right-Alt / AltGr can emit several Press events for a single
                 // physical press; lock the toggle until this key is released so
                 // capturing it doesn't immediately close the menu.
                 toggleLockKey = key;
-                Mod::get()->setSavedValue("menu_keybind", menuKeybind);
-                skkbot2::Logger::get().info("Keybind captured: key=0x{:X}", key);
+                skkbot2::Logger::get().info("skkBot2: keybind captured: {} = {}",
+                                            kBindRows[idx].label, keyName(key));
             }
         }
         return true; // consume the key so it doesn't reach the game
@@ -1480,12 +2102,97 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
         return false;
     }
 
-    // Toggle the bot menu on the configured keybind press.
-    if (down && key == menuKeybind) {
-        if (key == toggleLockKey) {
-            return true; // still the same physical press that just captured
+    // Menu toggle. Checked first and matched by INDEX, not by key value, so a
+    // duplicate binding elsewhere can never steal the menu open.
+    if (down && !repeat) {
+        const int menuIdx = static_cast<int>(Bind::Menu);
+        if (bindKeys[menuIdx] != 0 && key == bindKeys[menuIdx]) {
+            if (key == toggleLockKey) {
+                return true; // still the same physical press that just captured
+            }
+            open = !open;
+            return true;
         }
-        open = !open;
+    }
+
+    // Every other bind dispatches through the shared table. Step keys are
+    // consumed only while an attempt is actually running: the handler also runs
+    // while the pause menu is up, and a keypress there used to queue frames that
+    // fired the instant the level resumed.
+    const bool stepBind = (key == bindKeys[static_cast<int>(Bind::StepForward)] ||
+                           key == bindKeys[static_cast<int>(Bind::StepToggle)]);
+    bool stepGate = true;
+    if (stepBind) {
+        auto* pl = PlayLayer::get();
+        stepGate = pl && pl->m_started && !pl->m_isPaused &&
+                   !pl->m_hasCompletedLevel && !pl->m_levelEndAnimationStarted;
+    }
+
+    for (int i = 0; i < kBindCount; ++i) {
+        const auto b = static_cast<Bind>(i);
+        if (b == Bind::Menu) continue;
+        const int bound = bindKeys[i];
+        if (bound == 0 || key != bound) continue;
+
+        // StepForward is the one bind that behaves differently on press vs hold:
+        // a press owes exactly one step, holding repeats.
+        if (b == Bind::StepForward) {
+            if (!stepGate) return true;
+            auto& stepper = FrameStepper::get();
+            // Hold semantics are the point here: setKeyHoldState(down=true) arms
+            // the stepper's own repeat timer, so every OS repeat advances the
+            // level by one step. This bind therefore wants the repeats and is
+            // intentionally exempt from the heldBind edge guard below.
+            stepper.setKeyHoldState(down, /*forward=*/true);
+            if (down && !repeat) {
+                stepper.stepForward();
+            }
+            return true;
+        }
+        if (b == Bind::StepToggle) {
+            if (!stepGate) {
+                heldBind = -1;
+                return true;
+            }
+            // Same heldBind edge rule as the plain toggles below.
+            if (!down) {
+                heldBind = -1;
+                return true;
+            }
+            if (heldBind == i) return true;
+            heldBind = i;
+            FrameStepper::get().toggle();
+            skkbot2::Logger::get().info("skkBot2: Step Toggle -> {}",
+                                        FrameStepper::get().isEnabled() ? "on" : "off");
+            return true;
+        }
+
+        // Edge detection via heldBind, which means "this bind's key is physically
+        // down RIGHT NOW" and is therefore cleared on release (-1).
+        //
+        // The previous version assigned heldBind = i on RELEASE. That left the
+        // bind looking held, so the next press of the same key was swallowed by
+        // the `repeat && heldBind == i` guard whenever cocos coalesced the
+        // second press into an Action::Repeat вЂ” exactly what happens when the
+        // two presses are close together. Result: RECORD started, and pressing R
+        // again within the repeat window did nothing. PLAY only appeared to work
+        // because its presses were far enough apart to arrive as Action::Press.
+        //
+        // Clearing on release makes all three cases correct:
+        //   press (heldBind=-1)  -> fires
+        //   hold  (heldBind==i) -> repeat guard swallows it
+        //   release(heldBind=-1) -> re-arms
+        // The `repeat` flag is never consulted, so a coalesced second press
+        // still fires.
+        if (!down) {
+            heldBind = -1;
+            return true;
+        }
+        if (heldBind == i) {
+            return true;  // same physical hold, no new edge
+        }
+        heldBind = i;
+        runBind(b);
         return true;
     }
 
@@ -1494,6 +2201,9 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
 
 const char* Gui::keyName(int key) {
     switch (key) {
+        // 0 means "unbound". The ASSISTS rows ship unbound, so this must read
+        // as a word rather than fall through to the hex dump at the bottom.
+        case 0x00: return "NONE";
         case 0x08: return "Backspace";
         case 0x09: return "Tab";
         case 0x0C: return "Clear";

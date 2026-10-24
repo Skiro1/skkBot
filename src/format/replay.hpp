@@ -3,6 +3,7 @@
 
 #include "core/accuracy_mode.hpp"
 #include "core/full_player_checkpoint.hpp"
+#include "core/paths.hpp"
 #include "utils.hpp"
 
 #include <Geode/Geode.hpp>
@@ -34,7 +35,7 @@ namespace ReplayStorage {
     inline constexpr uintmax_t kMaxReplayFileSize = 64 * 1024 * 1024;
 
     inline std::filesystem::path getReplayDirectoryPath() {
-        return Mod::get()->getSaveDir() / "replays";
+        return skkbot2::paths::replays();
     }
 
     inline std::string sanitizeReplayName(std::string name) {
@@ -58,10 +59,30 @@ namespace ReplayStorage {
         return name;
     }
 
-    inline bool replayStemExists(
+    // Does this directory already hold a macro called `stem` IN THIS FORMAT?
+    //
+    // THE RULE, and it is one rule for both engines (пользователь, 19.10.2026):
+    // a collision is an EXACT match of name AND extension.
+    //
+    //   * .skc saved where awd.skc already exists  -> collision -> awd_1.skc
+    //   * .skc saved where only awd.skk exists     -> NOT a collision -> awd.skc
+    //
+    // The library is keyed by name AND format and lists DF2.skk and DF2.skc as
+    // two separate rows (see the loadMacro comment in beta_actions.hpp: "both
+    // DF2.skk and DF2.skc can exist"), so a save must resolve collisions the
+    // same way. This used to compare stems only, and an awd.txt in the folder
+    // made every save come out as awd_1 - a name the user never typed and no
+    // list row points at.
+    //
+    // There is deliberately NO "except the macro itself, overwrite in place"
+    // escape hatch. It was here for the SKK path (persistedName) and it made
+    // the outcome depend on invisible state: the same request could overwrite
+    // or could append a number, and which one happened depended on whether the
+    // macro had been loaded from disk. If it says -1 it means -1, every time.
+    inline bool replayFileExists(
         std::filesystem::path const& directory,
         std::string_view stem,
-        std::string_view excludedStem = {}
+        std::string_view extension
     ) {
         std::error_code ec;
         if (!std::filesystem::exists(directory, ec) || ec) {
@@ -73,11 +94,10 @@ namespace ReplayStorage {
                 continue;
             }
 
-            std::string currentStem = skk::pathToUtf8(it->path().stem());
-            if (currentStem == excludedStem) {
+            if (skk::pathToUtf8(it->path().stem()) != stem) {
                 continue;
             }
-            if (currentStem == stem) {
+            if (skk::pathToUtf8(it->path().extension()) == extension) {
                 return true;
             }
         }
@@ -88,7 +108,7 @@ namespace ReplayStorage {
     inline std::string makeUniqueReplayNameInDirectory(
         std::filesystem::path const& directory,
         std::string requestedName,
-        std::string_view excludedStem = {}
+        std::string_view extension
     ) {
         std::error_code ec;
         if (!std::filesystem::exists(directory, ec)) {
@@ -100,21 +120,28 @@ namespace ReplayStorage {
             baseName = "macro";
         }
 
-        std::string excludedName = sanitizeReplayName(std::string(excludedStem));
-        if (!replayStemExists(directory, baseName, excludedName)) {
+        if (!replayFileExists(directory, baseName, extension)) {
             return baseName;
         }
 
+        // _n+1: walk up from 1 until a name free IN THIS FORMAT appears. The
+        // walk restarts at 1 on every save instead of remembering a high-water
+        // mark, because deleting awd_1.skc should hand that name back - and
+        // because no counter can exist that could disagree with the disk.
         for (int suffix = 1;; ++suffix) {
             std::string candidate = baseName + "_" + std::to_string(suffix);
-            if (!replayStemExists(directory, candidate, excludedName)) {
+            if (!replayFileExists(directory, candidate, extension)) {
                 return candidate;
             }
         }
     }
 
-    inline std::string makeUniqueReplayName(std::string requestedName, std::string_view excludedStem = {}) {
-        return makeUniqueReplayNameInDirectory(getReplayDirectoryPath(), std::move(requestedName), excludedStem);
+    inline std::string makeUniqueReplayName(
+        std::string requestedName,
+        std::string_view extension
+    ) {
+        return makeUniqueReplayNameInDirectory(
+            getReplayDirectoryPath(), std::move(requestedName), extension);
     }
 
     inline std::optional<std::vector<uint8_t>> readReplayBytes(std::filesystem::path const& path) {
@@ -410,6 +437,16 @@ struct CheckpointStateBundle {
 
     // Click release state (GDH pattern, 6 bools: 3 per player)
     std::array<bool, 6> clickReleased = { true, true, true, true, true, true };
+
+    // GJBaseGameLayer / PlayLayer physics & collision state (Deep Practice Fix)
+    GameObject* player1CollisionBlock = nullptr;
+    GameObject* player2CollisionBlock = nullptr;
+    double extraDelta = 0.0;
+    int unk32d0 = 0;
+    int unk32ec = 0;
+    int currentStep = 0;
+    float unk3380 = 0.f;
+    gd::unordered_map<int, GameObjectPhysics> gameObjectPhysics;
 };
 
 struct MacroAction : gdr::Input {
@@ -454,6 +491,12 @@ public:
     bool recordedFromStartPos = false;
     bool platformerMode = false;
     bool hasPlatformerModeMetadata = false;
+    // Display rate this sequence was recorded under; 0 = follow `framerate`.
+    // Written to the .gdr extension only when it differs, same rule and same
+    // reason as the SKK3 header: a macro that ran at its own tick rate has
+    // nothing to add, and a file that records the answer "no" every time is a
+    // file nobody reads.
+    double displayFps = 0.0;
 
     MacroSequence()
         : Replay("skkBot", MOD_VERSION) {}
@@ -469,6 +512,10 @@ public:
             ext["anchor_interval"] = getPersistedAnchorStride();
         }
         ext["platformer_mode"] = platformerMode;
+        if (displayFps > 0.0 && std::isfinite(displayFps) &&
+            std::abs(displayFps - framerate) > 1e-3) {
+            ext["display_fps"] = displayFps;
+        }
 
         if (recordedFromStartPos) {
             ext["from_start_pos"] = true;
@@ -518,10 +565,12 @@ public:
             return false;
         }
 
-        pending.name = ReplayStorage::makeUniqueReplayName(pending.name, pending.persistedName);
-        pending.persistedName = pending.name;
-
         std::string const extension = useJson ? ".gdr.json" : ".gdr";
+        // Resolved AFTER `extension` exists, because the uniqueness check is
+        // per-format: a GDR save must not be renamed because an awd.skk is
+        // sitting next to it.
+        pending.name = ReplayStorage::makeUniqueReplayName(pending.name, extension);
+        pending.persistedName = pending.name;
         auto outputPath = dir / (pending.name + extension);
         auto bytes = pending.exportData(useJson);
         if (bytes.empty()) {

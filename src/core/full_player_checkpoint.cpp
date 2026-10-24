@@ -341,7 +341,13 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
     cp.holdingLeft = p->m_holdingLeft;
     cp.leftPressedFirst = p->m_leftPressedFirst;
     cp.wasOnSlope = p->m_wasOnSlope;
+    cp.isOnSlope = p->m_isOnSlope;
+    cp.isOnGround2 = p->m_isOnGround2;
+    cp.inputsLocked = p->m_inputsLocked;
     cp.maybeUpsideDownSlope = p->m_maybeUpsideDownSlope;
+    cp.maybeSlidingStartTime = p->m_maybeSlidingStartTime;
+    cp.stateForceVector = p->m_stateForceVector;
+    cp.jumpRelatedAC2 = p->m_jumpRelatedAC2;
     cp.stateJumpBuffered = p->m_stateJumpBuffered;
     cp.stateUnk = p->m_stateUnk;
     cp.stateNoStickX = p->m_stateNoStickX;
@@ -350,6 +356,19 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
     cp.ringJumpRelated = p->m_ringJumpRelated;
     cp.unkA29 = p->m_unkA29;
     cp.unkA99 = p->m_unkA99;
+
+    // Containers / maps (Deep Practice Fix)
+    cp.potentialSlopeMap = p->m_potentialSlopeMap;
+    cp.jumpPadRelated = p->m_jumpPadRelated;
+    cp.ringRelatedSet = p->m_ringRelatedSet;
+    cp.touchedRings = p->m_touchedRings;
+    cp.rotateObjectsRelated = p->m_rotateObjectsRelated;
+    cp.currentRobotAnimation = p->m_currentRobotAnimation;
+    if (p->m_touchingRings) {
+        for (unsigned int i = 0; i < p->m_touchingRings->count(); ++i) {
+            cp.touchingRings.push_back(p->m_touchingRings->objectAtIndex(i));
+        }
+    }
 
     cp.clickReleased = {
         !holdButtonHeld(p, 1),
@@ -506,7 +525,13 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_holdingLeft = holdingLeft;
     p->m_leftPressedFirst = leftPressedFirst;
     p->m_wasOnSlope = wasOnSlope;
+    p->m_isOnSlope = isOnSlope;
+    p->m_isOnGround2 = isOnGround2;
+    p->m_inputsLocked = inputsLocked;
     p->m_maybeUpsideDownSlope = maybeUpsideDownSlope;
+    p->m_maybeSlidingStartTime = maybeSlidingStartTime;
+    p->m_stateForceVector = stateForceVector;
+    p->m_jumpRelatedAC2 = jumpRelatedAC2;
     p->m_stateJumpBuffered = stateJumpBuffered;
     p->m_stateUnk = stateUnk;
     p->m_stateNoStickX = stateNoStickX;
@@ -515,6 +540,20 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_ringJumpRelated = ringJumpRelated;
     p->m_unkA29 = unkA29;
     p->m_unkA99 = unkA99;
+
+    // Containers / maps (Deep Practice Fix)
+    p->m_potentialSlopeMap = potentialSlopeMap;
+    p->m_jumpPadRelated = jumpPadRelated;
+    p->m_ringRelatedSet = ringRelatedSet;
+    p->m_touchedRings = touchedRings;
+    p->m_rotateObjectsRelated = rotateObjectsRelated;
+    p->m_currentRobotAnimation = currentRobotAnimation;
+    if (p->m_touchingRings) {
+        p->m_touchingRings->removeAllObjects();
+        for (auto* obj : touchingRings) {
+            if (obj) p->m_touchingRings->addObject(obj);
+        }
+    }
 
     p->m_playerColor1 = playerColor1;
     p->m_playerColor2 = playerColor2;

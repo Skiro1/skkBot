@@ -1,9 +1,20 @@
 #pragma once
 
 #include "skkBot.hpp"
+#include "format/gdr2/gdr2.hpp"
+#include "format/slc/slc.hpp"
+#include "format/GBR/gbr.hpp"
+#include "format/nhm/nhm.hpp"
+#include "format/xe/xe.hpp"
+#include "format/re4/re4.hpp"
+#include "format/ttrl/ttrl.hpp"
+#include "format/echo/echo.hpp"
+#include "format/ast/ast.hpp"
+#include "format/ttr3/ttr3.hpp"
 #include "logger/logger.hpp"
 
 #include <Geode/Geode.hpp>
+#include <Geode/ui/Notification.hpp>
 #include <imgui.h>
 
 #include <chrono>
@@ -16,6 +27,9 @@
 #include <shellapi.h>
 #endif
 
+#include "gui/skkbot_gui.hpp"
+#include "skc/skc_bot.hpp"
+
 // Shared actions for the beta UI.
 //
 // The UI is intentionally thin: this header only calls functionality that
@@ -25,11 +39,56 @@
 namespace skkbot2::gui {
 
 inline bool startRecording(std::string const& macroName) {
+    auto& gui = skkbot2::gui::get();
+    if (gui.macroBotType == Gui::MacroBotType::SKC) {
+        // Same gate as the SKK branch: recording needs a live level.
+        auto* playLayer = PlayLayer::get();
+        if (!playLayer || !playLayer->m_level) {
+            return false;
+        }
+
+        // Mutual exclusion, same as SKK's startRecording: stop the other bot
+        // first so one transport can never fight the other.
+        auto* engine = ReplayEngine::get();
+        if (engine && engine->engineMode != MODE_DISABLED) {
+            engine->haltExecution();
+        }
+        if (engine && engine->pendingAction != ReplayEngine::PendingAction::None) {
+            engine->clearPendingAction();
+        }
+
+        auto& bot = skk::skc::Bot::get();
+        if (!macroName.empty()) {
+            bot.setMacroName(macroName);
+        }
+        bot.setTps(gui.tpsEnabled ? static_cast<float>(gui.tpsValue) : 240.0f);
+        bot.bindLevel(playLayer->m_level);
+        // Starting a fresh recording discards whatever was in memory - routed
+        // through the single deletion owner so it gets logged like every other
+        // wipe instead of silently clearing.
+        bot.onResetEvent(skk::skc::Bot::ResetReason::UserClear, 0);
+        bot.startRecording();
+
+        // SKK's beginCapture does NOT restart the level - the macro records
+        // from the current position. SKC stores only frame deltas, so a
+        // mid-level recording just starts at a non-zero frame; same rule.
+        skkbot2::Logger::get().setSessionMode(
+            skkbot2::Logger::SessionMode::Record
+        );
+        return true;
+    }
+
     auto* playLayer = PlayLayer::get();
     auto* engine = ReplayEngine::get();
 
     if (!playLayer || !playLayer->m_level) {
         return false;
+    }
+
+    auto& bot = skk::skc::Bot::get();
+    if (bot.isEnabled() || bot.isPlaybackArmed() || bot.getPendingAction() != skk::skc::PendingAction::None) {
+        bot.stop();
+        bot.clearPendingAction();
     }
 
     if (engine->engineMode != MODE_DISABLED) {
@@ -60,6 +119,21 @@ inline bool startRecording(std::string const& macroName) {
 }
 
 inline void stopRecording(std::string const& macroName) {
+    auto& gui = skkbot2::gui::get();
+    if (gui.macroBotType == Gui::MacroBotType::SKC) {
+        auto& bot = skk::skc::Bot::get();
+        if (!macroName.empty()) {
+            bot.setMacroName(macroName);
+        }
+        // Same order as the SKK branch: stop the bot first, then close the
+        // logger session. The macro stays in memory (unsaved) until SAVE.
+        bot.stop();
+        skkbot2::Logger::get().setSessionMode(
+            skkbot2::Logger::SessionMode::None
+        );
+        return;
+    }
+
     auto* engine = ReplayEngine::get();
 
     if (!macroName.empty()) {
@@ -79,7 +153,137 @@ inline void stopRecording(std::string const& macroName) {
     );
 }
 
-inline bool loadMacroIntoMemory(std::string const& name) {
+inline bool importForeignMacroIntoSkc(std::string const& ext,
+                                      std::filesystem::path const& path,
+                                      std::string const& name) {
+    // Both foreign formats are import-only and both land in SKC: GDR2's Input
+    // and SLC's Action are the same four fields our Macro carries, and neither
+    // format stores physics. From the moment they load they ARE SKC macros,
+    // converted once and kept in memory until saved as .skc.
+    if (ext == ".gdr2") {
+        skk::skc::Macro macro;
+        skk::gdr2::Replay info;
+        std::string reason;
+        if (!skk::gdr2::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[GDR2] import failed: {}", reason);
+            return false;
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name, info.levelId,
+                                          info.levelName);
+    }
+    // Any of the ten GBR6 aliases, not just .brrr - the container is identical
+    // and matching on the extension list keeps the nine siblings working
+    // without a branch each.
+    if (ext == ".nhm") {
+        skk::skc::Macro macro;
+        std::string reason;
+        if (!skk::nhm::importFile(path, macro, nullptr, reason)) {
+            skkbot2::log::error("[NHM] import failed: {}", reason);
+            return false;
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".xe") {
+        skk::skc::Macro macro;
+        std::string reason;
+        if (!skk::xe::importFile(path, macro, nullptr, reason)) {
+            skkbot2::log::error("[XE] import failed: {}", reason);
+            return false;
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".re4") {
+        skk::skc::Macro macro;
+        skk::re4::Replay info;
+        std::string reason;
+        if (!skk::re4::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[RE4] import failed: {}", reason);
+            return false;
+        }
+        if (!info.caution.empty()) {
+            Notification::create(info.caution, NotificationIcon::Warning)->show();
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".ttrl") {
+        skk::skc::Macro macro;
+        std::string reason;
+        if (!skk::ttrl::importFile(path, macro, nullptr, reason)) {
+            skkbot2::log::error("[TTRL] import failed: {}", reason);
+            return false;
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".ttr3") {
+        skk::skc::Macro macro;
+        skk::ttr3::Replay info;
+        std::string reason;
+        if (!skk::ttr3::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[TTR3] import failed: {}", reason);
+            return false;
+        }
+        if (!info.caution.empty()) {
+            Notification::create(info.caution, NotificationIcon::Warning)->show();
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".echo") {
+        skk::skc::Macro macro;
+        skk::echo::Replay info;
+        std::string reason;
+        if (!skk::echo::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[ECHO] import failed: {}", reason);
+            return false;
+        }
+        if (!info.caution.empty()) {
+            Notification::create(
+                info.caution, NotificationIcon::Warning, NOTIFICATION_LONG_TIME
+            )->show();
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+if (skk::gbr::looksLikeGbrByExtension(ext)) {
+        skk::skc::Macro macro;
+        skk::gbr::Replay info;
+        std::string reason;
+        if (!skk::gbr::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[GBR] import failed: {}", reason);
+            return false;
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    if (ext == ".ast") {
+        // Astral Lite. The reader accounts for the whole payload apart from
+        // zero padding, so a refusal means "not understood", not "try again" -
+        // and a macro it does accept is frame-exact rather than plausible.
+        skk::skc::Macro macro;
+        skk::ast::Replay info;
+        std::string reason;
+        if (!skk::ast::importFile(path, macro, &info, reason)) {
+            skkbot2::log::error("[AST] import failed: {}", reason);
+            return false;
+        }
+        if (!info.caution.empty()) {
+            Notification::create(
+                info.caution, NotificationIcon::Warning, NOTIFICATION_LONG_TIME
+            )->show();
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), name);
+    }
+    skk::skc::Macro macro;
+    std::string reason;
+    if (!skk::slc::importFile(path, macro, nullptr, reason)) {
+        skkbot2::log::error("[SLC] import failed: {}", reason);
+        return false;
+    }
+    // SLC v3 metadata carries no level identity to bind against, so the macro
+    // stays unbound: onLevelEnter() treats that as "no level to compare", which
+    // is the honest state - we genuinely do not know which level it is from.
+    return skk::skc::Bot::get().adopt(std::move(macro), name);
+}
+
+inline bool loadMacroIntoMemory(std::string const& name,
+                               std::string const& forcedExt = {}) {
     auto* engine = ReplayEngine::get();
 
     if (name.empty()) {
@@ -90,51 +294,216 @@ inline bool loadMacroIntoMemory(std::string const& name) {
     // the play/record loop every tick, so replacing them mid-session is a
     // use-after-free (row click in the beta dropdown, Load in the classic GUI
     // during execute). Only idle loads are allowed.
-    if (engine->engineMode != MODE_DISABLED) {
+    if (engine && engine->engineMode != MODE_DISABLED) {
         return false;
     }
 
     namespace fs = std::filesystem;
-    auto dir = Mod::get()->getSaveDir() / "replays";
-    auto file = dir / (name + ".skk");
+    auto dir = skkbot2::paths::replays();
+    auto fileSkc = dir / (name + ".skc");
+    auto fileSkk = dir / (name + ".skk");
 
-    if (!fs::exists(file)) {
-        return false;
+    auto fileGdr2 = dir / (name + ".gdr2");
+    auto fileSlc = dir / (name + ".slc");
+    auto fileGbr = dir / (name + ".brrr");
+    auto fileNhm = dir / (name + ".nhm");
+    auto fileXe = dir / (name + ".xe");
+    auto fileRe4 = dir / (name + ".re4");
+    auto fileTtrl = dir / (name + ".ttrl");
+    auto fileTtr3 = dir / (name + ".ttr3");
+    auto fileEcho = dir / (name + ".echo");
+    auto fileAst = dir / (name + ".ast");
+
+    auto& gui = skkbot2::gui::get();
+    bool preferSkc = (gui.macroBotType == Gui::MacroBotType::SKC);
+
+    // A row in the library points at ONE concrete file. When the caller says
+    // which extension that row represented (both DF2.skk and DF2.skc can exist),
+    // load exactly that one instead of inferring it from the bot-engine pill.
+if (!forcedExt.empty()) {
+        // Every foreign extension must reach the importer. A GBR6 alias slipped
+        // past this once: the row was recognised as SKC-side, but the branch
+        // below only named .gdr2 and .slc, so a .maybach fell through to
+        // load(name + ".skc"), found nothing, and the macro silently stayed
+        // empty - the library said it was there and playback did nothing.
+        const bool isForeign = forcedExt == ".gdr2" || forcedExt == ".slc" ||
+                               forcedExt == ".nhm" || forcedExt == ".xe" ||
+                               forcedExt == ".re4" || forcedExt == ".ttrl" || forcedExt == ".ttr3" ||
+                                forcedExt == ".echo" ||
+                               forcedExt == ".ast" ||
+                               skk::gbr::looksLikeGbrByExtension(forcedExt);
+        if (forcedExt == ".skc" || isForeign) {
+            gui.macroBotType = Gui::MacroBotType::SKC;
+            Mod::get()->setSavedValue("gui_macro_bot_type", static_cast<int>(gui.macroBotType));
+            if (isForeign) {
+                return importForeignMacroIntoSkc(forcedExt, dir / (name + forcedExt), name);
+            }
+            return skk::skc::Bot::get().load(dir / (name + ".skc"));
+        }
+        std::unique_ptr<SkMacro> exact(SkMacro::loadFromPath(dir / (name + ".skk")));
+        if (!exact) return false;
+        gui.macroBotType = Gui::MacroBotType::SKK;
+        Mod::get()->setSavedValue("gui_macro_bot_type", static_cast<int>(gui.macroBotType));
+        delete engine->activeSk;
+        engine->activeSk = exact.release();
+        engine->skMode = true;
+        engine->selectedAccuracyMode = engine->activeSk->accuracyMode;
+        engine->enableCBSForLoadedMacroIfNeeded();
+        const double exactTps = engine->activeSk->framerate > 0.0 ? engine->activeSk->framerate
+                                                                 : engine->tickRate;
+        engine->practiceFixQueue =
+            skk::bridge::wireToBundles(engine->activeSk->practiceFixCheckpoints, exactTps);
+        return true;
     }
 
-    std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(file));
-    if (!macro) {
-        return false;
+    if (preferSkc && fs::exists(fileSkc)) {
+        return skk::skc::Bot::get().load(fileSkc);
+    }
+    // No extension given (the classic GUI's Load button). A .gdr2 is imported
+    // into SKC, so it belongs on the SKC side of the preference check rather
+    // than after it - a macro that only exists as GDR2 must still load.
+    for (const auto& pair : {std::pair{fileGdr2, ".gdr2"}, std::pair{fileSlc, ".slc"}, std::pair{fileGbr, ".brrr"}, std::pair{fileNhm, ".nhm"}, std::pair{fileXe, ".xe"}, std::pair{fileRe4, ".re4"}, std::pair{fileTtrl, ".ttrl"}, std::pair{fileTtr3, ".ttr3"},
+                       std::pair{fileEcho, ".echo"},
+                       std::pair{fileAst, ".ast"}}) {
+        if (fs::exists(pair.first)) {
+            gui.macroBotType = Gui::MacroBotType::SKC;
+            Mod::get()->setSavedValue("gui_macro_bot_type",
+                                      static_cast<int>(gui.macroBotType));
+            return importForeignMacroIntoSkc(pair.second, pair.first, name);
+        }
+    }
+    if (!preferSkc && fs::exists(fileSkk)) {
+        std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(fileSkk));
+        if (!macro) return false;
+        delete engine->activeSk;
+        engine->activeSk = macro.release();
+        engine->skMode = true;
+        engine->selectedAccuracyMode = engine->activeSk->accuracyMode;
+        engine->enableCBSForLoadedMacroIfNeeded();
+        double safeTps = engine->activeSk->framerate > 0.0 ? engine->activeSk->framerate : engine->tickRate;
+        engine->practiceFixQueue = skk::bridge::wireToBundles(engine->activeSk->practiceFixCheckpoints, safeTps);
+        skkbot2::log::info("P1 load(GUI): macro loaded practiceFixCheckpoints={} queueSize={}",
+                           engine->activeSk->practiceFixCheckpoints.size(),
+                           engine->practiceFixQueue.size());
+        return true;
     }
 
-    delete engine->activeSk;
-    engine->activeSk = macro.release();
+    if (fs::exists(fileSkc)) {
+        gui.macroBotType = Gui::MacroBotType::SKC;
+        Mod::get()->setSavedValue("gui_macro_bot_type", static_cast<int>(gui.macroBotType));
+        return skk::skc::Bot::get().load(fileSkc);
+    }
+    if (fs::exists(fileSkk)) {
+        gui.macroBotType = Gui::MacroBotType::SKK;
+        Mod::get()->setSavedValue("gui_macro_bot_type", static_cast<int>(gui.macroBotType));
+        std::unique_ptr<SkMacro> macro(SkMacro::loadFromPath(fileSkk));
+        if (!macro) return false;
+        delete engine->activeSk;
+        engine->activeSk = macro.release();
+        engine->skMode = true;
+        engine->selectedAccuracyMode = engine->activeSk->accuracyMode;
+        engine->enableCBSForLoadedMacroIfNeeded();
+        double safeTps = engine->activeSk->framerate > 0.0 ? engine->activeSk->framerate : engine->tickRate;
+        engine->practiceFixQueue = skk::bridge::wireToBundles(engine->activeSk->practiceFixCheckpoints, safeTps);
+        skkbot2::log::info("P1 load(GUI): macro loaded practiceFixCheckpoints={} queueSize={}",
+                           engine->activeSk->practiceFixCheckpoints.size(),
+                           engine->practiceFixQueue.size());
+        return true;
+    }
 
-    engine->skMode = true;
-    engine->selectedAccuracyMode = engine->activeSk->accuracyMode;
-    engine->enableCBSForLoadedMacroIfNeeded();
-
-    double safeTps =
-        engine->activeSk->framerate > 0.0
-            ? engine->activeSk->framerate
-            : engine->tickRate;
-
-    engine->practiceFixQueue =
-        skk::bridge::wireToBundles(
-            engine->activeSk->practiceFixCheckpoints,
-            safeTps
-        );
-
-    skkbot2::log::info(
-        "P1 load(GUI): macro loaded practiceFixCheckpoints={} queueSize={}",
-        engine->activeSk->practiceFixCheckpoints.size(),
-        engine->practiceFixQueue.size()
-    );
-
-    return true;
+    return false;
 }
 
 inline void armPlayback(std::string const& name) {
+    auto& gui = skkbot2::gui::get();
+    if (gui.macroBotType == Gui::MacroBotType::SKC) {
+        auto& bot = skk::skc::Bot::get();
+
+        // ReplayEngine::loadMacroFromName refuses to swap a macro while the
+        // engine is hot; the SKC bot is a separate engine, but the same rule
+        // applies for the same reason (poll() reads the list every step).
+        if (bot.isEnabled() || bot.isPlaybackArmed()) {
+            bot.stop();
+        }
+
+        // A typed name must win over whatever is already loaded, same as the
+        // SKK branch.
+        if (!name.empty() && bot.getMacroName() != name) {
+            auto dir = skkbot2::paths::replays();
+            (void)bot.load(dir / (name + ".skc"));
+        }
+        if (!bot.hasInputs()) {
+            return;
+        }
+
+        auto* engine = ReplayEngine::get();
+        if (engine && engine->engineMode != MODE_DISABLED) {
+            engine->haltExecution();
+        }
+        // A queued SKK Record/Play left over from earlier must not fire on the
+        // next level entry while SKC owns the transport.
+        if (engine && engine->pendingAction != ReplayEngine::PendingAction::None) {
+            engine->clearPendingAction();
+        }
+
+        skkbot2::Logger::get().setSessionMode(
+            skkbot2::Logger::SessionMode::Playback
+        );
+
+        // Does the macro have anywhere to play from RIGHT HERE? The old rule was
+        // `runActive`, which is true for the most common case of all - a normal
+        // level, attempt just started, player alive - so PLAY did nothing until
+        // the player died. The SKC clock separates those cases; `runActive`
+        // could not.
+        auto* playLayer = PlayLayer::get();
+        if (!playLayer) {
+            // Editor build mode (or menu): arm now and let the playtest-start
+            // / PlayLayer::init hook align the spawn when physics begin.
+            bot.armPlayback();
+            return;
+        }
+
+        skk::skc::Bot::PlaybackStart start{};
+        if (bot.startPlaybackIfReady(&start)) {
+            // Started on the spot. No arming, no reset, no waiting for a death.
+            skkbot2::log::info("[SKC] PLAY started immediately: attempt is at "
+                               "frame 0, macro begins at frame {}",
+                               start.firstActionFrame);
+            return;
+        }
+
+        if (start.decision == skk::skc::Bot::StartDecision::MidAttempt) {
+            // Genuinely unplayable here - the clicks would land on a player the
+            // macro never positioned. Arm anyway so it takes over on the next
+            // attempt WITHOUT the user having to ask again, and say out loud
+            // why it did not start now. Silently doing nothing was the bug.
+            bot.armPlayback();
+            // Reason to the log only - no GD toast (removed 19.10.2026 on
+            // request). "Armed" is visible in the transport, and the log says
+            // why it did not start and what frame it is at.
+            const std::string why = bot.describeStartBlock(start);
+            skkbot2::log::warn("{}", why);
+            skkbot2::Logger::get().error("{}", why);
+            return;
+        }
+
+        // Dead, finished, or practice respawn: the old immediate path, which
+        // restarts the level and plays from frame 0. Unchanged.
+        bot.startPlayback();
+        if (playLayer->m_levelSettings && playLayer->m_levelSettings->m_platformerMode) {
+            playLayer->resetLevelFromStart();
+        } else {
+            playLayer->resetLevel();
+        }
+        return;
+    }
+
+    auto& bot = skk::skc::Bot::get();
+    if (bot.isEnabled() || bot.isPlaybackArmed() || bot.getPendingAction() != skk::skc::PendingAction::None) {
+        bot.stop();
+        bot.clearPendingAction();
+    }
+
     auto* engine = ReplayEngine::get();
 
     // A typed name must win over whatever is already loaded: if the user asks
@@ -171,17 +540,30 @@ inline bool startRender() {
     // lastError().
     // The level does NOT have to be playing: begin() arms the render and the
     // capture loop waits until the user starts/resumes the level manually
-    // (manual start — begin() never restarts the level itself). If the macro
+    // (manual start Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р Р†РІР‚С›РЎС›Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р Р‹Р Р†РІР‚С›РЎС›Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В РІР‚В Р В Р вЂ Р В РІР‚С™Р РЋРІР‚С”Р В Р Р‹Р РЋРІР‚С”Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћСћР В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљР’В Р В Р’В Р вЂ™Р’В Р В Р вЂ Р В РІР‚С™Р РЋРІвЂћСћР В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂєР В Р’В Р вЂ™Р’В Р В РІР‚в„ўР вЂ™Р’В Р В Р’В Р вЂ™Р’В Р В Р’В Р Р†Р вЂљРІвЂћвЂ“Р В Р’В Р вЂ™Р’В Р В Р’В Р В РІР‚в„–Р В Р’В Р В Р вЂ№Р В Р вЂ Р Р†Р вЂљРЎвЂєР РЋРЎвЂє begin() never restarts the level itself). If the macro
     // is armed but the level is still paused, the render simply holds until
     // the user presses play.
     if (renderer.isRecording()) {
         return false;
     }
+    auto& gui = skkbot2::gui::get();
+    const bool skc = gui.macroBotType == Gui::MacroBotType::SKC;
+    auto& skcBot = skk::skc::Bot::get();
+    const bool skcRunning = skcBot.getState() == skk::skc::State::Playback ||
+                            skcBot.isPlaybackArmed();
+
+    // SKC is accepted here too. The renderer itself is engine-agnostic - it
+    // grabs frames and hands them to FFmpeg - so the old gate (MODE_EXECUTE &&
+    // activeSk, i.e. SKK-only) rejected a playback that renders perfectly well.
+    // SKC does NOT keep a death chain, so a render longer than the macro will
+    // restart from frame 0 rather than resume; say so up front instead of
+    // letting it look like a capture bug.
     if (!PlayLayer::get() || !PlayLayer::get()->m_level) {
         Notification::create("Enter a level first", NotificationIcon::Error)->show();
         return false;
     }
-    if (engine->engineMode != MODE_EXECUTE || !engine->activeSk) {
+    const bool skkRunning = engine->engineMode == MODE_EXECUTE && engine->activeSk;
+    if (!skkRunning && !skcRunning) {
         Notification::create(
             "Load a macro and press Play in the bot menu first",
             NotificationIcon::Error
@@ -197,6 +579,14 @@ inline bool startRender() {
             NotificationIcon::Error
         )->show();
         return false;
+    }
+    if (skc) {
+        // Geode's Notification is a CCLabelBMFont: one line, no wrapping, so a
+        // long sentence simply does not fit. Keep it short.
+        Notification::create(
+            "SKC: no death chain - restart from frame 0",
+            NotificationIcon::Info, NOTIFICATION_LONG_TIME
+        )->show();
     }
     return true;
 }
@@ -221,28 +611,22 @@ inline double wallSecs() {
 
 #ifdef GEODE_IS_WINDOWS
 
-inline void openFolderFor(const char* path) {
-    const int wlen =
-        MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+inline void openFolderFor(std::filesystem::path const& path) {
+    const std::wstring wide = path.wstring();
+    if (wide.empty()) return;
 
-    // Size the buffer for the FULL wide length (incl. the null terminator),
-    // then drop the terminator: writing `wlen` wide chars into a `wlen - 1`
-    // buffer wrote one wchar past the end.
-    std::wstring wide(wlen > 0 ? wlen : 0, L'\0');
-
-    if (wlen > 0) {
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            path,
-            -1,
-            wide.data(),
-            wlen
-        );
-        wide.pop_back();
+    std::wstring args;
+    const DWORD attrs = GetFileAttributesW(wide.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        args = L"/select,\"" + wide + L"\"";
+    } else {
+        const std::size_t slash = wide.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) {
+            return;
+        }
+        std::wstring parent = wide.substr(0, slash);
+        args = L"\"" + parent + L"\"";
     }
-
-    std::wstring args = L"/select,\"" + wide + L"\"";
 
     ShellExecuteW(
         nullptr,
@@ -254,10 +638,30 @@ inline void openFolderFor(const char* path) {
     );
 }
 
+inline void openFolderFor(const char* path) {
+    if (!path || !*path) return;
+    openFolderFor(skk::stringToPath(path));
+}
+
 #else
 
+inline void openFolderFor(std::filesystem::path const&) {}
 inline void openFolderFor(const char*) {}
 
 #endif
+
+// Open a DIRECTORY in the system file manager.
+inline void openFolderInExplorer(const std::filesystem::path& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+#ifdef GEODE_IS_WINDOWS
+    const std::wstring wide = dir.wstring();
+    if (wide.empty()) return;
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"\"" + wide + L"\"").c_str(), nullptr, SW_SHOW);
+#else
+    (void)dir;
+#endif
+}
 
 } // namespace skkbot2::gui

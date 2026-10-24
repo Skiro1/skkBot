@@ -3,6 +3,7 @@
 #endif
 
 #include "gui/blur.hpp"
+#include "core/hotpath.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 
@@ -36,6 +37,14 @@ GLuint g_snapshot = 0;
 int    g_snapW    = 0;
 int    g_snapH    = 0;
 bool   g_failed   = false;
+// True once the snapshot has been taken for the current frame. The capture is a
+// full-screen copy, so it is deferred until a blur region actually asks for the
+// pixels - see captureSnapshot() for why that is still a pristine frame.
+bool   g_snapDirty = true;
+// Whether g_snapshot has storage yet. glCopyTexImage2D allocates it as a side
+// effect, glCopyTexSubImage2D does not - and reallocating every frame is the
+// expensive variant.
+bool   g_snapStorage = false;
 
 // Device tilt (parallax input), -1..1. Fed from CMMotionManager on Apple
 // platforms, stays zero elsewhere (and on desktop).
@@ -393,13 +402,26 @@ bool ensureTexture() {
     return true;
 }
 
-// Grab the whole freshly-rendered game frame into g_snapshot. Called from
-// newFrame(), i.e. at the START of the imgui draw hook: the game has finished
-// rendering this frame into the backbuffer, but NO imgui geometry has been
-// drawn yet, so the snapshot is pristine game content — it can never contain
-// our own window, even while it is being dragged.
+// Grab the whole freshly-rendered game frame into g_snapshot.
+//
+// This is a full-screen copy - at 2560x1440 GL_RGB that is 11 MB moved per
+// call - and it used to run on EVERY frame from newFrame(), including while the
+// menu was closed and nothing was blurred. That is pure waste, and on a weak GPU
+// a per-frame full-screen texture reallocation is exactly the kind of thing that
+// shows up as "the game is heavier with skkBot2 loaded than with a light bot".
+//
+// So the copy is deferred to the first blur region of the frame, which is still
+// correct: ImGui does not execute draw commands as they are submitted. The
+// commands are recorded during gui.draw() and run later in RenderDrawData, still
+// before swapBuffers, so the backbuffer at that moment is the untouched game
+// frame - the same argument the old call site made, just evaluated later.
 void captureSnapshot() {
+    g_snapDirty = false;
     if (!g_snapshot) return;
+    // Once per frame at most, and only when something is actually blurred - but
+    // a full-screen copy is exactly the kind of cost that has to be measured
+    // rather than assumed, so it is timed here.
+    skkbot2::hot::Timed skkbot2Timing(skkbot2::hot::BlurSnap);
 
     GLint viewport[4] = { 0, 0, 0, 0 };
     glGetIntegerv(GL_VIEWPORT, viewport);
@@ -411,7 +433,15 @@ void captureSnapshot() {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
 
     glBindTexture(GL_TEXTURE_2D, g_snapshot);
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, fbW, fbH, 0);
+    // SubImage when the size is unchanged: no storage reallocation. CopyImage
+    // only has to run when the window was resized (or on the very first frame),
+    // and it is the call that gives the texture its storage.
+    if (g_snapStorage && fbW == g_snapW && fbH == g_snapH) {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, fbW, fbH);
+    } else {
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, fbW, fbH, 0);
+        g_snapStorage = true;
+    }
     g_snapW = fbW;
     g_snapH = fbH;
 
@@ -423,6 +453,9 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
 
     const size_t index = (size_t)(intptr_t)cmd->UserCallbackData;
     if (index >= g_regions.size()) return;
+
+    // First region of the frame: take the snapshot now, not back in newFrame().
+    if (g_snapDirty) captureSnapshot();
 
     if (!ensurePrograms() || !ensureTexture()) return;
 
@@ -653,9 +686,12 @@ namespace skkbot2::gui::blur {
 void newFrame() {
     pollParallax();
     g_regions.clear();
+    // Mark this frame's pixels as not captured yet, and copy nothing here. If
+    // no region ends up blurred this frame, no copy happens at all - which is
+    // the normal case, since the menu is closed almost all the time.
+    g_snapDirty = true;
     if (!g_failed) {
         if (!ensurePrograms() || !ensureTexture()) return;
-        captureSnapshot();
     }
 }
 

@@ -11,6 +11,26 @@
 #include <unordered_map>
 #include <vector>
 
+// kNoPadWithHalfSpacing is 1 << 26 - it is NOT in the
+// public ImGuiSelectableFlags_ enum in 1.93, it lives in imgui_internal.h
+// (imgui_internal.h:1108) right next to the Selectable() code that reads it
+// (imgui_widgets.cpp:7428). We mirror the value instead of including the
+// header, because imgui_internal.h:499 calls `log(x)` and becomes ambiguous
+// against geode::prelude's logger in every TU that has already pulled Geode
+// in. blur.cpp gets away with it only because it includes the header first,
+// before any `using namespace geode::prelude` - an order we must not depend on.
+//
+// On an ImGui bump, re-read imgui_internal.h:1108. A stale value here fails
+// silently (the mask simply does not match), so the static_assert below is the
+// only guard we get: it fires if the bit ever collides with a public flag.
+inline constexpr ImGuiSelectableFlags kNoPadWithHalfSpacing = 1 << 26;
+static_assert((kNoPadWithHalfSpacing &
+               (ImGuiSelectableFlags_None | ImGuiSelectableFlags_NoAutoClosePopups |
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick |
+                ImGuiSelectableFlags_Disabled | ImGuiSelectableFlags_AllowOverlap |
+                ImGuiSelectableFlags_Highlight | ImGuiSelectableFlags_SelectOnNav)) == 0,
+              "kNoPadWithHalfSpacing collides with a public ImGuiSelectableFlags bit");
+
 // Shared building blocks for the redesigned beta GUI. The palette and helpers
 // mirror `docs/abstract-modern-ui-redesign` (graphite shell + lime accent,
 // mono eyebrow typography, letter-spaced labels). Pure Dear ImGui
@@ -80,6 +100,10 @@ inline float menuOpacity = 1.0f;
 // the COSMETICS section in Settings. Persisted as "gui_solid_background".
 inline bool solidBackground = true;
 
+// COSMETICS: user font scale multiplier across the entire menu (persisted as "gui_font_scale").
+// Default 1.0f (range 0.60f .. 1.50f).
+inline float fontScale = 1.0f;
+
 } // namespace theme
 
 inline ImVec4 vec4(ImU32 color) {
@@ -110,11 +134,27 @@ inline std::unordered_map<ImGuiID, float>& tweenPool() {
 
 // Normalized [0,1] eased toward `target` (typically 0 or 1). Higher `speed`
 // = snappier approach.
+//
+// Two guards keep the tail from reading as a freeze:
+//  - A hitched frame (dt > 50ms) previously fell back to dt = 1e-3, which
+//    advanced the tween by almost nothing and visibly STALLED it for a frame.
+//    Clamping keeps the motion advancing instead.
+//  - Pure exponential easing decelerates forever: the last few percent of the
+//    travel is under a pixel per frame, so an accordion looked like it hung
+//    right before closing. `minStep` floors the per-frame advance (still far
+//    below one pixel for row-sized content) so the tail resolves promptly.
 inline float anim01(ImGuiID key, float target, float speed = 12.0f) {
     float dt = ImGui::GetIO().DeltaTime;
-    if (dt <= 0.0f || dt > 0.1f) dt = 1e-3f;
+    if (dt <= 0.0f) dt = 1e-3f;
+    if (dt > 0.05f) dt = 0.05f;
     float& v = tweenPool()[key];
-    v += (target - v) * (1.0f - std::exp(-speed * dt));
+    const float remain = target - v;
+    float step = remain * (1.0f - std::exp(-speed * dt));
+    constexpr float minStep = 0.006f;
+    if (std::fabs(remain) > minStep && std::fabs(step) < minStep) {
+        step = remain > 0.0f ? minStep : -minStep;
+    }
+    v += step;
     if (std::fabs(v - target) < 0.0015f) v = target;
     return v;
 }
@@ -178,9 +218,9 @@ inline float uiScale() {
 // separate factor keeps the compact shell from blowing up with the text.
 inline float uiTextScale() {
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    if (disp.y <= 0.0f) return 1.0f;
+    if (disp.y <= 0.0f) return 1.0f * theme::fontScale;
     const float k = disp.y / 820.0f;
-    return std::clamp(k, 1.0f, 1.5f);
+    return std::clamp(k, 1.0f, 1.5f) * theme::fontScale;
 }
 
 // Snap a requested font size to a whole pixel count. The GD ImGui fork bakes
@@ -315,17 +355,26 @@ inline void drawGradientText(ImDrawList* draw, ImFont* font, float size, ImVec2 
         spacedText(draw, useFont, size, pos, text, col0, 0.0f);
         return;
     }
-    float curX = std::round(pos.x);
+    // Glyph x positions come from PREFIX measurements of the whole string, not
+    // from measuring each character on its own. An isolated measurement loses
+    // the font's own advance handling, so the running cursor drifted and
+    // neighbouring glyphs drifted into each other — most visible on the longer
+    // captions ("Frame Stepper"), which read as "letters stuck together".
+    // Slicing the string at text + i reproduces exactly where a plain
+    // AddText(text) would put glyph i, so the gradient stays pixel-identical in
+    // layout to ordinary text.
+    const float x0 = std::round(pos.x);
     for (size_t i = 0; i < len; ++i) {
         char ch[2] = { text[i], '\0' };
         const float t = static_cast<float>(i) / static_cast<float>(len - 1);
         const ImU32 c = mixColor(col0, col1, t);
+        const float gx = useFont
+            ? x0 + useFont->CalcTextSizeA(size, FLT_MAX, 0.0f, text, text + i).x
+            : x0 + ImGui::CalcTextSize(text, text + i).x;
         if (useFont) {
-            draw->AddText(useFont, size, ImVec2(curX, pos.y), c, ch);
-            curX += useFont->CalcTextSizeA(size, FLT_MAX, 0.0f, ch).x;
+            draw->AddText(useFont, size, ImVec2(gx, pos.y), c, ch);
         } else {
-            draw->AddText(ImVec2(curX, pos.y), c, ch);
-            curX += ImGui::CalcTextSize(ch).x;
+            draw->AddText(ImVec2(gx, pos.y), c, ch);
         }
     }
 }
@@ -358,21 +407,33 @@ inline bool quietButton(const char* id, ImVec2 min, ImVec2 size,
 inline bool buttonPrimary(const char* id, ImVec2 pos, ImVec2 size,
                           const char* label, const char* kbd = nullptr,
                           bool enabled = true, ImU32 fill = theme::Accent,
-                          ImU32 onFill = theme::AccentLight) {
+                          ImU32 onFill = theme::AccentLight,
+                          bool* heldOut = nullptr) {
     ImGui::SetCursorScreenPos(pos);
     ImGui::BeginDisabled(!enabled);
     bool clicked = ImGui::InvisibleButton(id, size, blockedButtonFlags(enabled));
     ImGui::EndDisabled();
+    // Sample "is held" HERE, right after the button item: callers that poll
+    // IsItemActive() after the widget has run its own draw code can read a
+    // different last-item and silently miss the hold, which is what made the
+    // STEP button step only on tap while the keybind held fine.
+    if (heldOut) *heldOut = enabled && ImGui::IsItemActive();
 
     const bool hovered = enabled && ImGui::IsItemHovered();
     const bool fakeFill = hovered && enabled;
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    ImU32 bg = !enabled ? withAlpha(theme::Secondary, 0.45f)
+    // Disabled contrast: the label used to sit at 45% alpha over a 45%-alpha
+    // Secondary fill, and the border at 18% — on the dark panel the whole pill
+    // vanished, so "START RENDER" (disabled whenever a render cannot start) was
+    // effectively unreadable and looked like a rendering glitch rather than an
+    // inactive control. Raised all three so the shape and its caption stay
+    // legible while still clearly reading as not-pressable.
+    ImU32 bg = !enabled ? withAlpha(theme::Secondary, 0.62f)
                         : (fakeFill ? onFill : fill);
     draw->AddRectFilled(pos, add(pos, size), bg, 28.0f * uiScale());
     draw->AddRect(pos, add(pos, size),
-                  !enabled ? withAlpha(fill, 0.18f) : bg, 28.0f * uiScale(), 0, 1.0f);
-    ImU32 labelCol = !enabled ? withAlpha(theme::OnAccent, 0.45f) : theme::OnAccent;
+                  !enabled ? withAlpha(fill, 0.45f) : bg, 28.0f * uiScale(), 0, 1.0f);
+    ImU32 labelCol = !enabled ? theme::rgb(255, 255, 255) : theme::OnAccent;
 
     ImFont* mono = nullptr; // use bold/default label below
     ImVec2 tl = ImGui::CalcTextSize(label);
@@ -657,10 +718,6 @@ inline NumberEditState& numberEditState(ImGuiID key) {
     return s[key];
 }
 
-inline bool numberEditing(ImGuiID key) {
-    return numberEditState(key).editing;
-}
-
 // Line-top to baseline distance in pixels for `font` rendered at `size`.
 inline float fontAscentPx(ImFont* font, float size) {
     if (font) {
@@ -822,6 +879,20 @@ inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
 // `curIndex` is the currently selected item (-1 = none / custom value, only
 // shown through `preview`). Returns the index the user picked this frame, or
 // -1 if the popup was not used.
+// ---- Dropdown list state ----------------------------------------------------
+// A single open slot is enough: opening one list closes the other, which is what
+// a dropdown is supposed to do anyway. Keyed by ImGuiID, so the two lists on
+// the same page never fight over it.
+inline ImGuiID& dropdownOpenId() {
+    static ImGuiID id = 0;
+    return id;
+}
+
+inline float& dropdownScroll() {
+    static float s = 0.0f;
+    return s;
+}
+
 inline int dropdownField(ImFont* font, const char* id, ImVec2 pos, float width,
                          const char* preview, const std::vector<std::string>& items,
                          int curIndex, bool enabled) {
@@ -844,24 +915,51 @@ inline int dropdownField(ImFont* font, const char* id, ImVec2 pos, float width,
     ImGui::BeginDisabled(!enabled);
     const bool clicked = ImGui::InvisibleButton(id, size, blockedButtonFlags(enabled));
     ImGui::EndDisabled();
-    if (clicked && enabled) ImGui::OpenPopup(id);
+    // No OpenPopup() here: the list is drawn by hand further down. Opening an
+    // ImGui popup from here is what latched its position to the mouse.
     if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
-    // Preview value: left-padded, ink-centered vertically.
+    // Preview value: ink-centered horizontally AND vertically, matching
+    // numberField. If preview text exceeds available space (width minus chevron and padding),
+    // truncate with "..." so it never overflows or collides with the chevron.
     const float kt = uiTextScale();
     const float vSize = pxSize(13.0f * kt);
-    const char* text = (preview && *preview) ? preview : "-";
+    ImFont* useFont = font ? font : ImGui::GetFont();
+    std::string previewStr = (preview && *preview) ? preview : "-";
+
+    const float maxPreviewW = std::max(10.0f * k, size.x - 26.0f * k);
+    float textW = useFont ? useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, previewStr.c_str()).x
+                          : ImGui::CalcTextSize(previewStr.c_str()).x;
+    if (textW > maxPreviewW) {
+        // Truncate characters until it fits with ellipsis
+        while (!previewStr.empty() && textW > maxPreviewW) {
+            previewStr.pop_back();
+            std::string candidate = previewStr + "...";
+            textW = useFont ? useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, candidate.c_str()).x
+                            : ImGui::CalcTextSize(candidate.c_str()).x;
+        }
+        previewStr += "...";
+    }
+
+    const char* text = previewStr.c_str();
     InkMeasure vm;
     const bool haveV = measureGlyphInk(font, vSize, text, vm);
+    const float inkW = haveV ? (vm.x1 - vm.x0)
+                             : (useFont ? useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, text).x : textW);
     const float inkH = haveV ? (vm.y1 - vm.y0) : vSize * 0.8f;
+    const float inkL = haveV ? vm.x0 : 0.0f;
     const float inkT = haveV ? vm.y0 : 0.0f;
+    const float availW = size.x - 20.0f * k;
+    const float tx = pos.x + (availW - inkW) * 0.5f - inkL;
     const float ty = pos.y + (size.y - inkH) * 0.5f - inkT;
-    const float padX = 10.0f * k;
-    draw->AddText(font, vSize,
-                  ImVec2(pos.x + padX - (haveV ? vm.x0 : 0.0f), ty),
+
+    draw->PushClipRect(ImVec2(pos.x + 3.0f * k, pos.y),
+                       ImVec2(pos.x + size.x - 18.0f * k, pos.y + size.y), true);
+    draw->AddText(font, vSize, ImVec2(tx, ty),
                   !enabled ? theme::rgb(158, 167, 187)
                            : theme::rgb(220, 227, 243),
                   text);
+    draw->PopClipRect();
 
     // Chevron: a small solid triangle on the right edge (drawn as geometry so
     // it never depends on a glyph being baked).
@@ -874,34 +972,150 @@ inline int dropdownField(ImFont* font, const char* id, ImVec2 pos, float width,
                             !enabled ? theme::rgb(122, 131, 150)
                                      : theme::rgb(143, 153, 174));
 
-    // The popup is a separate ImGui window, so it renders ABOVE the section's
-    // PushClipRect reveal (the parent clip only affects this window's list).
-    int picked = -1;
-    const float itemH = 26.0f * k;
-    const float r = 28.0f * k;
-    ImGui::SetNextWindowSizeConstraints(ImVec2(std::max(size.x, 140.0f * k), 0.0f),
-                                        ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * k, 8.0f * k));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * k, 3.0f * k));
-    ImGui::PushStyleVar(ImGuiStyleVar_SelectableRounding, r);
-    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.08f, 0.5f));
-    ImGui::PushStyleColor(ImGuiCol_Header, vec4(theme::rgb(55, 95, 175, 160)));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, vec4(theme::rgb(70, 120, 215, 200)));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, vec4(theme::rgb(85, 145, 240, 230)));
-    if (ImGui::BeginPopup(id)) {
-        if (font) ImGui::PushFont(font);
-        for (size_t i = 0; i < items.size(); ++i) {
-            const bool isSelected = static_cast<int>(i) == curIndex;
-            if (ImGui::Selectable(items[i].c_str(), isSelected, 0, ImVec2(0.0f, itemH))) {
-                picked = static_cast<int>(i);
-            }
-        }
-        if (font) ImGui::PopFont();
-        ImGui::EndPopup();
+    // ---- The list ---------------------------------------------------------------
+// The list is NOT an ImGui popup any more, and that is the whole point. Every
+// symptom that came out of the popup traces back to the popup being a real
+// ImGui window:
+//   * its position is latched from the MOUSE at OpenPopup() time
+//     (imgui.cpp:12506 -> NavCalcPreferredRefPos) and consumed verbatim
+//     (imgui.cpp:7884), so the list opened wherever the cursor was, not under
+//     the field - clicking the right half of the 160px field dropped it up to
+//     160px to the right;
+//   * popups take style.PopupBorderSize, not style.WindowBorderSize
+//     (imgui.cpp:7777), so the list kept a 1px border nothing else in the shell
+//     has, standing alone in the gap - the "strange stripe";
+//   * its size came from auto-fit plus size constraints, and Selectable() with
+//     size.x == 0 reported its width from window->WorkRect, which describes the
+//     size carried over from the previous frame - the window was measuring the
+//     content and the content was measuring the window;
+//   * and it was free to grow a scrollbar of its own on the right.
+// Drawn by hand here, none of that is reachable. It goes on the FOREGROUND draw
+// list so the shell's column clip rect cannot cut it off: escaping that clip is
+// the only reason it ever needed to be a popup at all.
+//
+// Left and right insets are the same `pad` constant used in both directions, so
+// the gaps are equal by construction rather than by agreement between a size
+// constraint and a remembered frame size.
+//
+// One behaviour difference from the popup it replaces: a click outside used to
+// be swallowed by the modal popup, and now it also reaches whatever is under
+// the cursor (the list closes AND that control fires).
+ImGuiID& openId = dropdownOpenId();
+float& scroll = dropdownScroll();
+if (clicked && enabled) {
+    if (openId == key) {
+        openId = 0;
+    } else {
+        openId = key;
+        scroll = 0.0f;
     }
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar(4);
-    return picked;
+}
+if (!enabled && openId == key) openId = 0;
+if (ImGui::IsKeyPressed(ImGuiKey_Escape) && openId == key) openId = 0;
+
+int picked = -1;
+if (openId != key) return picked;
+
+const float itemH = 26.0f * k;
+const float r = 28.0f * k;
+const float pad = 8.0f * k;
+const float gapY = 2.0f * k;
+const float rowGap = 3.0f * k;
+
+const float rows = static_cast<float>(items.size());
+const float contentH = rows * itemH + std::max(0.0f, rows - 1.0f) * rowGap;
+// Same width as the field, always - that is what makes the box and the list
+// share both vertical edges.
+const float panelW = size.x;
+// Cap the panel so a long list (every font on disk) cannot run off the bottom
+// of the screen; the overflow scrolls on the wheel.
+const float dispH = ImGui::GetIO().DisplaySize.y;
+const float capH = dispH > 0.0f ? dispH * 0.45f : 240.0f * k;
+const float panelH = 2.0f * pad + std::min(contentH, std::max(3.0f * itemH, capH));
+const float viewH = panelH - 2.0f * pad;
+
+const float belowY = pos.y + size.y + gapY;
+const float aboveY = pos.y - gapY - panelH;
+const float panelY = (dispH > 0.0f && belowY + panelH > dispH && aboveY > 0.0f) ? aboveY : belowY;
+
+const ImVec2 panelMin(pos.x, panelY);
+const ImVec2 panelMax(pos.x + panelW, panelY + panelH);
+const float maxScroll = std::max(0.0f, contentH - viewH);
+scroll = std::clamp(scroll, 0.0f, maxScroll);
+
+// The open list must OWN the mouse over its whole panel. The rows below are
+// hand-drawn on the foreground list, not ImGui items, so they never claim the
+// click: without a real item here the press that picks "3840x2160" also lands
+// on whatever sits underneath, and on the RENDER tab that is the Codec row —
+// choosing a resolution closed the list and instantly opened the Codec dropdown
+// (the same double-hit applied to every list: fonts, audio codec). An invisible
+// button submitted BEFORE the widgets drawn later in the frame claims
+// HoveredId/ActiveId, so those later controls no longer see the press.
+ImGui::SetCursorScreenPos(panelMin);
+ImGui::InvisibleButton("##dd_panel_hit", ImVec2(panelW, panelH),
+                       ImGuiButtonFlags_MouseButtonLeft);
+
+const bool clickNow = ImGui::IsMouseClicked(0);
+const bool overPanel = ImGui::IsMouseHoveringRect(panelMin, panelMax);
+if (overPanel && ImGui::GetIO().MouseWheel != 0.0f) {
+    scroll = std::clamp(scroll - ImGui::GetIO().MouseWheel * itemH, 0.0f, maxScroll);
+}
+
+ImDrawList* fg = ImGui::GetForegroundDrawList();
+fg->PushClipRect(panelMin, panelMax, true);
+fg->AddRectFilled(panelMin, panelMax, theme::ModalBg, r);
+
+const float listTop = panelMin.y + pad;
+const ImU32 textCol = enabled ? theme::rgb(220, 227, 243) : theme::rgb(158, 167, 187);
+const float maxLabelW = panelW - 2.0f * pad;
+for (size_t i = 0; i < items.size(); ++i) {
+    const float rowY = listTop + static_cast<float>(i) * (itemH + rowGap) - scroll;
+    if (rowY + itemH < listTop || rowY > listTop + viewH) continue;
+
+    const ImVec2 rowMin(panelMin.x + pad, rowY);
+    const ImVec2 rowMax(panelMax.x - pad, rowY + itemH);
+    const bool rowHover = enabled && ImGui::IsMouseHoveringRect(rowMin, rowMax);
+    if (rowHover || static_cast<int>(i) == curIndex) {
+        fg->AddRectFilled(rowMin, rowMax,
+                          rowHover ? theme::rgb(70, 120, 215, 200)
+                                   : theme::rgb(55, 95, 175, 160),
+                          r);
+    }
+
+    // A label wider than the row would be hard-clipped mid-glyph, so shorten it
+    // with an ellipsis before drawing.
+    std::string label = items[i];
+    if (useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, label.c_str()).x > maxLabelW) {
+        while (!label.empty() &&
+               useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, (label + "...").c_str()).x > maxLabelW) {
+            label.pop_back();
+        }
+        label += "...";
+    }
+
+    // Ink-centred, same as the closed state: optical middle, not advance box.
+    InkMeasure vm;
+    const bool haveInk = measureGlyphInk(useFont, vSize, label.c_str(), vm);
+    const float inkW = haveInk ? (vm.x1 - vm.x0)
+                               : useFont->CalcTextSizeA(vSize, FLT_MAX, 0.0f, label.c_str()).x;
+    const float inkH = haveInk ? (vm.y1 - vm.y0) : vSize * 0.8f;
+    fg->AddText(useFont, vSize,
+                ImVec2(rowMin.x + ((rowMax.x - rowMin.x) - inkW) * 0.5f - (haveInk ? vm.x0 : 0.0f),
+                       rowMin.y + ((rowMax.y - rowMin.y) - inkH) * 0.5f - (haveInk ? vm.y0 : 0.0f)),
+                textCol, label.c_str());
+
+    if (rowHover && clickNow) {
+        picked = static_cast<int>(i);
+        openId = 0;
+    }
+}
+fg->PopClipRect();
+fg->AddRect(panelMin, panelMax, theme::ModalBorder, r, 0, 1.0f);
+
+// A click on neither the field nor the list closes it. The field itself is
+// excluded so the very click that opened the list does not shut it again.
+if (clickNow && !hovered && !overPanel) openId = 0;
+return picked;
 }
 
 }  // namespace skkbot2::gui::beta_widgets

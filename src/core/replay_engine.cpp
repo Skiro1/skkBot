@@ -2,9 +2,12 @@
 #include "core/checkpoint_handler.hpp"
 #include "core/editor_playback.hpp"
 #include "core/gameplay_layer.hpp"
+#include "core/hotpath.hpp"
 #include "core/physical_keys.hpp"
 #include "core/replay_timing.hpp"
+#include "gui/skkbot_gui.hpp"
 #include "hacks/autoclicker.hpp"
+#include "skc/skc_bot.hpp"
 
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -20,6 +23,110 @@
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #endif
+
+
+// Every PHYSICAL key press the player makes, logged.
+//
+// The macro's own clicks never come through here: playback pushes straight into
+// m_queuedButtons (physicsbypass.cpp:403, skc_hooks.cpp:426), so anything that
+// arrives on UILayer::keyDown is a human by construction. That makes this the
+// one place where "was that me or the player?" is a fact rather than a guess -
+// and it is the same shape as syncAccuracyFromGame(), which adopts CBS/COS out
+// of GD's live fields and logs the moment they move. Here the thing being
+// adopted is the player's own hands.
+//
+// Individual lines are capped, not the counter. During recording a player taps
+// constantly and the lines would bury everything else; during playback the cap
+// is what makes a stray press visible rather than the hundredth one.
+//
+// Defined here, at the top of the file, because everything below this point sits
+// inside a namespace that would turn these into different symbols than the ones
+// skkBot.hpp declares - and the linker failure that caused looks like nothing at
+// all ("unresolved external symbol skkbot2::notePlayerInput") while the cause is
+// three hundred lines away from where the compiler complains.
+namespace skkbot2 {
+namespace {
+struct PlayerInputTally {
+    long long total = 0;
+    long long duringPlayback = 0;
+    long long duringRecording = 0;
+    long long printed = 0;
+    long long suppressed = 0;
+    static constexpr long long kPrintCap = 40;
+};
+
+PlayerInputTally g_playerInput;
+}  // namespace
+
+void notePlayerInput(char const* kind, int key) {
+    auto& tally = g_playerInput;
+    ++tally.total;
+
+    // Both bots' state is asked for rather than one being picked. SKK's state lives
+    // in ReplayEngine::engineMode (get() hands back a pointer, as everywhere else
+    // in this file); SKC keeps its own enum. The local is not named `skk` -
+    // that would shadow the namespace holding SKC.
+    auto* skkEngine = ReplayEngine::get();
+    const bool skkPlaying = skkEngine && skkEngine->engineMode == MODE_EXECUTE;
+    const bool skkRecording = skkEngine && skkEngine->engineMode == MODE_CAPTURE;
+    auto& skc = skk::skc::Bot::get();
+    const bool skcPlaying = skc.isPlaying();
+    const bool skcRecording = skc.isRecording();
+    const bool skcIgnoring = skc.getIgnoreInputs();
+
+    if (skkPlaying || skcPlaying) {
+        ++tally.duringPlayback;
+    }
+    if (skkRecording || skcRecording) {
+        ++tally.duringRecording;
+    }
+
+    const bool active = skkPlaying || skcPlaying || skkRecording || skcRecording;
+    const bool playing = skkPlaying || skcPlaying;
+
+    // During playback a press from the human is the interesting case, and the
+    // one that can corrupt a run. Say whether it will be swallowed rather than
+    // letting the reader assume: Ignore Inputs clears the queue before the
+    // macro's commands are pushed (skc_hooks.cpp:413), and with it off the press
+    // interleaves and the run drifts. Both are documented behaviour; which one
+    // is active decides whether the line matters.
+    const char* verdict =
+        playing
+        ? (skcIgnoring
+               ? "during playback, swallowed by Ignore Inputs"
+               : "during playback, NOT ignored - it interleaves with the macro")
+        : (active ? "while a run is open but not playing" : "outside a run");
+
+    if (tally.printed < PlayerInputTally::kPrintCap) {
+        ++tally.printed;
+        skkbot2::log::info(
+            "player-input: {} {} (code {}) - {}; press #{} this session "
+            "[total {} / playback {} / recording {}]",
+            kind, skkbot2::gui::Gui::keyName(key), key, verdict, tally.printed,
+            tally.total, tally.duringPlayback, tally.duringRecording);
+    } else {
+        ++tally.suppressed;
+        if (tally.suppressed == 1) {
+            skkbot2::log::info(
+                "player-input: further individual lines suppressed; the tally "
+                "keeps counting and is printed with the session");
+        }
+    }
+}
+
+void dumpPlayerInputTally(char const* reason) {
+    auto& tally = g_playerInput;
+    if (tally.total == 0) {
+        return;
+    }
+    skkbot2::log::info(
+        "player-input tally ({}): {} presses, {} during playback, {} during "
+        "recording, {} lines printed, {} suppressed",
+        reason, tally.total, tally.duringPlayback, tally.duringRecording,
+        tally.printed, tally.suppressed);
+    tally = PlayerInputTally {};
+}
+}  // namespace skkbot2
 
 namespace {
     // Level-wide portal list cache shared by findTeleportEntryPortal and the
@@ -2259,16 +2366,14 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     // that state lands one (or several) ticks LATE.
                     if (curGravNeg != wantGravNeg || curUD != wantUD) {
                         const int lag = effectiveTick - pf.tick;
-                        if (wantUD != wantGravNeg) {
+                        // Always INFO, and on BOTH bits disagreeing. The old gate
+                        // (wantUD != wantGravNeg) only fired when the two bits
+                        // disagreed with each other, which a normal gravity portal
+                        // never does — both flip together — so the exact case we are
+                        // chasing (a UFO's gravity flip not landing) logged nothing.
+                        if (std::abs(lag) <= 8) {
                             skkbot2::log::info(
-                                "RECON ud[BUG-04]: tick={} pfTick={} lag={} p1 cur(g={} ud={}) -> want(g={} ud={}) p1vis=0x{:02x}",
-                                effectiveTick, pf.tick, lag,
-                                curGravNeg ? 1 : 0, curUD ? 1 : 0,
-                                wantGravNeg ? 1 : 0, wantUD ? 1 : 0,
-                                static_cast<int>(pf.p1vis));
-                        } else {
-                            skkbot2::log::debug(
-                                "RECON ud[BUG-04]: tick={} pfTick={} lag={} p1 cur(g={} ud={}) -> want(g={} ud={}) p1vis=0x{:02x}",
+                                "RECON ud: tick={} pfTick={} lag={} p1 cur(g={} ud={}) -> want(g={} ud={}) p1vis=0x{:02x}",
                                 effectiveTick, pf.tick, lag,
                                 curGravNeg ? 1 : 0, curUD ? 1 : 0,
                                 wantGravNeg ? 1 : 0, wantUD ? 1 : 0,
@@ -2427,6 +2532,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         }
 
         int effectiveTick = tick + engine->tickOffset;
+        engine->lastDispatchEffectiveTick = effectiveTick;
 
         // Input dispatch only (frame-boundary).
         if (!shouldUseInputOnlySkPlayback() && !shouldUseInputOnlyGDRPlayback()) {
@@ -2529,6 +2635,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     // Triple RNG: restore teleport from anchor.
                     if (auditAnchor.rng.teleportState != 0) {
                         *skk::gdTeleportRng() = auditAnchor.rng.teleportState;
+                    }
+                    // And shake, now that it is locked for both SKK and SKC.
+                    // Without this the chain drifted across the whole replay
+                    // while primary and teleport were re-pinned every tick.
+                    if (auditAnchor.rng.shakeState != 0) {
+                        skk::shakeStateSet(auditAnchor.rng.shakeState);
                     }
                 }
             }
@@ -3019,6 +3131,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
 class $modify(MacroEnginePlayerObject, PlayerObject) {
     void update(float stepDelta) {
+        skkbot2::hot::Timed skkbot2Count(skkbot2::hot::MacroPlayerUpdate);
         auto* playLayer = PlayLayer::get();
         auto* engine = ReplayEngine::get();
 
@@ -3069,17 +3182,15 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
     // else (autoclicker, direct pushButton, post-restore residue) shows up as
     // direct=false. Logging who pressed, which player, and the resulting hold
     // map tells us if the self-jump originates OUTSIDE the button system.
-    void reportButtonCall(const char* kind, int button, bool* outIsP1) {
+    void reportButtonCall(const char* kind, int button) {
         auto* playLayer = PlayLayer::get();
         if (!playLayer) {
-            if (outIsP1) *outIsP1 = false;
-            return;
+                return;
         }
         auto* engine = ReplayEngine::get();
         const bool isP1 = this == playLayer->m_player1;
         const bool isP2 = playLayer->m_player2 && this == playLayer->m_player2;
-        if (outIsP1) *outIsP1 = isP1;
-        int tick = 0;
+            int tick = 0;
         if (engine) {
             if (engine->stepClock) {
                 tick = std::max(0, engine->stepPairCount + 1);
@@ -3111,14 +3222,14 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
 
     bool pushButton(PlayerButton button) {
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_gameState.m_isDualMode) {
-            reportButtonCall("push", static_cast<int>(button), nullptr);
+            reportButtonCall("push", static_cast<int>(button));
         }
         return PlayerObject::pushButton(button);
     }
 
     bool releaseButton(PlayerButton button) {
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_gameState.m_isDualMode) {
-            reportButtonCall("release", static_cast<int>(button), nullptr);
+            reportButtonCall("release", static_cast<int>(button));
         }
         return PlayerObject::releaseButton(button);
     }
@@ -3137,6 +3248,7 @@ class $modify(MacroUiInputWall, UILayer) {
             engine->inputArrivalWallTime = ReplayEngine::wallClockSeconds();
             engine->hasInputArrivalWallTime = true;
         }
+        skkbot2::notePlayerInput("key down", static_cast<int>(key));
         UILayer::keyDown(key, timestamp);
     }
 
@@ -3145,6 +3257,7 @@ class $modify(MacroUiInputWall, UILayer) {
             engine->inputArrivalWallTime = ReplayEngine::wallClockSeconds();
             engine->hasInputArrivalWallTime = true;
         }
+        skkbot2::notePlayerInput("key up", static_cast<int>(key));
         UILayer::keyUp(key, timestamp);
     }
 
@@ -3153,6 +3266,7 @@ class $modify(MacroUiInputWall, UILayer) {
             engine->inputArrivalWallTime = ReplayEngine::wallClockSeconds();
             engine->hasInputArrivalWallTime = true;
         }
+        skkbot2::notePlayerInput("touch down", 0);
         return UILayer::ccTouchBegan(touch, event);
     }
 
@@ -3161,6 +3275,7 @@ class $modify(MacroUiInputWall, UILayer) {
             engine->inputArrivalWallTime = ReplayEngine::wallClockSeconds();
             engine->hasInputArrivalWallTime = true;
         }
+        skkbot2::notePlayerInput("touch up", 0);
         UILayer::ccTouchEnded(touch, event);
     }
 };

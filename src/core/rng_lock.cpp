@@ -114,10 +114,24 @@ void regenerateVarianceFromSeed(uint64_t seed, float* table, size_t count) {
 
 namespace {
     SafetyHookMid g_teleportHook;
+    SafetyHookMid g_shakeHooks[4];
     bool g_rngHooksInstalled = false;
 
     // Bot-owned copy for midhook callback.
     uint64_t g_teleportState = 0;
+
+    // Bot-owned shake state. GD draws shake randomness through C rand(), whose
+    // seed is not part of the streams we pin at reset, so two attempts at the
+    // same level consume different draws. Silicate overrides all four call
+    // sites for exactly this reason
+    // (silicate-main/src/hooks/GJBaseGameLayer.cpp:736-744).
+    //
+    // Shared by SKK and SKC on purpose. It was previously SKC-only behind a
+    // gate, with SKK deliberately leaving shake unlocked
+    // ("shake (camera) is not locked"). A half-locked stream is worse than
+    // either: a checkpoint captured mid-attempt recorded a shake value that
+    // could not be restored, so practice replays drifted visually anyway.
+    uint64_t g_shakeState = 0;
 
     // Teleport midhook: intercept the inline LCG call.
     // GD calls rand() inline at these sites. We intercept rax (the return
@@ -127,6 +141,16 @@ namespace {
     void teleportMidhook(safetyhook::Context& ctx) {
         g_teleportState = lcgAdvance(g_teleportState);
         ctx.rax = static_cast<uintptr_t>(lcgOutput(g_teleportState));
+    }
+
+    // Shake rand() override, shared by SKK and SKC. Always active once
+    // installed: the chain is pinned deterministically at every attempt reset
+    // and snapshotted into every practice checkpoint, so there is no state
+    // left un-owned.
+    void shakeRandomMidhook(safetyhook::Context& ctx) {
+        g_shakeState = lcgAdvance(g_shakeState);
+        ctx.rax = static_cast<uintptr_t>(lcgOutput(g_shakeState));
+        ctx.rip += 6;   // skip the original call to rand()
     }
 
     // Sync bot-owned copy from GD global (called after restore).
@@ -173,13 +197,22 @@ bool installRngMidhooks() {
     bool ok = true;
     ok &= tryHook(g_teleportHook, 0x20FED3, "teleport", teleportMidhook);
 
+    // The four C-rand() call sites GD uses for shake randomness.
+    static constexpr uintptr_t kShakeSites[4] = {
+        0x23E173, 0x23E1A1, 0x23E1CB, 0x23E1E9,
+    };
+    for (size_t i = 0; i < 4; ++i) {
+        ok &= tryHook(g_shakeHooks[i], kShakeSites[i], "shake",
+                      shakeRandomMidhook);
+    }
+
     if (!ok) {
         skkbot2::log::warn("rng midhooks: some hooks failed - teleport lock degraded");
         // Don't disable completely; the hooks that succeeded still work.
     }
 
     g_rngHooksInstalled = true;
-    skkbot2::log::info("rng midhooks installed: teleport@0x20FED3");
+    skkbot2::log::info("rng midhooks installed: teleport@0x20FED3 + 4 shake rand() sites (SKK and SKC)");
     return ok;
 }
 
@@ -190,6 +223,11 @@ void pinTripleSeedAtReset(uint64_t primary, uint64_t teleport) {
 
     // Sync bot-owned midhook copy.
     g_teleportState = teleport;
+    // Shake draws come from C rand(), which we override while an SKC session is
+    // live. Derive it from the same primary seed the attempt starts from so the
+    // chain is identical on every run of that attempt. Masked to 15 bits: the
+    // four call sites consume the truncated value.
+    g_shakeState = primary & 0x7FFFULL;
 }
 
 void applyRngBoundaryReseed(uint64_t primary, uint64_t teleport,
@@ -214,6 +252,9 @@ void applyRngBoundaryReseed(uint64_t primary, uint64_t teleport,
 void syncMidhookFromGlobals();
 void syncGlobalsFromMidhook();
 
+uint64_t shakeStateGet() { return g_shakeState; }
+void shakeStateSet(uint64_t state) { g_shakeState = state; }
+
 #else
 // Non-Windows: stubs.
 bool installRngMidhooks() { return false; }
@@ -228,6 +269,7 @@ void applyRngBoundaryReseed(uint64_t primary, uint64_t teleport,
         advRandomReseedAt(seedSalt, progress);
     }
 }
+uint64_t shakeStateGet() { return 0; }
+void shakeStateSet(uint64_t) {}
 #endif
-
 }

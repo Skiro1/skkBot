@@ -1,21 +1,23 @@
 #pragma once
 
-// Stub replacement for the removed skkBot trajectory module.
-// The replay engine / checkpoint system only consult whether a trajectory
-// simulation is running; the native-imGui port never runs one, so the stub
-// always reports false.
+#include <Geode/cocos/include/ccTypes.h>
 
-class TrajectoryPredictionService {
-public:
-    static TrajectoryPredictionService& get() {
-        static TrajectoryPredictionService instance;
-        return instance;
-    }
+namespace skk::trajectory {
 
-    bool isActiveSimulation() const {
-        return false;
-    }
-
-private:
-    TrajectoryPredictionService() = default;
+struct Settings {
+    bool enabled = false;          // GDH: level.show_trajectory
+    bool performance = true;       // GDH: level.show_trajectory::performance
+    bool noCollisions = false;     // GDH: level.show_trajectory::no_collisions
+    int iterations = 150;          // GDH: level.show_trajectory::iterations
+    int stepMultiplier = 1;        // GDH: level.show_trajectory::step_multiplier
+    float tps = 240.0f;            // GDH: invisible.tps::value
+    cocos2d::ccColor4F jumpColor = {0.91f, 0.00f, 1.00f, 1.00f};    // #E900FFFF
+    cocos2d::ccColor4F normalColor = {0.00f, 1.00f, 1.00f, 1.00f};  // #00FFFFFF
+    cocos2d::ccColor4F hitboxColor = {1.00f, 0.00f, 0.00f, 1.00f};  // #FF0000FF
+    cocos2d::ccColor4F hitboxInnerColor = {0.00f, 0.25f, 1.00f, 1.00f}; // #003FFFFF
 };
+
+Settings& settings();
+bool isSimulating();
+
+} // namespace skk::trajectory

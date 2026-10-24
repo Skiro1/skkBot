@@ -255,6 +255,12 @@ public:
     std::string levelName;
     int32_t levelId = 0;
     double framerate = 240.0;
+    // Display rate as a WIRE value, not a number: +0.0 = the macro carries no
+    // display rate (FPS was off while recording), -0.0 = "FPS on, follow the
+    // tick rate", n > 0 = pinned. Read it with
+    // skkbot2::fps::MacroDisplayRate::fromWire - comparing against zero cannot
+    // see the marker, because -0.0 == +0.0.
+    double displayFps = 0.0;
     double duration = 0.0;
     uint32_t gameVersion = 0;
     float startPosX = 0.f;

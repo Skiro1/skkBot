@@ -118,7 +118,13 @@ struct FullPlayerCheckpoint {
     bool holdingLeft = false;
     bool leftPressedFirst = false;
     bool wasOnSlope = false;
+    bool isOnSlope = false;
+    bool isOnGround2 = false;
+    bool inputsLocked = false;
     bool maybeUpsideDownSlope = false;
+    double maybeSlidingStartTime = 0.0;
+    cocos2d::CCPoint stateForceVector = { 0.f, 0.f };
+    geode::SeedValueRSV jumpRelatedAC2;
     unsigned char stateJumpBuffered = 0;
     unsigned char stateUnk = 0;
     unsigned char stateNoStickX = 0;
@@ -127,6 +133,15 @@ struct FullPlayerCheckpoint {
     bool ringJumpRelated = false;
     bool unkA29 = false;
     bool unkA99 = false;
+
+    // --- Containers / maps (Deep Practice Fix) ---
+    gd::unordered_map<int, GameObject*> potentialSlopeMap;
+    gd::map<int, bool> jumpPadRelated;
+    gd::unordered_set<int> ringRelatedSet;
+    gd::unordered_set<int> touchedRings;
+    gd::unordered_map<int, GJPointDouble> rotateObjectsRelated;
+    std::vector<cocos2d::CCObject*> touchingRings;
+    gd::string currentRobotAnimation;
 
     // --- Click release state (GDH pattern) ---
     std::array<bool, 3> clickReleased = { true, true, true };
@@ -158,9 +173,17 @@ struct FullCheckpointBundle {
     FullPlayerCheckpoint player2;
     bool hasDual = false;
 
-    // Layer-level state (silicate pattern)
+    // Layer-level state (silicate & EclipseMenu pattern)
     std::unordered_map<int, int> persistentItemMap;
     std::array<float, 2000> varianceValues{};
+    GameObject* player1CollisionBlock = nullptr;
+    GameObject* player2CollisionBlock = nullptr;
+    double extraDelta = 0.0;
+    int unk32d0 = 0;
+    int unk32ec = 0;
+    int currentStep = 0;
+    float unk3380 = 0.f;
+    gd::unordered_map<int, GameObjectPhysics> gameObjectPhysics;
 
     // RNG state
     uint64_t seedState = 0;

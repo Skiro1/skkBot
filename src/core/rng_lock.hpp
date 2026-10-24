@@ -6,9 +6,11 @@
 
 namespace skk {
 
-// Lock RNG streams: primary (main LCG) + teleport (portal inline LCG).
-// Shake (camera) is intentionally not locked: it is visual-only and its
-// midhooks were removed.
+// Lock RNG streams: primary (main LCG) + teleport (portal inline LCG) +
+// shake (the four C rand() call sites GD uses for camera shake).
+// Shake is locked for BOTH SKK and SKC: the chain is pinned at every attempt
+// reset and snapshotted into every practice checkpoint, so it is owned
+// end-to-end rather than left half-locked.
 // GD 2.2081 x64 data globals:
 //   GD+0x6C2E90 = primary RNG (GameToolbox::fast_srand/fast_rand)
 //   GD+0x6C2EF8 = teleport RNG (portal inline LCG)
@@ -68,6 +70,12 @@ bool installRngMidhooks();
 
 // Seed pin at level reset: writes primary + teleport GD globals + midhook copy.
 void pinTripleSeedAtReset(uint64_t primary, uint64_t teleport);
+
+// Bot-owned shake LCG chain (only advanced while SKC is enabled).
+// Exposed so the SKC practice checkpoint can snapshot/restore it alongside the
+// primary and teleport globals.
+uint64_t shakeStateGet();
+void shakeStateSet(uint64_t state);
 
 // Re-seed the locked RNG streams at a practice-restart boundary. Restores the
 // GD globals (+ midhook copy) verbatim to the LIVE teleport state captured

@@ -1,6 +1,7 @@
 #ifdef GEODE_IS_WINDOWS
 
 #include "skkBot.hpp"
+#include "../core/hotpath.hpp"
 #include "core/rng_lock.hpp"
 
 #include <Geode/modify/RandTriggerGameObject.hpp>
@@ -36,8 +37,10 @@ class $modify(SkRandTriggerGameObject, RandTriggerGameObject) {
 
         // Lazy-init from attempt seed.
         if (m_fields->m_advRandomState == std::numeric_limits<uint64_t>::max()) {
-            auto* engine = ReplayEngine::get();
-            uint64_t seedBase = engine ? engine->macroSetupSeed() : 100ULL;
+            uint64_t seedBase = 100ULL;
+            if (auto* engine = ReplayEngine::get()) {
+                seedBase = engine->macroSetupSeed();
+            }
             m_fields->m_advRandomState = seedBase ^ (static_cast<uint64_t>(m_uniqueID) * 2137ULL);
         }
 
@@ -77,8 +80,10 @@ class $modify(SkEffectGameObject, EffectGameObject) {
         }
 
         if (m_fields->m_advRandomState == std::numeric_limits<uint64_t>::max()) {
-            auto* engine = ReplayEngine::get();
-            uint64_t seedBase = engine ? engine->macroSetupSeed() : 100ULL;
+            uint64_t seedBase = 100ULL;
+            if (auto* engine = ReplayEngine::get()) {
+                seedBase = engine->macroSetupSeed();
+            }
             m_fields->m_advRandomState = seedBase ^ (static_cast<uint64_t>(m_uniqueID) * 2137ULL);
         }
 

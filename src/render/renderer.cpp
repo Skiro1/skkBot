@@ -1,9 +1,13 @@
-﻿#include "renderer.hpp"
+#include "renderer.hpp"
+
+#include "core/hotpath.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
@@ -15,8 +19,10 @@
 #include <Geode/cocos/shaders/ccGLStateCache.h>
 
 #include "../skkBot.hpp"
+#include "../core/paths.hpp"
 #include "../logger/logger.hpp"
 #include "audiocap.hpp"
+#include "hwprobe.hpp"
 #include "../hacks/physicsbypass.hpp"
 
 using namespace geode::prelude;
@@ -389,17 +395,93 @@ Renderer::~Renderer() {
     mRecording.store(false);
 }
 
+// Where the renderer looks for the FFmpeg DLLs, in order. The save-dir drop-in
+// comes first on purpose:
+//   * `geode/unzipped/<id>/resources/<id>` (Mod::get()->getResourcesDir()) is
+//     where Geode unpacks the copy bundled inside the .geode -- but that whole
+//     tree is DELETED when the game exits (LoaderImpl removes getModRuntimeDir
+//     on unload), so it is a moving target: users cannot put a file there and
+//     expect it to survive, and one failed unpack leaves nothing at all;
+//   * `geode/mods/<id>/ffmpeg` is a plain folder next to replays/ and videos/,
+//     which is what the RENDER tab's folder button opens and what a user can
+//     actually find.
+// The resources dir stays as the second candidate so a mod update that ships
+// the DLLs keeps working without any manual step.
+std::vector<std::filesystem::path> Renderer::ffmpegSearchPaths() {
+    return skkbot2::paths::ffmpegSearchPaths();
+}
+
+std::filesystem::path Renderer::preferredFfmpegDir() {
+    return skkbot2::paths::ffmpeg();
+}
+
+// Creates the drop-in folder and leaves a note in it. A user who was told "put
+// the DLLs into geode/unzipped/..." has nowhere to look: that tree only exists
+// while the game runs. This folder sits next to replays/ and videos/, is opened
+// by the RENDER tab's folder button, and is the FIRST place the loader checks.
+void Renderer::prepareFfmpegDropIn() {
+    std::error_code ec;
+    const auto dir = preferredFfmpegDir();
+    std::filesystem::create_directories(dir, ec);
+    const auto note = dir / "README.txt";
+    if (std::filesystem::exists(note, ec)) {
+        return;
+    }
+    std::ofstream out(note, std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    out << "FFmpeg DLLs for the skkBot renderer\n"
+           "==================================\n\n"
+           "Target folder for the 7 FFmpeg DLLs:\n"
+           "  avutil-61.dll\n"
+           "  swresample-7.dll\n"
+           "  swscale-10.dll\n"
+           "  avcodec-63.dll\n"
+           "  avformat-63.dll\n"
+           "  avfilter-12.dll\n"
+           "  avdevice-63.dll\n\n"
+           "You can download them automatically in the RENDER tab (press DOWNLOAD FFMPEG),\n"
+           "or download dll.zip manually and extract the files directly here.\n\n"
+           "Download mirrors:\n"
+           "  - Codeberg: https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip\n"
+           "  - GitHub:   https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip\n\n"
+           "After placing the files, click RELOAD FFMPEG in the RENDER tab.\n";
+}
+
 bool Renderer::loadFFmpeg() {
     if (m_ffLoaded) {
         return true;
     }
-    std::string dir = Mod::get()->getResourcesDir().string();
-    if (!ffLoadFunctions(&m_ff, dir, m_error)) {
+    prepareFfmpegDropIn();
+    // Every candidate is tried and logged: "FFmpeg does not work" without the
+    // list of places that were checked is exactly the report that made this
+    // audit necessary.
+    std::string lastError;
+    for (auto const& dir : ffmpegSearchPaths()) {
+        if (!ffLoadFunctions(&m_ff, dir, lastError)) {
+            skkbot2::log::info("[RENDER] FFmpeg not in {}: {}", skk::pathToUtf8(dir),
+                               lastError);
+            continue;
+        }
+        m_ffLoaded = true;
+        m_ffDir = dir;
+        skkbot2::log::info("[RENDER] FFmpeg loaded from {}", skk::pathToUtf8(dir));
+        break;
+    }
+    if (!m_ffLoaded) {
+        m_error = lastError.empty() ? std::string("FFmpeg not found")
+                                    : lastError;
         skkbot2::log::error("[RENDER] {}", m_error);
         return false;
     }
-    m_ffLoaded = true;
-    skkbot2::log::info("[RENDER] FFmpeg loaded from {}", dir);
+
+    // One line, once per session: could a zero-copy GPU->NVENC path exist here?
+    // Purely informational - nothing consumes it yet and no UI is wired up.
+    // cuda is NOT universal, which is exactly why a future toggle must default
+    // OFF, and the honest way to know is to look rather than assume.
+    skkbot2::log::info("[RENDER] hw probe: {}",
+                       hwProbeLine(probeHwFrames(m_ffDir)));
 
     // Enumerate available encoders once (used by the GUI combo), keeping only
     // a curated short-list (software + the three hardware GPU families).
@@ -464,68 +546,26 @@ bool Renderer::startEncoder(const std::string& outPath) {
         m_error = "avcodec_alloc_context3 failed: " + m_encoderSel;
         return false;
     }
-    mCtx->codec_id = mCodec->id;
-    mCtx->width = static_cast<int>(mWidth);
-    mCtx->height = static_cast<int>(mHeight);
-    // NV12 is the native capture format (matches the GPU pipeline). Encoders
-    // that reject it (software x265/AV1/VP9/mpeg4/mjpeg/prores) get a
-    // swscale-based NV12 -> YUV420P conversion; the frames fed to the codec
-    // always match the pinned format.
-    mCtx->pix_fmt = AV_PIX_FMT_NV12;
-    mCtx->time_base = AVRational{1, mFps};
-    mCtx->framerate = AVRational{mFps, 1};
-    mCtx->max_b_frames = 0;  // b-frames hurt realtime preview
-    mCtx->gop_size = mFps * 2;
-    mCtx->bit_rate = static_cast<int64_t>(mBitrateMbps) * 1000000LL;
-    // Cap the output tightly: rc_max_rate == bit_rate makes NVENC run in
-    // CBR mode (the target is hit exactly, same as xdBot's renders).
-    // The VBV buffer is half a second so bitrate spikes stay near the
-    // target instead of ballooning to ~2x (measured with a 1s buffer).
-    // libx264 keeps a small headroom so ABR doesn't overshoot wildly on
-    // complex content (measured 48 Mbps from a 20 Mbps target).
-    if (mCodec->name && std::string(mCodec->name).find("nvenc") != std::string::npos) {
-        mCtx->rc_max_rate = mCtx->bit_rate;
-        mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate / 2);
-    } else {
-        mCtx->rc_max_rate = mCtx->bit_rate * 12 / 10;
-        mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate);
-    }
-    mCtx->color_primaries = AVCOL_PRI_BT709;
-    mCtx->color_trc = AVCOL_TRC_BT709;
-    mCtx->colorspace = AVCOL_SPC_BT709;
-    mCtx->color_range = AVCOL_RANGE_MPEG;
-    if (mFmt->oformat->flags & AVFMT_GLOBALHEADER) {
-        mCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
+    std::string cname = mCodec->name ? mCodec->name : "";
+    bool isNvenc = (cname.find("nvenc") != std::string::npos);
 
-    AVDictionary* opts = nullptr;
-    std::string cname = mCodec->name;
-    if (cname.find("nvenc") != std::string::npos) {
-        m_ff.av_dict_set(&opts, "preset", "p4", 0);  // balanced speed/quality
-    } else if (cname == "libx264" || cname == "libx265") {
-        m_ff.av_dict_set(&opts, "threads", "8", 0);
-    }
-    ret = m_ff.avcodec_open2(mCtx, mCodec, &opts);
-    m_ff.av_dict_free(&opts);
-    if (ret < 0) {
-        // The codec refused NV12 — retry with YUV420P + swscale conversion.
-        m_ff.avcodec_free_context(&mCtx);
-        mCtx = m_ff.avcodec_alloc_context3(mCodec);
-        if (!mCtx) {
-            m_error = "avcodec_alloc_context3 failed: " + m_encoderSel;
-            return false;
-        }
+    auto fillContext = [&](bool cbr) {
         mCtx->codec_id = mCodec->id;
-        mCtx->width = static_cast<int>(mWidth);
-        mCtx->height = static_cast<int>(mHeight);
-        mCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+        mCtx->width = static_cast<int>(mWidth & ~1);
+        mCtx->height = static_cast<int>(mHeight & ~1);
+        mCtx->pix_fmt = AV_PIX_FMT_NV12;
         mCtx->time_base = AVRational{1, mFps};
         mCtx->framerate = AVRational{mFps, 1};
-        mCtx->max_b_frames = 0;
-        mCtx->gop_size = mFps * 2;
+        mCtx->max_b_frames = 0;  // b-frames hurt realtime preview
+        mCtx->gop_size = mFps;
         mCtx->bit_rate = static_cast<int64_t>(mBitrateMbps) * 1000000LL;
-        mCtx->rc_max_rate = mCtx->bit_rate * 12 / 10;
-        mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate);
+        if (cbr) {
+            mCtx->rc_max_rate = mCtx->bit_rate;
+            mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate);
+        } else {
+            mCtx->rc_max_rate = mCtx->bit_rate * 12 / 10;
+            mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate);
+        }
         mCtx->color_primaries = AVCOL_PRI_BT709;
         mCtx->color_trc = AVCOL_TRC_BT709;
         mCtx->colorspace = AVCOL_SPC_BT709;
@@ -533,55 +573,179 @@ bool Renderer::startEncoder(const std::string& outPath) {
         if (mFmt->oformat->flags & AVFMT_GLOBALHEADER) {
             mCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         }
-        AVDictionary* opts2 = nullptr;
-        if (cname == "libx264" || cname == "libx265") {
-            m_ff.av_dict_set(&opts2, "threads", "8", 0);
+    };
+
+    if (isNvenc) {
+        struct NvencOpt {
+            const char* preset;
+            bool cbr;
+            bool gpuAny;
+        };
+        const NvencOpt attempts[] = {
+            { "p4",      true,  true },  // 1: Modern balanced preset + CBR + GPU probe
+            { "medium",  true,  true },  // 2: Universal SDK preset + CBR + GPU probe
+            { "default", false, true },  // 3: Default preset + VBR + GPU probe
+            { nullptr,   false, false }  // 4: Minimal barebones fallback
+        };
+
+        bool opened = false;
+        std::string lastErr;
+        for (size_t att = 0; att < sizeof(attempts) / sizeof(attempts[0]); ++att) {
+            if (att > 0) {
+                m_ff.avcodec_free_context(&mCtx);
+                mCtx = m_ff.avcodec_alloc_context3(mCodec);
+                if (!mCtx) break;
+            }
+            fillContext(attempts[att].cbr);
+            AVDictionary* opts = nullptr;
+            if (attempts[att].preset) {
+                m_ff.av_dict_set(&opts, "preset", attempts[att].preset, 0);
+            }
+            if (attempts[att].gpuAny) {
+                m_ff.av_dict_set(&opts, "gpu", "any", 0);
+            }
+            clearLastFfLogMsg();
+            ret = m_ff.avcodec_open2(mCtx, mCodec, &opts);
+            m_ff.av_dict_free(&opts);
+            if (ret >= 0) {
+                opened = true;
+                if (att > 0) {
+                    skkbot2::log::info("[RENDER] NVENC initialized on fallback attempt {} (preset={})",
+                                       att + 1, attempts[att].preset ? attempts[att].preset : "barebones");
+                }
+                break;
+            }
+            std::string ffMsg = getLastFfLogMsg();
+            lastErr = !ffMsg.empty() ? ffMsg : ffErrString(&m_ff, ret);
+            skkbot2::log::warn("[RENDER] NVENC init attempt {} (preset={}, cbr={}) failed: {} (ret={})",
+                               att + 1, attempts[att].preset ? attempts[att].preset : "none",
+                               attempts[att].cbr, lastErr, ret);
         }
-        ret = m_ff.avcodec_open2(mCtx, mCodec, &opts2);
-        m_ff.av_dict_free(&opts2);
+
+        if (!opened) {
+            m_ff.avcodec_free_context(&mCtx);
+            mCtx = nullptr;
+            mCodec = nullptr;
+            m_error = "NVENC (" + m_encoderSel + ") failed to initialize: " + lastErr;
+            if (m_encoderSel == "hevc_nvenc") {
+                m_error += " [Try h264_nvenc or libx264]";
+            }
+            skkbot2::log::error("[RENDER] {}", m_error);
+            return false;
+        }
+    } else {
+        auto applyCodecOpts = [&](AVDictionary** dict) {
+            const bool isQsv = cname.find("qsv") != std::string::npos;
+            const bool isAmf = cname.find("amf") != std::string::npos;
+            if (isQsv) {
+                m_ff.av_dict_set(dict, "preset", "veryfast", 0);
+                m_ff.av_dict_set(dict, "async_depth", "4", 0);
+            } else if (isAmf) {
+                m_ff.av_dict_set(dict, "quality", "speed", 0);
+                m_ff.av_dict_set(dict, "usage", "lowlatency", 0);
+            } else if (cname == "libx264" || cname == "libx265") {
+                m_ff.av_dict_set(dict, "preset", "veryfast", 0);
+                m_ff.av_dict_set(dict, "threads", "8", 0);
+            }
+        };
+
+        fillContext(false);
+        AVDictionary* opts = nullptr;
+        applyCodecOpts(&opts);
+        clearLastFfLogMsg();
+        ret = m_ff.avcodec_open2(mCtx, mCodec, &opts);
+        m_ff.av_dict_free(&opts);
         if (ret < 0) {
-            std::string err = ffErrString(&m_ff, ret);
-            m_ff.avcodec_free_context(&mCtx);
-            mCtx = nullptr;
-            mCodec = nullptr;
-            m_error = "encoder failed to initialize: " + m_encoderSel +
-                      " (NV12 and YUV420P both rejected: " + err + ")";
-            return false;
+            // If specialized opts failed, retry barebones
+            AVDictionary* bareOpts = nullptr;
+            if (cname == "libx264" || cname == "libx265") {
+                m_ff.av_dict_set(&bareOpts, "threads", "8", 0);
+            }
+            clearLastFfLogMsg();
+            ret = m_ff.avcodec_open2(mCtx, mCodec, &bareOpts);
+            m_ff.av_dict_free(&bareOpts);
         }
-        m_sws = m_ff.sws_getContext(
-            static_cast<int>(mWidth), static_cast<int>(mHeight), AV_PIX_FMT_NV12,
-            static_cast<int>(mWidth), static_cast<int>(mHeight), AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!m_sws) {
-            m_error = "sws_getContext failed (NV12 -> YUV420P)";
+        if (ret < 0) {
+            // The codec refused NV12 — retry with YUV420P + swscale conversion.
             m_ff.avcodec_free_context(&mCtx);
-            mCtx = nullptr;
-            mCodec = nullptr;
-            return false;
-        }
-        m_convFrame = m_ff.av_frame_alloc();
-        if (!m_convFrame) {
-            m_error = "conversion frame alloc";
-            m_ff.avcodec_free_context(&mCtx);
-            mCtx = nullptr;
-            mCodec = nullptr;
-            m_ff.sws_freeContext(m_sws);
-            m_sws = nullptr;
-            return false;
-        }
-        m_convFrame->format = AV_PIX_FMT_YUV420P;
-        m_convFrame->width = static_cast<int>(mWidth);
-        m_convFrame->height = static_cast<int>(mHeight);
-        if (m_ff.av_frame_get_buffer(m_convFrame, 32) < 0) {
-            m_error = "conversion frame buffer alloc";
-            m_ff.avcodec_free_context(&mCtx);
-            mCtx = nullptr;
-            mCodec = nullptr;
-            m_ff.sws_freeContext(m_sws);
-            m_sws = nullptr;
-            m_ff.av_frame_free(&m_convFrame);
-            m_convFrame = nullptr;
-            return false;
+            mCtx = m_ff.avcodec_alloc_context3(mCodec);
+            if (!mCtx) {
+                m_error = "avcodec_alloc_context3 failed: " + m_encoderSel;
+                return false;
+            }
+            mCtx->codec_id = mCodec->id;
+            mCtx->width = static_cast<int>(mWidth & ~1);
+            mCtx->height = static_cast<int>(mHeight & ~1);
+            mCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+            mCtx->time_base = AVRational{1, mFps};
+            mCtx->framerate = AVRational{mFps, 1};
+            mCtx->max_b_frames = 0;
+            mCtx->gop_size = mFps;
+            mCtx->bit_rate = static_cast<int64_t>(mBitrateMbps) * 1000000LL;
+            mCtx->rc_max_rate = mCtx->bit_rate * 12 / 10;
+            mCtx->rc_buffer_size = static_cast<int>(mCtx->bit_rate);
+            mCtx->color_primaries = AVCOL_PRI_BT709;
+            mCtx->color_trc = AVCOL_TRC_BT709;
+            mCtx->colorspace = AVCOL_SPC_BT709;
+            mCtx->color_range = AVCOL_RANGE_MPEG;
+            if (mFmt->oformat->flags & AVFMT_GLOBALHEADER) {
+                mCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+            AVDictionary* opts2 = nullptr;
+            applyCodecOpts(&opts2);
+            clearLastFfLogMsg();
+            ret = m_ff.avcodec_open2(mCtx, mCodec, &opts2);
+            m_ff.av_dict_free(&opts2);
+            if (ret < 0) {
+                AVDictionary* bareOpts2 = nullptr;
+                if (cname == "libx264" || cname == "libx265") {
+                    m_ff.av_dict_set(&bareOpts2, "threads", "8", 0);
+                }
+                clearLastFfLogMsg();
+                ret = m_ff.avcodec_open2(mCtx, mCodec, &bareOpts2);
+                m_ff.av_dict_free(&bareOpts2);
+            }
+            if (ret < 0) {
+                std::string ffMsg = getLastFfLogMsg();
+                std::string err = !ffMsg.empty() ? ffMsg : ffErrString(&m_ff, ret);
+                m_ff.avcodec_free_context(&mCtx);
+                mCtx = nullptr;
+                mCodec = nullptr;
+                m_error = "encoder failed to initialize: " + m_encoderSel + " (" + err + ")";
+                return false;
+            }
+            m_sws = m_ff.sws_getContext(
+                static_cast<int>(mWidth), static_cast<int>(mHeight), AV_PIX_FMT_NV12,
+                static_cast<int>(mWidth), static_cast<int>(mHeight), AV_PIX_FMT_YUV420P,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!m_sws) {
+                m_error = "sws_getContext failed (NV12 -> YUV420P)";
+                m_ff.avcodec_free_context(&mCtx);
+                mCtx = nullptr;
+                mCodec = nullptr;
+                return false;
+            }
+            m_convFrame = m_ff.av_frame_alloc();
+            if (!m_convFrame) {
+                m_error = "av_frame_alloc failed for YUV420P conversion frame";
+                m_ff.avcodec_free_context(&mCtx);
+                mCtx = nullptr;
+                mCodec = nullptr;
+                return false;
+            }
+            m_convFrame->format = AV_PIX_FMT_YUV420P;
+            m_convFrame->width = static_cast<int>(mWidth);
+            m_convFrame->height = static_cast<int>(mHeight);
+            ret = m_ff.av_frame_get_buffer(m_convFrame, 32);
+            if (ret < 0) {
+                m_error = "av_frame_get_buffer failed: " + ffErrString(&m_ff, ret);
+                m_ff.av_frame_free(&m_convFrame);
+                m_convFrame = nullptr;
+                m_ff.avcodec_free_context(&mCtx);
+                mCtx = nullptr;
+                mCodec = nullptr;
+                return false;
+            }
         }
     }
     mUsingNvenc = (cname.find("nvenc") != std::string::npos);
@@ -612,9 +776,12 @@ bool Renderer::startEncoder(const std::string& outPath) {
         }
     }
 
+    clearLastFfLogMsg();
     ret = m_ff.avio_open(&mFmt->pb, outPath.c_str(), AVIO_FLAG_WRITE);
     if (ret < 0) {
-        m_error = "avio_open: " + ffErrString(&m_ff, ret);
+        std::string ffMsg = getLastFfLogMsg();
+        m_error = "avio_open: " + (!ffMsg.empty() ? ffMsg : ffErrString(&m_ff, ret));
+        skkbot2::log::error("[RENDER] avio_open failed for '{}': {} (ret={})", outPath, m_error, ret);
         return false;
     }
 
@@ -678,12 +845,13 @@ bool Renderer::startEncoder(const std::string& outPath) {
     return true;
 }
 
-void Renderer::encodeOneFrame(uint8_t* nv12, int64_t pts) {
+void Renderer::encodeOneFrame(const uint8_t* nv12, int64_t pts, bool alreadyOwned) {
     if (!mPkt || !mCtx || !mFmt) {
         return;
     }
 
     auto drainPackets = [this]() {
+        const double drainT0 = nowS();
         while (true) {
             int ret = m_ff.avcodec_receive_packet(mCtx, mPkt);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -715,6 +883,7 @@ void Renderer::encodeOneFrame(uint8_t* nv12, int64_t pts) {
             }
             m_ff.av_packet_unref(mPkt);
         }
+        m_encDrainMs += (nowS() - drainT0) * 1e3;
     };
 
     // NV12 planes come straight from the GPU capture pipeline (already
@@ -725,27 +894,56 @@ void Renderer::encodeOneFrame(uint8_t* nv12, int64_t pts) {
     if (!f) {
         return;
     }
-    // Copy the ring slot's NV12 data into the frame's own buffer BEFORE the
-    // slot is released. If NVENC still holds a reference (async copy in
-    // flight), make_writable allocates a fresh buffer for the next frame
-    // instead of reusing it вЂ” the data the codec is reading can never be
-    // overwritten.
+    // Copy the grabbed NV12 into the frame's own buffer BEFORE the slot is
+    // released. If NVENC still holds a reference (async copy in flight),
+    // make_writable allocates a fresh buffer for the next frame instead of
+    // reusing it вЂ” the data the codec is reading can never be overwritten.
+    //
+    // `nv12` points straight into a mapped PBO slot rather than into a ring
+    // buffer of our own. The main thread USED to memcpy out of that mapping
+    // into a ring buffer, and this used to memcpy the ring buffer in here -
+    // two copies of the same bytes, one of them on the thread that also owns
+    // GD's physics. There is one now, and it is here. `alreadyOwned` says the
+    // caller already copied (the sync-readback fallback, which has to: the GL
+    // context is on the main thread and nowhere else).
     if (m_ff.av_frame_make_writable(f) < 0) {
         skkbot2::log::error("[RENDER] av_frame_make_writable failed вЂ” frame "
                             "dropped");
         return;
     }
-    // Row-wise copy: robust against linesize padding from av_frame_get_buffer
-    // alignment (all GUI resolutions are 16:9 multiples of 64, so in practice
-    // linesize == width, but this stays correct either way).
-    for (int r = 0; r < static_cast<int>(mHeight); r++) {
-        std::memcpy(f->data[0] + static_cast<size_t>(r) * f->linesize[0],
-                    nv12 + static_cast<size_t>(r) * mWidth, mWidth);
-    }
-    for (int r = 0; r < static_cast<int>(mHeight) / 2; r++) {
-        std::memcpy(f->data[1] + static_cast<size_t>(r) * f->linesize[1],
-                    nv12 + ySize + static_cast<size_t>(r) * mWidth, mWidth);
-    }
+// The row-wise loop cost one memcpy call per row of both planes: at 4K
+      // that is 2160 + 1080 = 3240 calls per frame to move 12.4 MB. glReadPixels
+      // returns tightly packed rows with no padding (GL_PACK_ALIGNMENT is 1 for
+      // the capture), and av_frame_get_buffer(f, 32) only pads linesize up to a
+      // multiple of 32 - which every render resolution already is (3840, 2560,
+      // 1920, 1280 are all multiples of 32). So the two planes are contiguous
+      // and one memcpy each does the whole job.
+      //
+      // Verified against the log rather than assumed: linesize is not what we
+      // set at line 670, it is what get_buffer computed afterwards, so the
+      // equality is CHECKED, not assumed. The row-wise path stays as the
+      // fallback for a resolution or alignment that breaks it.
+      const double copyT0 = nowS();
+      if (alreadyOwned) {
+          // Nothing to do: nv12 already IS the buffer the encoder must read.
+          // m_encCopyMs stays untouched rather than recording a fake zero.
+      } else if (f->linesize[0] == static_cast<int>(mWidth) &&
+          f->linesize[1] == static_cast<int>(mWidth)) {
+          std::memcpy(f->data[0], nv12, ySize);
+          std::memcpy(f->data[1], nv12 + ySize, ySize / 2);
+      } else {
+          for (int r = 0; r < static_cast<int>(mHeight); r++) {
+              std::memcpy(f->data[0] + static_cast<size_t>(r) * f->linesize[0],
+                          nv12 + static_cast<size_t>(r) * mWidth, mWidth);
+          }
+          for (int r = 0; r < static_cast<int>(mHeight) / 2; r++) {
+              std::memcpy(f->data[1] + static_cast<size_t>(r) * f->linesize[1],
+                          nv12 + ySize + static_cast<size_t>(r) * mWidth, mWidth);
+          }
+      }
+      if (!alreadyOwned) {
+          m_encCopyMs += (nowS() - copyT0) * 1e3;
+      }
     // Strict sequential pts (frame units): the codec and the muxer then see a
     // perfectly uniform 1/mFps grid from pts 0, so the output is EXACTLY the
     // configured fps. (See m_videoPts comment in renderer.hpp.)
@@ -758,10 +956,12 @@ void Renderer::encodeOneFrame(uint8_t* nv12, int64_t pts) {
     // single reusable m_convFrame can never be read while it is rewritten.
     AVFrame* sendF = f;
     if (m_sws && m_convFrame) {
+        const double swsT0 = nowS();
         m_ff.sws_scale(m_sws,
                        reinterpret_cast<const uint8_t* const*>(f->data),
                        f->linesize, 0, static_cast<int>(mHeight),
                        m_convFrame->data, m_convFrame->linesize);
+        m_encSwsMs += (nowS() - swsT0) * 1e3;
         m_convFrame->pts = sentPts;
         sendF = m_convFrame;
     }
@@ -771,18 +971,26 @@ void Renderer::encodeOneFrame(uint8_t* nv12, int64_t pts) {
     // frame, never spin forever.
     drainPackets();
     int sendRet = 0;
+    // send_frame is timed separately from the drains it triggers, otherwise a
+    // full codec queue would show up as "send is slow" when the cost was the
+    // packets leaving. The delta on m_encDrainMs isolates the two.
+    const double sendT0 = nowS();
+    const double drainBefore = m_encDrainMs;
     for (int attempt = 0; attempt < 500; attempt++) {
         sendRet = m_ff.avcodec_send_frame(mCtx, sendF);
         if (sendRet == 0) {
             break;
         }
         if (sendRet == AVERROR(EAGAIN)) {
+            m_encEagain++;
             drainPackets();
             continue;
         }
         skkbot2::log::error("[RENDER] send_frame: {}", ffErrString(&m_ff, sendRet));
+        m_encSendMs += (nowS() - sendT0) * 1e3 - (m_encDrainMs - drainBefore);
         return;
     }
+    m_encSendMs += (nowS() - sendT0) * 1e3 - (m_encDrainMs - drainBefore);
     if (sendRet == AVERROR(EAGAIN)) {
         skkbot2::log::error("[RENDER] send_frame stayed EAGAIN вЂ” frame dropped");
         return;
@@ -1237,7 +1445,7 @@ bool Renderer::begin(PlayLayer* layer) {
     }
 
     namespace fs = std::filesystem;
-    auto vidDir = Mod::get()->getSaveDir() / "videos";
+    auto vidDir = skkbot2::paths::videos();
     std::error_code ec;
     fs::create_directories(vidDir, ec);
 
@@ -1250,12 +1458,26 @@ bool Renderer::begin(PlayLayer* layer) {
     std::string levelName = layer->m_level ? layer->m_level->m_levelName
                                            : std::string("level");
     for (auto& ch : levelName) {
-        if (ch == ' ' || ch == '/' || ch == '\\' || ch == ':' || ch == '*' ||
+        if (static_cast<unsigned char>(ch) < 32 ||
+            ch == ' ' || ch == '/' || ch == '\\' || ch == ':' || ch == '*' ||
             ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|') {
             ch = '_';
         }
     }
-    std::string outPath = (vidDir / (levelName + "_" + tbuf + ".mp4")).string();
+    while (!levelName.empty() && (levelName.back() == ' ' || levelName.back() == '.')) {
+        levelName.pop_back();
+    }
+    if (levelName.empty()) {
+        levelName = "level";
+    }
+    if (levelName.size() > 64) {
+        levelName.resize(64);
+    }
+    std::string filename = levelName + "_" + tbuf + ".mp4";
+    fs::path fullOutPath = vidDir / skk::stringToPath(filename);
+    fs::create_directories(fullOutPath.parent_path(), ec);
+
+    std::string outPath = skk::pathToUtf8(fullOutPath);
     m_lastOutputPath = outPath;
 
     // Seed the runtime audio latch from the SETTING. m_audioEnabled is the
@@ -1293,19 +1515,40 @@ bool Renderer::begin(PlayLayer* layer) {
     // handles stopped-channel restart. Empirically this is what makes the
     // difference between silence and audible output.
     if (auto* pl = PlayLayer::get()) {
-        if (pl->m_musicPrepared) {
-            pl->startMusic();
-            if (auto* engine = FMODAudioEngine::get()) {
-                engine->startMusic(0, 0, 0, 0, false, getLastMusicId(),
-                                   false, false);
+if (pl->m_musicPrepared) {
+        pl->startMusic();
+        if (auto* engine = FMODAudioEngine::get()) {
+            const int musicId = getLastMusicId();
+            // Our music-ID hooks only see loadAndPlayMusic / queueStartMusic /
+            // loadMusic. If the level got its track prepared through some other
+            // path, m_musicPrepared is true while s_lastMusicId is still 0 -
+            // and startMusic(..., musicID=0) then asks GD for a channel that
+            // was never set up. The crash that motivated this guard was an
+            // EXCEPTION_ACCESS_VIOLATION inside FMOD's own file thread, at
+            // FMOD_Debug_Initialize, on exactly that run.
+            //
+            // Not treated as proof: two renders with audio completed fine
+            // before it, so the trigger is a state race, not a constant. The
+            // guard removes the one call that logged an obviously invalid
+            // argument; if the crash survives it, the remaining suspects are
+            // setDSPBufferSize(1024, 2) on the live system and addDSP on the
+            // 8-channel mixer, and they get disabled one at a time.
+            if (musicId <= 0) {
+                armMusicRestart();
+                skkbot2::log::warn(
+                    "[RENDER] audio kick: musicID unknown - startMusic skipped, "
+                    "deferred restart armed");
+            } else {
+                engine->startMusic(0, 0, 0, 0, false, musicId, false, false);
                 engine->pauseAllAudio();
                 engine->resumeAllAudio();
                 engine->m_allAudioPaused = false;
                 skkbot2::log::info("[RENDER] audio kick: start+pause/resume "
                                    "from 0 (musicID={})",
-                                   getLastMusicId());
+                                   musicId);
             }
-        } else {
+        }
+    } else {
             armMusicRestart();
             skkbot2::log::info("[RENDER] audio kick: song not prepared — "
                                "deferred restart armed");
@@ -1320,6 +1563,7 @@ bool Renderer::begin(PlayLayer* layer) {
             AudioCapture::get().detach();
             m_audioEnabled = false;
         }
+        disarmMusicRestart();
         return false;
     }
 
@@ -1341,12 +1585,11 @@ bool Renderer::begin(PlayLayer* layer) {
 
     mCapture.init(mWidth, mHeight);
 
-    // Allocate the ring of NV12 buffers (one full frame each).
-    size_t frameSize = static_cast<size_t>(mWidth) * mHeight * 3 / 2;
-    m_ring.resize(RING_SIZE);
-    for (auto& buf : m_ring) {
-        buf.resize(frameSize);
-    }
+    // The ring carries frame DESCRIPTORS only - a pointer into a mapped PBO
+    // slot plus the slot index - so there is no per-slot buffer to allocate
+    // here any more. That also retires 6 x 24.9 MB (150 MB at 4K) of VRAM/RAM
+    // that existed only to be memcpy'd through once per frame.
+    m_ring.assign(RING_SIZE, RingEntry{});
     m_ringPts.assign(RING_SIZE, -1);
     m_rd = 0;
     m_wr = 0;
@@ -1374,10 +1617,50 @@ bool Renderer::begin(PlayLayer* layer) {
     m_stepCount = 0;
     m_grabFailTotal = 0;
     m_pendingDrops = 0;
+    mClockTick = 0;
+    mFrameTicksMin = 0;
+    mFrameTicksMax = 0;
+    mClockAskedSum = 0;
+    mClockDoneSum = 0;
+    mClockMismatch = 0;
+    mClockZeroFrames = 0;
+    mClockCapHits = 0;
+    mClockStallFrames = 0;
+    mClockLogs = 0;
+    mPboGateFrames = 0;
+    mBatchCalls = 0;
+    mBatchProduced = 0;
+    mBatchDeliveredFull = 0;
+    mBatchStopDrive = 0;
+    mBatchStopDraw = 0;
     m_grabMs = 0.0;
     m_grabN = 0;
+    m_grabMaxMs = 0.0;
+    m_grabMaxPts = 0;
+    for (double& v : m_stageMs) {
+        v = 0.0;
+    }
     m_lastStatsWall = 0.0;
     m_firstCaptureLogged = false;
+    // Encoder stage accumulators, same bug class as FboCapture::m_visitN (fixed
+    // 18.10.2026): these were never reset either, so the SECOND render of a
+    // session reported the first render's numbers PLUS its own.
+    //
+    // Not a subtle inflation. Stereo Madness at 4K on 2026-10-18 reported
+    // copy + send + drain = 103.5s of work inside a thread that lived 48.6s -
+    // 213% of a thread, arithmetically impossible. Subtracting GRIEF's run from
+    // the cumulative totals gives 47.8s, i.e. 98% of the thread, and that is
+    // the real number. Every encoder figure quoted for a second or later render
+    // before this fix was wrong by exactly the previous render's contribution.
+    m_encCopyMs = 0.0;
+    m_encSwsMs = 0.0;
+    m_encSendMs = 0.0;
+    m_encDrainMs = 0.0;
+    m_encEagain = 0;
+    // Every render starts at batch=3 for fast initial throughput and re-probes.
+    m_batchLimit = 3;
+    m_batchFullStreak = 0;
+    m_batchShortStreak = 0;
     m_pauseLogged = false;
     // The render drive feeds the scheduler 1/fps through the SAME step-grid
     // pipeline the macro was recorded on (SpeedControlScheduler ->
@@ -1399,15 +1682,20 @@ bool Renderer::begin(PlayLayer* layer) {
                            ? (std::string(", audio ") + m_audioCodecUsed +
                               " " + std::to_string(m_audioBitrate) + " kbps")
                            : "");
+    // No render-session flag any more (removed 19.10.2026 with logs/render.txt):
+    // every diagnostic line now goes wherever every other line goes and follows
+    // the same file-logging switch. The hot-path rows printed below are the
+    // reason this was worth a second look - they carry no [RENDER] prefix, so a
+    // prefix-based mirror used to drop exactly them.
     return true;
 }
 
-uint8_t* Renderer::tryAcquireSlot() {
+bool Renderer::tryAcquireSlot() {
     std::lock_guard lk(m_qMu);
     if (m_qClosed || (m_wr + 1) % RING_SIZE == m_rd) {
-        return nullptr;
+        return false;
     }
-    return m_ring[m_wr].data();
+    return true;
 }
 
 bool Renderer::ringFull() {
@@ -1415,9 +1703,10 @@ bool Renderer::ringFull() {
     return (m_wr + 1) % RING_SIZE == m_rd;
 }
 
-void Renderer::commitSlot(int64_t pts) {
+void Renderer::commitSlot(const render::GrabResult& frame, int64_t pts) {
     {
         std::lock_guard lk(m_qMu);
+        m_ring[m_wr] = RingEntry{frame.data, frame.slot, frame.preCopied};
         m_ringPts[m_wr] = pts;
         m_wr = (m_wr + 1) % RING_SIZE;
     }
@@ -1427,7 +1716,7 @@ void Renderer::commitSlot(int64_t pts) {
 void Renderer::encodeThreadMain() {
     m_encRunning.store(true);
     while (true) {
-        uint8_t* rgba = nullptr;
+        RingEntry entry;
         int64_t pts = 0;
         {
             std::unique_lock lk(m_qMu);
@@ -1437,11 +1726,20 @@ void Renderer::encodeThreadMain() {
             if (m_qClosed && m_rd == m_wr) {
                 break;
             }
-            rgba = m_ring[m_rd].data();
+            entry = m_ring[m_rd];
             pts = m_ringPts[m_rd];
             m_rd = (m_rd + 1) % RING_SIZE;
         }
-        encodeOneFrame(rgba, pts);
+        // The slot (or the fallback scratch buffer) stays ours until the copy
+        // out of it is done, and not one instruction longer. Releasing it in
+        // the next statement instead of at the top of the loop is deliberate:
+        // FboCapture reuses slots the instant this flag drops.
+        encodeOneFrame(entry.ptr, pts, entry.preCopied);
+        if (entry.slot >= 0) {
+            mCapture.releaseSlot(entry.slot);
+        } else if (entry.preCopied) {
+            mCapture.releaseSync();
+        }
         m_qCv.notify_one();
     }
     // Queue drained and closed: flush the codec + muxer and write the trailer.
@@ -1462,11 +1760,109 @@ void Renderer::encodeThreadMain() {
     m_qCv.notify_all();
 }
 
+namespace {
+// Accumulates elapsed time into a slot on scope exit, so every early return in
+// drive() is still measured. drive() bails out on pause, ring backpressure and
+// several safety nets - timing only the happy path would silently drop exactly
+// the frames where the stall lives.
+struct StageTimer {
+    double* acc;
+    double t0;
+    explicit StageTimer(double* a) : acc(a), t0(nowS()) {}
+    ~StageTimer() { *acc += nowS() - t0; }
+};
+} // namespace
+
 void Renderer::drive(GJBaseGameLayer* layer,
                      std::function<void(float)> stepOne) {
     if (!mRecording.load()) {
         return;
     }
+    m_driveCalls++;
+
+    // Batched capture. One drawScene used to mean exactly one video frame, so
+    // the wall frame rate - not the capture pipeline - decided how long the
+    // render took. Measured 2026-10-18 on a 180 Hz panel: Stereo Madness ran at
+    // driveHz=181 (frame 5.52ms = exactly the refresh period) while the video
+    // wanted 60 frames/s, i.e. two thirds of the wall frames existed only to
+    // wait for a vertical blank.
+    //
+    // Each extra frame costs one sim step to the pts boundary plus one
+    // renderSceneInto + NV12 + async readback, and nothing waits on the display
+    // in between, so the wait is what gets converted.
+    //
+    // Stop conditions, all of them "this frame could not be produced":
+    //   driveOneFrame false - ring full, level paused, level done, stop()
+    //   onFrameDraw false   - the capture itself could not be committed
+    // Both leave the sim at a boundary, so no pts is ever skipped.
+    int produced = 0;
+    for (int k = 0; k < m_batchLimit; ++k) {
+        if (!driveOneFrame(layer, stepOne)) {
+            ++mBatchStopDrive;
+            break;
+        }
+        // Capture NOW rather than leaving it to the ImGui callback at
+        // swapBuffers time: that callback runs once per drawScene, so leaving
+        // it there caps the batch at one no matter what m_batchLimit says.
+        //
+        // Safe to run inside drawScene because issueReadback() re-renders the
+        // scene into its own FBO. Afterwards drawPreview() blits that FBO to
+        // the window, so the operator watches the LAST frame of the batch -
+        // which is the newest state, not a stale one.
+        if (!onFrameDraw()) {
+            ++mBatchStopDraw;
+            break;
+        }
+        ++produced;
+    }
+    mBatchCalls++;
+    mBatchProduced += produced;
+    if (produced >= m_batchLimit && m_batchLimit > 0) {
+        ++mBatchDeliveredFull;
+    }
+
+    // Adapt the batch, with hysteresis on both edges.
+    //
+    // The first version reacted to every single drawScene and oscillated. On
+    // Stereo Madness (2026-10-18) batch walked 3 -> 5 -> 2 -> 2 -> 3 over five
+    // seconds while sitting right at the encoder's limit: one drawScene
+    // delivered its full batch, the next hit the full ring, and the pair of
+    // rules fought each other. The batch also decides how much work one wall
+    // frame does, so a limit that changes every frame is a wall frame that
+    // changes every frame.
+    //
+    // Grow only after kGrowStreak consecutive full drawScenes, shrink only after
+    // kShrinkStreak consecutive short ones. Both thresholds are in drawScenes,
+    // not seconds: on a level running at 100 driveHz that is 40ms of evidence
+    // before the limit moves, which is long enough to be a measurement and
+    // short enough to be invisible in a render.
+    const bool full = produced >= m_batchLimit && m_batchLimit > 0;
+    if (full) {
+        ++m_batchFullStreak;
+        m_batchShortStreak = 0;
+    } else if (m_batchLimit > 1) {
+        ++m_batchShortStreak;
+        m_batchFullStreak = 0;
+    }
+    if (m_batchShortStreak >= kShrinkStreak && m_batchLimit > 1) {
+        m_batchLimit = std::max(1, produced > 0 ? produced : m_batchLimit - 1);
+        m_batchShortStreak = 0;
+        m_batchFullStreak = 0;
+    } else if (full && m_batchFullStreak >= kGrowStreak &&
+               m_batchLimit < kBatchMax) {
+        ++m_batchLimit;
+        m_batchShortStreak = 0;
+        m_batchFullStreak = 0;
+    }
+}
+
+bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
+                             std::function<void(float)> stepOne) {
+    if (!mRecording.load()) {
+        return false;
+    }
+    StageTimer driveTimer(&m_stageMs[static_cast<int>(Stage::Drive)]);
+    m_stageStallPending = false;
     auto* pl = static_cast<PlayLayer*>(layer);
     // Silicate parity: feed the scheduler 1/fps (e.g. 1/60) — GD's own
     // getModifiedDelta quantises to the 240-Hz tick grid internally.
@@ -1474,39 +1870,43 @@ void Renderer::drive(GJBaseGameLayer* layer,
     // zero if the first fractional tick rounds down.
     const float simDt = 1.0f / static_cast<float>(mFps);
 
-    // Encoder backpressure (Silicat's tryBeginFrame): if every ring buffer is
-    // still being encoded, HOLD the sim at the current position instead of
-    // stepping (never block the main thread). The boundary is retried on the
-    // next wall frame, so no pts is ever lost and the render rate naturally
-    // caps at the encoder rate. If the ring stays full for ~30s of wall
-    // frames the encoder is dead (NVENC session or muxer failure) вЂ” abort
-    // instead of freezing the game forever.
-    if (ringFull()) {
+    // PBO pool is a SECOND reason to hold, and it is checked HERE on
+    // purpose. issueReadback() runs inside grab(), which runs AFTER the
+    // simulation has already stepped - a pool that turned out to be empty
+    // at that point would have advanced the sim without capturing it,
+    // i.e. a silently dropped frame. Asked before the step, it is just
+    // backpressure.
+    if (ringFull() || !mCapture.hasFreeSlot()) {
+        // Counted SEPARATELY, because these two mean opposite things. A full
+        // ring is the encoder being slow - known, handled, and capped. A full
+        // PBO pool is a gate this change introduced, and it is a NEW way for
+        // the render to lose throughput without saying so anywhere. The first
+        // render after 380b82e showed grab 2.6 -> 1.8 ms and the wall clock
+        // dead at 107.1 s, and the most likely explanation available is that
+        // this gate fires and eats the gain. That is a guess, and a counter is
+        // the difference between a guess and a measurement.
+        if (!ringFull()) {
+            ++mPboGateFrames;
+        }
         if (++mRingFullFrames > 60 * 30) {
             skkbot2::log::error(
                 "[RENDER] encoder stalled: capture ring full for ~30s вЂ” "
                 "aborting render");
             stop();
         }
-        return;
+        return false;
     }
     mRingFullFrames = 0;
-
-    auto ptsOfFrame = [&](uint64_t f) {
-        return static_cast<int64_t>(static_cast<double>(f - 1) *
-                                    static_cast<double>(mFps) / mTps);
-    };
 
     // Fast-forward render (same idea as Silicat): NO wall-clock pacing. Every
     // drive() call advances exactly one video frame's worth of sim
     // (mTps/mFps ticks) and queues one capture; the game loop runs uncapped
     // (~180Hz on this machine), so a 37.5s level renders in ~13s wall instead
     // of real-time. pts are derived from the sim tick count, so the video
-    // always plays at 1x regardless of the wall rate вЂ” speed only affects how
-    // long the render takes. Captures read the backbuffer right after the
-    // scene is drawn for this frame (onFrameDraw), so every frame is fresh вЂ”
-    // no re-sampling of a stale present like the old sync-grab in drive().
-    m_driveCalls++;
+    // always plays at 1x regardless of the wall rate — speed only affects how
+    // long the render takes. The capture no longer waits for the ImGui
+    // callback at swapBuffers: drive() calls onFrameDraw() itself, once per
+    // batched frame, right after this function queues the boundary.
     const double nowW = nowS();
     // Periodic diagnostics (~1 dump / 5s wall): render speed (level/wall вЂ”
     // >1x is fast-forward, expected), sim rate and drive rate.
@@ -1517,13 +1917,29 @@ void Renderer::drive(GJBaseGameLayer* layer,
         double speed = wall > 0.0 ? lvlT / wall : 0.0;
         skkbot2::log::info(
             "[RENDER] stats: wall={:.1f}s level={:.2f}s speed={:.2f}x "
-            "ticks={} tickRate={:.0f}/s driveHz={:.0f} captured={} "
+            "ticks={} tickRate={:.0f}/s driveHz={:.0f} batch={} captured={} "
             "encoded={} grabFails={} drops={} started={}",
             wall, lvlT, speed, m_stepCount,
             wall > 0.0 ? m_stepCount / wall : 0.0,
             wall > 0.0 ? static_cast<double>(m_driveCalls) / wall : 0.0,
+            m_batchLimit,
             mCapturedFrames.load(), mEncodedFrames.load(), m_grabFailTotal,
             m_pendingDrops, pl->m_started);
+        // Clock audit: ticks per captured frame is the number the judder lives
+        // in. A correct render has min/max within one tick of tps/fps, asked
+        // == done, and zero mismatches. Anything else is named here instead of
+        // being discovered in the finished video.
+        skkbot2::log::info(
+            "[RENDER] clock: ticks/frame {}..{} (ideal {:.2f}) asked={} "
+            "done={} mismatch={} zero={} capHits={} drops={}",
+            mFrameTicksMin, mFrameTicksMax,
+            static_cast<double>(mTps) / static_cast<double>(mFps),
+            mClockAskedSum, mClockDoneSum, mClockMismatch,
+            mClockZeroFrames, mClockCapHits, m_pendingDrops);
+        mFrameTicksMin = 0;
+        mFrameTicksMax = 0;
+        mClockAskedSum = 0;
+        mClockDoneSum = 0;
         if (speed < 0.85) {
             skkbot2::log::warn(
                 "[RENDER] render slower than real-time ({:.2f}x) вЂ” the "
@@ -1548,10 +1964,10 @@ void Renderer::drive(GJBaseGameLayer* layer,
         // just keeps grabbing fresh frames at video fps.
         if (mTrailerRemain <= 0.0) {
             stop();
-            return;
+            return false;
         }
         if (m_pendingFrame) {
-            return;  // previous trailer frame not drawn yet
+            return false;  // previous trailer frame not drawn yet
         }
         mLastPts++;
         m_pendingPts = mLastPts;
@@ -1566,19 +1982,21 @@ void Renderer::drive(GJBaseGameLayer* layer,
         // pump to the trailer's video time so the audio tail matches the
         // last frames.
         audioPump(static_cast<double>(mLastPts) / mFps);
-        return;
+        return true;
     }
 
-    uint64_t f = computeRenderFrame(pl, mTps);
-    int64_t curPts = ptsOfFrame(f);
+    const uint64_t f = computeRenderFrame(pl, mTps);
     // Do not capture while the level is paused вЂ” the pause menu must not
     // end up in the video. Drop any pending capture too: a boundary queued
     // before pausing would be grabbed once onFrameDraw() next runs, baking
     // the pause menu into the video.
     if (pl->m_isPaused) {
+        if (m_pendingFrame) {
+            ++m_pendingDrops;  // counted: this boundary is gone, not retried
+        }
         m_pendingFrame = false;
         m_pendingFadeOut = 1.0f;
-        return;
+        return false;
     }
     if (mLastPts < 0 && pl->m_gameState.m_levelTime <= 0.0) {
         // One-shot diagnostic: log the first warm-up entry so we know
@@ -1594,24 +2012,21 @@ void Renderer::drive(GJBaseGameLayer* layer,
         mLastFramed = 0;
         stepOne(simDt);
         m_stepCount++;
-        return;
+        return false;
     }
     if (m_pendingFrame) {
         // The draw callback has not consumed the previous boundary yet (the
         // loop fired faster than the frame drew). Wait instead of queueing a
         // new capture вЂ” overwriting would lose a pts and stutter the video.
-        return;
+        return false;
     }
-    int ticks = 0;
-    while (curPts <= mLastPts) {
-        if (pl->m_isPaused) {
-            return;  // can't safely sim while paused; wait next wall frame
-        }
-        // After the macro's last click the bot no longer steers the
-        // player: if it dies before the finish line the level resets and
-        // completion will never fire. Give it a few seconds of sim time,
-        // then give up. (Playback exhausted marks "macro consumed" вЂ” inputs
-        // delivered, the player must reach the end on its own.)
+    // ---- guards that used to live inside the stepping loop ----
+    // After the macro's last click the bot no longer steers the player: if it
+    // dies before the finish line the level resets and completion will never
+    // fire. Give it a few seconds of sim time, then give up. (Playback
+    // exhausted marks "macro consumed" вЂ” inputs delivered, the player must
+    // reach the end on its own.)
+    {
         bool macroConsumed = false;
         if (auto* eng = ReplayEngine::get()) {
             macroConsumed = eng->playbackExhaustionNotified ||
@@ -1622,42 +2037,140 @@ void Renderer::drive(GJBaseGameLayer* layer,
                 "[RENDER] player never reached the end after the macro "
                 "finished (died before the finish line?) вЂ” stopping");
             stop();
-            return;
+            return false;
         }
-        // Safety net: if level time stops advancing while the game is NOT
-        // paused (e.g. a practice checkpoint respawn reset m_levelTime
-        // backward), stepping forever would hang the whole game. Cap the
-        // ticks and bail out вЂ” the render simply stalls instead.
-        if (++ticks > 2400) {
-            skkbot2::log::error(
-                "[RENDER] drive stalled: levelTime not advancing "
-                "(f={} pts={}/{}) вЂ” bailing out of this wall frame",
-                f, curPts, mLastPts);
-            return;
-        }
-        if (f < mLastFramed) {
-            // Level time rewound (practice respawn): rewind the video
-            // timeline to the new position and restart capture from there.
-            skkbot2::log::info("[RENDER] level time rewound f={}->{} "
-                               "(respawn) вЂ” video timeline resynced",
-                               mLastFramed, f);
-            mLastPts = curPts;
-            mLastFramed = f;
-            return;
-        }
-        mLastFramed = f;
-        stepOne(simDt);
-        m_stepCount++;
-        f = computeRenderFrame(pl, mTps);
-        curPts = ptsOfFrame(f);
     }
+    if (f < mLastFramed) {
+        // Level time moved BACKWARDS. Two very different things cause this
+        // and only one of them is recoverable.
+        //
+        // A practice checkpoint respawn rewinds a little: the player is put
+        // back on solid ground a short way behind. The video timeline simply
+        // continues (the respawn IS part of the video); only the sim clock is
+        // re-anchored.
+        //
+        // A level RESTART throws the level back to frame 1 from wherever it
+        // was - measured: f=6461->1 mid-render. There is no timeline to
+        // resync to, the frames already captured describe a run that no
+        // longer exists, and the level comes back paused, so the render sits
+        // there holding a pause for as long as the user leaves it. Observed:
+        // 77 frames over 34 seconds, all of it paused.
+        //
+        // Restarting the recording silently is the wrong answer in both
+        // cases - the first case would throw away a long, good recording.
+        // The honest answer is to finish this one and say why.
+        const bool isRestart = f <= 1;
+        if (isRestart) {
+            skkbot2::log::error(
+                "[RENDER] the level was RESTARTED mid-render (frame {} -> {}). "
+                "The captured frames describe a run that no longer exists, so "
+                "this render ends here rather than rewinding the timeline and "
+                "sitting in a pause forever. Start a new render after the "
+                "restart.",
+                mLastFramed, f);
+            stop();
+            return false;
+        }
+        skkbot2::log::info("[RENDER] level time rewound f={}->{} "
+                           "(respawn) вЂ” sim clock re-anchored, video timeline "
+                           "continues",
+                           mLastFramed, f);
+        mLastFramed = f;
+        return false;
+    }
+    mLastFramed = f;
+
+    // ---- RENDER CLOCK ----
+    // One captured frame == exactly `ticksThisFrame` physics ticks, chosen so
+    // that video frame k lands on sim tick round(k * tps / fps).
+    //
+    // The old loop stepped a fixed 1/fps of SCHEDULER time and then asked the
+    // game where it had landed (ptsOfFrame(computeRenderFrame())). That is not
+    // a clock: when tps/fps is not an integer the scheduler serves an
+    // alternating step count (8,8,9,...), and a 9-tick step can straddle TWO
+    // pts boundaries. The loop then exited with the pts two ahead, `mLastPts =
+    // curPts` swallowed the difference and that video-frame slot was never
+    // captured - while the encoder still writes a strict sequential 1/fps
+    // timeline. What the viewer sees is a stretch that runs fast and then
+    // slow. That is the judder reported on high-TPS renders, and it needs
+    // tps/fps to be non-integer to appear, which is why 240/60 looked fine.
+    //
+    // Counting ticks here instead makes the content time a function of the
+    // FRAME INDEX by construction: no slot can be skipped, and the per-frame
+    // tick count differs by at most one tick - which is the correct rounding
+    // of a non-integer ratio, not a defect.
+    const int64_t frameIndex = mLastPts < 0 ? 0 : mLastPts + 1;
+    const int64_t targetTick = static_cast<int64_t>(std::llround(
+        static_cast<double>(frameIndex) * mTps / static_cast<double>(mFps)));
+    // A frame never needs more than one frame's worth of ticks; the cap only
+    // exists so a nonsense tps/fps ratio cannot freeze the render on frame 0.
+    const int64_t kClockTicksCap =
+        std::max<int64_t>(16, static_cast<int64_t>(std::ceil(mTps / mFps)) + 8);
+    int64_t ticksThisFrame = targetTick - static_cast<int64_t>(mClockTick);
+    if (ticksThisFrame < 0) ticksThisFrame = 0;
+    if (ticksThisFrame > kClockTicksCap) {
+        ticksThisFrame = kClockTicksCap;
+        ++mClockCapHits;
+    }
+    if (ticksThisFrame == 0) {
+        // tps < fps: two video frames describe the same sim state. Correct,
+        // and it is the only case where a repeated image is not a defect.
+        ++mClockZeroFrames;
+    }
+
+    if (ticksThisFrame > 0) {
+        StageTimer simTimer(&m_stageMs[static_cast<int>(Stage::Sim)]);
+        // Ask for exactly that many ticks: dt is an exact multiple of the
+        // scheduler's 1/tps step, so the step planner serves it without a
+        // carry (it may still refuse at its own budget - measured below).
+        stepOne(static_cast<float>(static_cast<double>(ticksThisFrame) / mTps));
+        mClockTick += static_cast<uint64_t>(ticksThisFrame);
+        m_stepCount += static_cast<uint64_t>(ticksThisFrame);
+    }
+    const uint64_t after = computeRenderFrame(pl, mTps);
+    const int64_t actual = static_cast<int64_t>(after) - static_cast<int64_t>(f);
+    mClockAskedSum += ticksThisFrame;
+    mClockDoneSum += actual;
+    // One tick of slack: level time is a float accumulator, so floor() lands
+    // either side of a boundary now and then. Anything beyond that is the sim
+    // refusing the request (step budget, pause, warp) and is worth knowing.
+    if (actual < ticksThisFrame - 1 || actual > ticksThisFrame + 1) {
+        ++mClockMismatch;
+        if (mClockLogs < 10) {
+            ++mClockLogs;
+            skkbot2::log::warn(
+                "[RENDER] clock: asked {} ticks, sim advanced {} "
+                "(frame={} tick={}->{} levelTime={:.6f} tps={:.1f})",
+                ticksThisFrame, actual, frameIndex, f, after,
+                pl->m_gameState.m_levelTime, mTps);
+        }
+    }
+    if (actual == 0 && ticksThisFrame > 0) {
+        if (++mClockStallFrames > 240) {
+            skkbot2::log::error(
+                "[RENDER] drive stalled: levelTime not advancing for {} frames "
+                "(f={} asked={} levelTime={:.6f}) вЂ” bailing out",
+                mClockStallFrames, f, ticksThisFrame,
+                pl->m_gameState.m_levelTime);
+            return false;
+        }
+    } else {
+        mClockStallFrames = 0;
+    }
+    if (mFrameTicksMin == 0 || ticksThisFrame < mFrameTicksMin) {
+        mFrameTicksMin = ticksThisFrame;
+    }
+    if (ticksThisFrame > mFrameTicksMax) {
+        mFrameTicksMax = ticksThisFrame;
+    }
+    mLastFramed = after;
 
     // Boundary reached: queue the capture. The actual grab runs in
     // onFrameDraw() (start of the ImGui draw callback, right after the game
     // drew this wall frame's scene and BEFORE the GUI overlay is rendered) вЂ”
     // so the video gets a fresh frame with no bot menu baked in.
-    mLastPts = curPts;
-    m_pendingPts = curPts;
+    mLastPts = frameIndex;
+    m_pendingPts = frameIndex;
     m_pendingFadeOut = 1.0f;
     m_pendingFrame = true;
 
@@ -1667,23 +2180,64 @@ void Renderer::drive(GJBaseGameLayer* layer,
     // through this pump вЂ” the audio is generated at the level's own speed
     // and plays back at exactly 1x in the video.
     audioPump(pl->m_gameState.m_levelTime);
+    return true;
 }
 
-void Renderer::onFrameDraw() {
+double Renderer::renderElapsedSeconds() const {
+    if (!mRecording.load()) {
+        return 0.0;
+    }
+    // A level pause freezes the sim and produces no frames, so it is dead time.
+    // Bill the hold that is still open to the accumulator first, then subtract
+    // everything: the wall figure is the render's own cost, not the time the
+    // user spent sitting in the pause menu.
+    double open = 0.0;
+    if (mLevelPaused && mPauseStartWall > 0.0) {
+        open = nowS() - mPauseStartWall;
+    }
+    const double wall = nowS() - m_renderStartWall;
+    return std::max(0.0, wall - mPausedWallSecs - open);
+}
+
+double Renderer::videoSeconds() const {
+    return mFps > 0 ? static_cast<double>(mCapturedFrames.load()) /
+                          static_cast<double>(mFps)
+                    : 0.0;
+}
+
+void Renderer::noteLevelPaused() {
+    mLevelPauseLogged = true;
+    mLevelPaused = true;
+    mPauseStartWall = nowS();
+}
+
+void Renderer::noteLevelResumed() {
+    mLevelPauseLogged = false;
+    mLevelPaused = false;
+    if (mPauseStartWall > 0.0) {
+        mPausedWallSecs += nowS() - mPauseStartWall;
+        mPauseStartWall = 0.0;
+    }
+}
+
+bool Renderer::onFrameDraw() {
+    // Returns whether a video frame was actually committed. drive() uses that
+    // as the batching stop signal: a false here means the encoder ring is full
+    // or the pipeline could not deliver, and the batch stops for this drawScene
+    // instead of spinning.
     if (!mRecording.load() || !m_pendingFrame) {
-        return;
+        return false;
     }
 
-    uint8_t* slot = tryAcquireSlot();
-    if (!slot) {
-        // Encoder backpressure: every ring buffer is still being encoded.
-        // Do NOT consume the pending boundary вЂ” drive() holds the sim while
+    if (!tryAcquireSlot()) {
+        // Encoder backpressure: every ring entry is still being encoded.
+        // Do NOT consume the pending boundary - drive() holds the sim while
         // the ring is full, so this boundary is retried on the next wall
         // frame with no pts lost (Silicat-style skip, main thread never
         // blocks).
-        return;
+        return false;
     }
-m_pendingFrame = false;
+    m_pendingFrame = false;
 
     // Silicate-style: the cocos view already points at the OUTPUT size for the
     // whole render (acquireView applied it once on the first render frame).
@@ -1714,12 +2268,14 @@ m_pendingFrame = false;
     mCapture.setFade(fade);
 
     // grab() issues the readback of the CURRENT scene (labeled m_pendingPts)
-    // and hands back the frame captured two requests ago with ITS pts вЂ” the
-    // encoder always gets the timestamp of the pixels it is actually given
-    // (Silicat's m_ptsQueue push/pop pairing).
-    int64_t gotPts = -1;
+    // and hands back the OLDEST already-issued frame together with ITS pts and
+    // a POINTER into its mapped PBO slot - the encoder always gets the
+    // timestamp of the pixels it is actually given (Silicat's m_ptsQueue
+    // push/pop pairing), and the main thread no longer copies them anywhere.
+    render::GrabResult got;
     const double g0 = nowS();
-    const bool grabbed = mCapture.grab(slot, m_pendingPts, &gotPts);
+    const bool grabbed = mCapture.grab(m_pendingPts, &got);
+    const int64_t gotPts = got.pts;
 
     if (!grabbed) {
         m_grabFailTotal++;
@@ -1743,10 +2299,25 @@ m_pendingFrame = false;
                 mGrabFailStreak);
             stop();
         }
-        return;
+        // Retry, do not drop. The boundary was NOT consumed by the failed
+        // grab (tryAcquireSlot() above already returned early for the other
+        // failure mode), and the sim has not moved since it was queued, so
+        // the next wall frame grabs exactly this frame. Clearing the flag
+        // here used to lose a pts for good - one missing slot, which the
+        // encoder's sequential timeline turns into a visible speed change.
+        m_pendingFrame = true;
+        return false;
     }
-    m_grabMs += (nowS() - g0) * 1e3;
+    const double grabDelta = (nowS() - g0) * 1e3;
+    m_grabMs += grabDelta;
     m_grabN++;
+    if (grabDelta > m_grabMaxMs) {
+        m_grabMaxMs = grabDelta;
+        m_grabMaxPts = m_pendingPts;
+    }
+    // grabDelta is milliseconds (it feeds m_grabMs and the "grabAvg=1.8ms"
+    // summary); noteStage counts in seconds, like every other stage.
+    noteStage(grabDelta * 1e-3, Stage::Grab);
     mGrabFailStreak = 0;
     if (!m_firstCaptureLogged) {
         m_firstCaptureLogged = true;
@@ -1755,16 +2326,74 @@ m_pendingFrame = false;
             "nv12Size={}",
             gotPts, m_grabMs / m_grabN, mCapture.m_nv12Size);
     }
-    commitSlot(gotPts);
+    commitSlot(got, gotPts);
     mCapturedFrames.fetch_add(1, std::memory_order_release);
     if ((mCapturedFrames.load() % 120) == 0) {
         skkbot2::log::info("[RENDER] progress: captured={} encoded={} pts={}",
                            mCapturedFrames.load(), mEncodedFrames.load(),
                            gotPts);
     }
+    return true;
+}
+
+double Renderer::nowWall() {
+    return nowS();
+}
+
+void Renderer::noteStage(double seconds, Stage which) {
+    m_stageMs[static_cast<int>(which)] += seconds;
+    const double ms = seconds * 1e3;
+
+    // Watchdog. A stall inside the render frame logs nothing at all - the whole
+    // main thread is blocked, so the probes, the DIAG lines and the audio level
+    // all stop too, and the gap in the log is the only symptom. Measured on
+    // Artemis 13: one 1.46s silence at level frame 14380 (75% of the level) and
+    // 4794 frames otherwise clean, drops=0, grabFails=2 - so nothing is
+    // overfilling and nothing is dropped, the thread is simply stuck.
+    //
+    // The stage timers hand us SECONDS (nowWall() returns seconds), while the
+    // grab timer is in milliseconds. The first version of this compared seconds
+    // against 200.0 and therefore needed a 200 second stall to fire - which is
+    // why it stayed silent through a run that visibly froze. Converting once,
+    // here, keeps every caller free to pass seconds.
+    static constexpr double kStallMs = 200.0;
+
+    const int idx = static_cast<int>(which);
+    if (ms < kStallMs) return;
+    m_stageStallPending = true;
+
+    if (which == Stage::Frame) {
+        // The drawScene BODY was slow, but nothing timed inside it explains it.
+        //
+        // Two things this message used to get wrong, both found on the GRIEF 4K
+        // run (2026-10-18) that produced the line above: it claimed "NO stage of
+        // ours was slow" while grab - the largest stage at 2.43ms of a 13.04ms
+        // frame - was not even considered, because grab is timed in
+        // onFrameDraw() and lives outside Stage::Frame. And it attributed the
+        // remainder to "GD's own loop", when it is at least as likely to be the
+        // GPU draining our own 4K passes: gl* returns immediately, so the wait
+        // shows up as a gap between frames rather than inside one.
+        skkbot2::log::warn(
+            "[RENDER] STALL: the drawScene body took {:.0f} ms with no stage "
+            "inside it slow. grab is timed in onFrameDraw, outside the body - "
+            "compare grabMax in the summary: if it is nowhere near this number "
+            "the stall was NOT the capture, and what is left is either GD's loop "
+            "or the GPU draining our 4K passes. These timers cannot tell those "
+            "two apart.",
+            ms);
+        return;
+    }
+
+    static const char* kNames[] = {"drive", "sim",   "grab",     "preview",
+                                   "viewUi", "swap", "frame"};
+    skkbot2::log::warn(
+        "[RENDER] STALL: the '{}' stage took {:.0f} ms of a single wall frame "
+        "(threshold {:.0f} ms). Main thread was blocked here.",
+        kNames[idx], ms, kStallMs);
 }
 
 void Renderer::drawPreview() {
+    StageTimer previewTimer(&m_stageMs[static_cast<int>(Stage::Preview)]);
     mCapture.displayPreview(m_windowW, m_windowH);
 }
 
@@ -1793,6 +2422,7 @@ void Renderer::stop() {
         return;
     }
     mRecording.store(false);
+    disarmMusicRestart();
 
     {
         std::lock_guard lk(m_qMu);
@@ -1827,21 +2457,194 @@ void Renderer::stop() {
 
     // End-of-render diagnostics: the speed factor is the single best check
     // that pacing worked (must be ~1.0); anything else = stutter/stretch.
-    double wall = nowS() - m_renderStartWall;
+    // wall excludes level pauses (nothing is simulated or captured then), and
+    // the time spent holding is reported separately as paused=.
+    double paused = mPausedWallSecs;
+    if (mLevelPaused && mPauseStartWall > 0.0) {
+        paused += nowS() - mPauseStartWall;
+    }
+    double wall = std::max(0.0, nowS() - m_renderStartWall - paused);
     double lvl = mLastPts > 0 ? static_cast<double>(mLastPts) / mFps : 0.0;
     skkbot2::log::info(
-        "[RENDER] Summary: captured={} encoded={} wall={:.1f}s "
-        "level={:.2f}s speed={:.2f}x ticks={} driveHz={:.0f} "
-        "grabAvg={:.1f}ms grabFails={} drops={}{}",
-        mCapturedFrames.load(), mEncodedFrames.load(), wall, lvl,
+        "[RENDER] Summary: captured={} encoded={} wall={:.1f}s paused={:.1f}s "
+        "level={:.2f}s speed={:.2f}x ticks={} driveHz={:.0f} batch={} "
+        "grabAvg={:.1f}ms grabMax={:.1f}ms@pts={} grabFails={} drops={} "
+        "pboGate={} batchAvg={:.2} batchFull={} stopDrive={} stopDraw={}{}",
+        mCapturedFrames.load(), mEncodedFrames.load(), wall, paused, lvl,
         wall > 0.0 ? lvl / wall : 0.0, m_stepCount,
         wall > 0.0 ? static_cast<double>(m_driveCalls) / wall : 0.0,
-        m_grabN > 0 ? m_grabMs / m_grabN : 0.0, m_grabFailTotal,
+        m_batchLimit,
+        m_grabN > 0 ? m_grabMs / m_grabN : 0.0, m_grabMaxMs, m_grabMaxPts,
+        m_grabFailTotal,
         m_pendingDrops,
+        mPboGateFrames,
+        mBatchCalls ? static_cast<double>(mBatchProduced) /
+                          static_cast<double>(mBatchCalls)
+                    : 0.0,
+        mBatchDeliveredFull,
+        mBatchStopDrive,
+        mBatchStopDraw,
         m_audioPackets > 0
             ? (std::string(" audio=") + std::to_string(m_audioPackets) +
                "pk (" + m_audioCodecUsed + ")")
             : std::string(" audio=off"));
+    // Where the wall frame actually goes. These are CPU submission costs only
+    // (the GL calls just queue work), so frameMs - their sum is the part the
+    // main thread spends waiting on the GPU to finish the frame.
+    // The per-frame divisor is CAPTURED FRAMES, not drive() calls. They used to
+    // be the same number - one video frame per drawScene - and batching broke
+    // that identity: one drive() call now delivers up to kBatchMax frames. Left
+    // as m_driveCalls, every per-frame figure in this summary would have been
+    // divided by a number up to 8x too small.
+    const double frames =
+        mCapturedFrames.load() > 0 ? static_cast<double>(mCapturedFrames.load()) : 1.0;
+    const double frameMs = wall * 1e3 / frames;
+    auto avg = [&](Stage s) { return m_stageMs[static_cast<int>(s)] / frames; };
+    const double driveAvg = avg(Stage::Drive);
+    const double simAvg = avg(Stage::Sim);
+    const double grabAvgStage = avg(Stage::Grab);
+    const double prevAvg = avg(Stage::Preview);
+    const double viewUiAvg = avg(Stage::ViewUi);
+    const double swapAvg = avg(Stage::Swap);
+    const double hookAvg = avg(Stage::Frame);
+    // Raw sums too, in us with 1 decimal: {:.2} on a value under 5 microseconds
+    // prints 0.00, which is indistinguishable from "never ran" and sent us
+    // hunting for a counter bug that did not exist.
+    skkbot2::log::info(
+        "[RENDER] stages: frame={:.2f}ms body={:.3f} drive={:.3f} sim={:.3f} "
+        "grab={:.3f} preview={:.3f} viewUi={:.3f} swap={:.3f} "
+        "outsideStages={:.3f} [raw us: drive={:.1f} sim={:.1f} preview={:.1f} "
+        "viewUi={:.1f} swap={:.1f} frames={:.0f}]",
+        frameMs, hookAvg, driveAvg, simAvg, grabAvgStage, prevAvg, viewUiAvg,
+        swapAvg,
+        // Subtracted BOTH the drawScene body and grab. grab is timed in
+        // onFrameDraw(), which runs in the imgui hook OUTSIDE Stage::Frame, so
+        // the old `frameMs - body` left it inside the remainder and then called
+        // that remainder "GD's own loop". On GRIEF 4K (2026-10-18) grab was
+        // 2.43ms of a 13.04ms frame - the single biggest measured stage, filed
+        // under GD. What is left now is genuinely unattributed: gl* calls
+        // return immediately and the wait lands on the next frame's first call,
+        // so this bucket holds the GPU draining the 4K scene render, the NV12
+        // passes and the present. Calling it GD's loop was a guess that
+        // pointed the next investigation at the wrong subsystem.
+        std::max(0.0, frameMs - hookAvg - grabAvgStage),
+        m_stageMs[static_cast<int>(Stage::Drive)] * 1e3,
+        m_stageMs[static_cast<int>(Stage::Sim)] * 1e3,
+        m_stageMs[static_cast<int>(Stage::Preview)] * 1e3,
+        m_stageMs[static_cast<int>(Stage::ViewUi)] * 1e3,
+        m_stageMs[static_cast<int>(Stage::Swap)] * 1e3, frames);
+
+    // Encoder-thread breakdown, per encoded frame. Deliberately a separate line
+    // from the GL-thread stages above: the two threads run concurrently, so
+    // summing them into one table would read as "more than a frame", which is
+    // what made the earlier memcpy change impossible to judge.
+    //
+    // EAGAIN count is the signal for the encoder ring: a non-zero value means
+    // the codec queue filled up and the send had to wait for packets to leave,
+    // which is the case ENC_FRAMES exists to absorb.
+    skkbot2::log::info(
+        "[RENDER] enc stages: per frame copy={:.3f}ms sws={:.3f}ms "
+        "send={:.3f}ms drain={:.3f}ms eagain={} "
+        "[totals ms: copy={:.1f} sws={:.1f} send={:.1f} drain={:.1f} "
+        "frames={:.0f}]",
+        frames > 0 ? m_encCopyMs / frames : 0.0,
+        frames > 0 ? m_encSwsMs / frames : 0.0,
+        frames > 0 ? m_encSendMs / frames : 0.0,
+        frames > 0 ? m_encDrainMs / frames : 0.0,
+        m_encEagain, m_encCopyMs, m_encSwsMs, m_encSendMs, m_encDrainMs,
+        frames);
+
+    // The scene traversal inside the capture, measured on its own. The old
+    // comment here called it "the duplicate" and promised a ~6.7s saving on
+    // GRIEF by removing it. That was wrong: displayPreview() has been a
+    // glBlitFramebuffer of the already-rendered scene FBO (capture.cpp:617),
+    // not a second walk of the scene graph, so renderSceneInto() is the ONLY
+    // traversal per frame and there is no duplicate to remove. The number is
+    // still worth having - it separates "telling the GPU what to draw" from
+    // "reading pixels back" inside grab.
+    //
+    // It has to be measured on its own because glDrawArrays only queues: the
+    // traversal's CPU cost is visible, but its GPU cost drains later and never
+    // appears in grab. Reported against grabAvg so the fraction of the capture
+    // stage it accounts for is explicit.
+    const double visitAvg =
+        mCapture.visitN() > 0 ? mCapture.visitMs() / mCapture.visitN() : 0.0;
+    skkbot2::log::info(
+        "[RENDER] scene visit (the only traversal; preview is a blit): "
+        "{:.3}ms per call over {} calls "
+"= {:.1f}ms of {:.2f}ms of grab = {:.0f}% of it, "
+          "{:.1f}% of a {:.2f}ms frame",
+          visitAvg, mCapture.visitN(), mCapture.visitMs(),
+          m_grabN > 0 ? m_grabMs / m_grabN : 0.0,
+          (m_grabMs > 0.0) ? 100.0 * mCapture.visitMs() / m_grabMs : 0.0,
+          (frameMs > 0.0) ? 100.0 * visitAvg / frameMs : 0.0, frameMs);
+
+    // How hot the bot's own per-tick hooks ran during this render. Added
+    // because the bot, not the renderer, is the expensive half: Xenon's
+    // kerender takes 2:04 with Xenon's bot and 2:40 with ours, and ours is
+    // not the slower renderer.
+    //
+    // Rates are per wall second because that is the number that has to be
+    // explained - it is what the 36s of extra render time is made of. The
+    // scheduler row also carries its own wall time; the per-object rows carry
+    // call counts only, because a clock read inside a per-object per-tick hook
+    // would cost more than the thing being measured.
+    if (frames > 0) {
+        const double secs = wall > 0.0 ? wall : 1.0;
+        skkbot2::log::info(
+            "[RENDER] hot path per wall second ({}s wall, {:.0f} sched calls/s):",
+            std::to_string(secs).substr(0, 5), frames / secs);
+        auto& hs = skkbot2::hot::stats();
+        // The ratio that matters: physics steps per captured video frame. The
+        // step-grid hook pins the loop to g_forcedSteps iterations of 1/240s,
+        // so one scheduler update advances the level by g_forcedSteps/240 -
+        // not by the 1/60 handed to the scheduler. A renderer that gets 1/60
+        // per call therefore needs 240/60 times fewer calls for the same video.
+        const double stepsPerFrame =
+            hs.calls[static_cast<size_t>(skkbot2::hot::PhysStep)] / frames;
+        const double schedPerFrame =
+            hs.calls[static_cast<size_t>(skkbot2::hot::SchedUpdate)] / frames;
+        // The ratio line and the per-slot rows carry the [RENDER] prefix purely so a
+        // grep finds the whole block; it no longer has to, because the
+        // dedicated render.txt mirror is gone (removed 19.10.2026). They used
+        // to have to: that file was fed by a prefix match in Logger::log, so a
+        // continuation line indented with spaces silently never reached it -
+        // which is exactly what happened on the 2026-10-18 GRIEF run, where the
+        // header was present and both the ratio line and every counter row were
+        // missing. That read as "no hot-path work happened" rather than as
+        // "this line was never captured", which is the worse of the two.
+        //
+        // The divisor is m_driveCalls (captured video frames), NOT the slot's
+        // own call count - the row used to say "ms per call" over a per-frame
+        // figure, which for the scheduler rows is off by the batch factor
+        // (advanceNormalScheduler calls GD's base up to 8 times per hook call):
+        // GRIEF read "5.597413ms per call" when the real per-call figure was
+        // 0.34ms and the per-frame figure was 5.597. Both are useful, so both
+        // are printed from here on.
+        skkbot2::log::info(
+            "[RENDER]   ratio: {:.2f} physics steps and {:.2f} scheduler "
+            "calls per captured frame ({:.2f} ms of level time per frame at "
+            "{:.0f} tps)",
+            stepsPerFrame, schedPerFrame,
+            stepsPerFrame * 1000.0 / static_cast<double>(mTps), mTps);
+        for (size_t i = 0; i < skkbot2::hot::N; i++) {
+            if (hs.calls[i] == 0) continue;
+            const double perSec = hs.calls[i] / secs;
+            const double perFrame = hs.ms[i] / frames;
+            const double perCall =
+                hs.ms[i] / static_cast<double>(hs.calls[i]);
+            std::string row = std::string("[RENDER]   ") + skkbot2::hot::name(
+                                                         static_cast<skkbot2::hot::Slot>(i));
+            row += " = " + std::to_string(hs.calls[i]) + " calls (" +
+                   std::to_string(static_cast<long long>(perSec)) + "/s)";
+            if (hs.ms[i] > 0.0) {
+                row += ", " + std::to_string(perFrame) +
+                       "ms per captured frame, " + std::to_string(perCall * 1e3) +
+                       "us per call";
+            }
+            skkbot2::log::info("{}", row);
+        }
+    }
 
     // NOTE: ffmpeg contexts are freed by the encoder thread itself (it owns
     // them: flush + trailer + free). The main thread detaches/joins it above
@@ -1862,6 +2665,10 @@ void Renderer::stop() {
     // called from there. resizeShaderLayer no-ops if the size already matches.
     restoreView();
     skkbot2::log::info("[RENDER] view restored {}x{}", m_windowW, m_windowH);
+    // Every summary line above has already gone to the regular log by now, so
+    // there is no session to close. stop() is also called from failure paths
+    // (grab never produced a frame, the encoder stalled, the level restarted
+    // mid-render), and those summaries are exactly the ones worth keeping.
 }
 
 }  // namespace render

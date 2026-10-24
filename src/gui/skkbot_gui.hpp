@@ -9,6 +9,11 @@
 // toggle buttons, macro name + Save/Load/Clear/List, macro info, and a
 // separate Settings window for TPS / RNG / logging.
 
+// Declared OUTSIDE namespace gui on purpose: inside it, `namespace render` would
+// declare skkbot2::gui::render and shadow the real skkbot2::render, so the
+// parameter below would resolve to an incomplete type.
+namespace skkbot2::render { class Renderer; }
+
 namespace skkbot2::gui {
 
 struct Gui {
@@ -40,6 +45,12 @@ struct Gui {
     ImVec2 settingsPos = ImVec2(0, 0);
     ImVec2 macroListPos = ImVec2(0, 0);
     ImVec2 renderPos = ImVec2(0, 0);
+
+    // During a render the bot menu can be replaced by a small HUD. The capture
+    // copies the level into its own FBO before the menu is drawn, so the menu
+    // never reaches the video and is pure per-frame cost. Default on, since the
+    // win is real; turn it off to watch the menu while rendering.
+    bool renderHideMenu = true;
     float mainWindowWidth = 320.0f;
     float mainWindowHeight = 420.0f;
     float featuresWindowWidth = 320.0f;
@@ -64,18 +75,104 @@ struct Gui {
     // 1.0 regardless of the slider value.
     bool speedhackEnabled = false;
     double speedhackValue = 1.0;
+    // Apply the speedhack value to the FMOD master channel group pitch so the
+    // level song follows the game speed. Meaningful only while speedhackEnabled
+    // is on (the row is hidden otherwise). Reference: GDH "Speedhack Audio",
+    // EclipseMenu "Audio Speed".
+    bool musicSpeedSync = false;
 
     // TPS toggle: when disabled the effective tick rate is locked to 240.0
     // regardless of the slider value.
     bool tpsEnabled = false;
     double tpsValue = 240.0;
 
+    // FPS toggle: when disabled the animation interval is never touched and
+    // the step budget simply follows whatever the display is really doing.
+    // When on, fpsValue pins the display rate; 0 is the special "follow TPS"
+    // value (one physics step per drawn frame). Defaults to off so an existing
+    // install keeps the frame pacing it had, which is the only choice that
+    // cannot surprise anyone.
+    bool fpsEnabled = false;
+    double fpsValue = 0.0;
+    // Lock fps: exactly one physics step per drawn frame. Only meaningful while
+    // fpsEnabled is on, because without a pinned rate the step count depends on
+    // whatever the compositor delivers. Turning FPS off clears it.
+
     int selectedMacro = -1;
     std::vector<std::string> macros;
 
+    enum class MacroBotType : int {
+        SKK = 0,
+        SKC = 1,
+    };
+    MacroBotType macroBotType = MacroBotType::SKK;
+
     int menuKeybind = 0xA5;      // Left Alt (scan 0x38 -> 0xA5 in main.cpp)
-    bool keybindWaiting = false;
+    int stepForwardKeybind = 0x43;  // 'C'
     bool settingsDirty = false;
+
+    // -- Full keybind table ------------------------------------------------
+    // One flat table instead of a field per action: the KEYBIND section renders
+    // rows from it, the global key handler dispatches by index, and capture uses
+    // a single `kbWaiting` slot (at most one pill can be armed at a time, which
+    // is what the old keybindWaiting/stepForwardWaiting pair could not express
+    // once more than two binds existed).
+    //
+    // `kKey` is a Windows VK code, matching what main.cpp's KeyboardInputEvent
+    // listener hands to handleKey. 0 means "unbound" and the action is skipped.
+    // Enum ORDER is the on-screen order: the rows and the MENU group are emitted
+    // in this sequence, so ResetLevel sits directly under Open Menu rather than
+    // wherever it happened to be appended.
+    enum class Bind : int {
+        Menu = 0,
+        ResetLevel,
+        Record,
+        Play,
+        StepForward,
+        StepToggle,
+        Hitboxes,
+        Speedhack,
+        Noclip,
+        Trajectory,
+        LayoutMode,
+        Count,
+    };
+    static constexpr int kBindCount = static_cast<int>(Bind::Count);
+
+    struct BindInfo {
+        Bind bind;
+        const char* label;
+        int k;        // default VK code
+        int group;    // index into kBindGroupNames
+    };
+
+    // Group separators drawn between keybind rows (the "полосочки").
+    static constexpr int kGroupCount = 3;
+    static constexpr const char* kBindGroupNames[kGroupCount] = {
+        "MENU", "RECORD & PLAY", "ASSISTS",
+    };
+
+    int bindKeys[kBindCount] = {0};
+    // Index of the row currently armed for capture, or -1. Armed rows show
+    // "PRESS A KEY"; Esc cancels.
+    int kbWaiting = -1;
+    // Row whose key is physically held down RIGHT NOW, or -1 for none. Press-edge
+    // detection for the toggle binds: a toggle fires once per physical press,
+    // the OS auto-repeat during a hold must not fire it again, and a RELEASE
+    // must clear it (-1) so the next press always counts as a new edge.
+    // Deliberately independent of the `repeat` flag — see handleKey.
+    int heldBind = -1;
+
+    // Mirrors the menu toggles so a hotkey flip persists exactly like a click.
+    void persistBind(Bind b);
+    const BindInfo* bindInfo(int i) const;
+    // True while the action can actually run: PLAY must not fight RECORD, the
+    // frame stepper owns the scheduler exclusively, an open macro list is modal,
+    // and a render/RECORD already in flight blocks everything else.
+    bool transportAllowedFor(Bind b) const;
+    // Executes a bind by index from the global key handler. Returns true when
+    // the key was consumed so it does not reach the game.
+    bool runBind(Bind b);
 
     // Video render settings (port of the old skkBot render tab).
     struct RenderSettingsStore {

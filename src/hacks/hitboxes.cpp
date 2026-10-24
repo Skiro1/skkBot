@@ -32,6 +32,7 @@
 #include <Geode/cocos/draw_nodes/CCDrawNode.h>
 
 #include "skkBot.hpp"
+#include "logger/logger.hpp"
 
 #include <algorithm>
 
@@ -95,7 +96,10 @@ Kind classify(GameObject* o) {
     if (t == GameObjectType::Solid || t == GameObjectType::Slope)
         return Kind::Solid;
 
-    // Vehicle + gravity portals get their own color.
+    // Vehicle + gravity + size + mirror portals get their own color.
+    // Size portals (RegularSizePortal=17 / MiniSizePortal=18) and mirror
+    // portals (InverseMirrorPortal=14 / NormalMirrorPortal=15) were missing
+    // here, so they fell through to Kind::Skip and drew nothing.
     if (t == GameObjectType::CubePortal || t == GameObjectType::ShipPortal ||
         t == GameObjectType::BallPortal || t == GameObjectType::UfoPortal ||
         t == GameObjectType::WavePortal || t == GameObjectType::RobotPortal ||
@@ -103,7 +107,11 @@ Kind classify(GameObject* o) {
         t == GameObjectType::DualPortal || t == GameObjectType::SoloPortal ||
         t == GameObjectType::InverseGravityPortal ||
         t == GameObjectType::NormalGravityPortal ||
-        t == GameObjectType::GravityTogglePortal)
+        t == GameObjectType::GravityTogglePortal ||
+        t == GameObjectType::RegularSizePortal ||
+        t == GameObjectType::MiniSizePortal ||
+        t == GameObjectType::InverseMirrorPortal ||
+        t == GameObjectType::NormalMirrorPortal)
         return Kind::Portal;
 
     // Orbs, pads, rings, coins, speed portals (Modifier).
@@ -163,6 +171,26 @@ void drawPolygonFromRect(CCDrawNode* node, const CCRect& r, const ccColor4F& col
         ccp(r.getMaxX(), r.getMaxY()),
         ccp(r.getMinX(), r.getMaxY()),
     };
+    node->drawPolygon(verts, 4, ccc4f(col.r, col.g, col.b, fillAlpha()),
+                      kBorderWidth, col, cocos2d::BorderAlignment::Inside);
+}
+
+void drawRotatedPolygonFromRect(CCDrawNode* node, const CCRect& r, float rotation, const ccColor4F& col) {
+    if (std::abs(rotation) <= 0.01f) {
+        drawPolygonFromRect(node, r, col);
+        return;
+    }
+    CCPoint verts[4] = {
+        ccp(r.getMinX(), r.getMinY()),
+        ccp(r.getMaxX(), r.getMinY()),
+        ccp(r.getMaxX(), r.getMaxY()),
+        ccp(r.getMinX(), r.getMaxY()),
+    };
+    const CCPoint center = ccp(r.getMidX(), r.getMidY());
+    const float rad = -CC_DEGREES_TO_RADIANS(rotation);
+    for (auto& v : verts) {
+        v = v.rotateByAngle(center, rad);
+    }
     node->drawPolygon(verts, 4, ccc4f(col.r, col.g, col.b, fillAlpha()),
                       kBorderWidth, col, cocos2d::BorderAlignment::Inside);
 }
@@ -232,6 +260,22 @@ void drawObjectHitbox(CCDrawNode* node, GameObject* o, bool isEditor) {
 
 void drawPlayerHitbox(CCDrawNode* node, PlayerObject* p) {
     if (!p) return;
+
+    if (p->m_isDart) {
+        // Wave (dart): GD's exact hitbox is 10x10 for normal, 6x6 for mini.
+        // Rotated box for slopes/rotated hazards + AABB for straight hazards.
+        // Wave has no inner 0.3x box in GD physics.
+        const float wSize = (p->m_vehicleSize != 1.0f) ? 6.0f : 10.0f;
+        const CCPoint center = p->getPosition();
+        const CCRect waveRect(center.x - wSize * 0.5f, center.y - wSize * 0.5f, wSize, wSize);
+        drawRotatedPolygonFromRect(node, waveRect, p->getRotation(), kPlayerRot);
+        drawPolygonFromRect(node, waveRect, kPlayer);
+        return;
+    }
+
+    if (p->m_isOrientedBoxDirty) {
+        p->updateOrientedBox();
+    }
 
     // Rotated box (dart / slope rotation) first so the outer rect draws on top.
     if (p->m_orientedBox) {
@@ -309,9 +353,39 @@ void redraw(GJBaseGameLayer* gl, CCDrawNode* node) {
 // implement it — PlayLayer and the editor playtest (LevelEditorLayer), which
 // is also how GDH / EclipseMenu drive their overlays.
 // ---------------------------------------------------------------------------
+CCDrawNode* getOrCreateNode(GJBaseGameLayer* gl, Ref<CCDrawNode>& nodeRef, const char* id) {
+    if (!gl) return nullptr;
+    CCNode* desiredParent = (gl->m_debugDrawNode && gl->m_debugDrawNode->getParent())
+        ? gl->m_debugDrawNode->getParent()
+        : static_cast<CCNode*>(gl->m_objectLayer);
+    if (!desiredParent) desiredParent = gl;
+
+    if (nodeRef && nodeRef->getParent()) {
+        if (nodeRef->getParent() != desiredParent && desiredParent != gl) {
+            nodeRef->removeFromParentAndCleanup(false);
+            desiredParent->addChild(nodeRef);
+        }
+        return nodeRef;
+    }
+
+    auto* n = CCDrawNode::create();
+    n->setBlendFunc(ccBlendFunc{GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
+    n->setZOrder(9999);
+    n->m_bUseArea = false;
+    n->setID(id);
+    desiredParent->addChild(n);
+    nodeRef = n;
+    return n;
+}
+
 void updateHitboxes(GJBaseGameLayer* gl, CCDrawNode* node) {
     if (!node) return;
     bool visible = shouldBeVisible(gl);
+    static bool s_lastVisible = false;
+    if (visible != s_lastVisible) {
+        s_lastVisible = visible;
+        skkbot2::log::info("[HITBOX] overlay visibility changed -> {}", visible ? "ENABLED" : "DISABLED");
+    }
     node->setVisible(visible);
     if (!visible) {
         node->clear();
@@ -327,23 +401,20 @@ class $modify(HitboxPlayLayer, PlayLayer) {
 
     void createObjectsFromSetupFinished() {
         PlayLayer::createObjectsFromSetupFinished();
-        CCNode* parent = (m_debugDrawNode && m_debugDrawNode->getParent())
-            ? m_debugDrawNode->getParent()
-            : static_cast<CCNode*>(m_objectLayer);
-        if (!parent) parent = this;
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes"_spr);
+        updateHitboxes(this, n);
+    }
 
-        auto* n = CCDrawNode::create();
-        n->setBlendFunc(ccBlendFunc{GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
-        n->setZOrder(9999);
-        n->m_bUseArea = false;
-        n->setID("skk-hitboxes"_spr);
-        parent->addChild(n);
-        m_fields->node = n;
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes"_spr);
+        updateHitboxes(this, n);
     }
 
     void updateVisibility(float dt) {
         PlayLayer::updateVisibility(dt);
-        updateHitboxes(this, m_fields->node);
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes"_spr);
+        updateHitboxes(this, n);
     }
 };
 
@@ -354,25 +425,38 @@ class $modify(HitboxEditorLayer, LevelEditorLayer) {
 
     bool init(GJGameLevel* level, bool noUI) {
         if (!LevelEditorLayer::init(level, noUI)) return false;
-        CCNode* parent = (m_debugDrawNode && m_debugDrawNode->getParent())
-            ? m_debugDrawNode->getParent()
-            : static_cast<CCNode*>(m_objectLayer);
-        if (!parent) parent = this;
-
-        auto* n = CCDrawNode::create();
-        n->setBlendFunc(ccBlendFunc{GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
-        n->setZOrder(9999);
-        n->m_bUseArea = false;
-        n->setID("skk-hitboxes-editor"_spr);
-        parent->addChild(n);
-        m_fields->node = n;
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes-editor"_spr);
+        updateHitboxes(this, n);
         return true;
+    }
+
+    void postUpdate(float dt) {
+        LevelEditorLayer::postUpdate(dt);
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes-editor"_spr);
+        updateHitboxes(this, n);
     }
 
     void updateVisibility(float dt) {
         LevelEditorLayer::updateVisibility(dt);
-        updateHitboxes(this, m_fields->node);
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes-editor"_spr);
+        updateHitboxes(this, n);
     }
 };
+
+void forceRefresh() {
+    if (auto* pl = PlayLayer::get()) {
+        auto* modifyPl = static_cast<HitboxPlayLayer*>(pl);
+        if (modifyPl) {
+            auto* n = getOrCreateNode(pl, modifyPl->m_fields->node, "skk-hitboxes"_spr);
+            updateHitboxes(pl, n);
+        }
+    } else if (auto* el = LevelEditorLayer::get()) {
+        auto* modifyEl = static_cast<HitboxEditorLayer*>(el);
+        if (modifyEl) {
+            auto* n = getOrCreateNode(el, modifyEl->m_fields->node, "skk-hitboxes-editor"_spr);
+            updateHitboxes(el, n);
+        }
+    }
+}
 
 }  // namespace skk::hitboxes
