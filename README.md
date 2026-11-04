@@ -9,7 +9,9 @@ renderer using bundled FFmpeg — no extra downloads needed.
 - **Input-first macro recording/playback** with per-substep (sub-tick) input dispatch
   through GD's native pipeline (`.skk`, SKK3 format)
 - **LockDelta**: physics-delta freeze (`warp*physicsDt` per substep, step-grid hooks) —
-  verified playback at 1.00–1.13 plan/tick
+  verified playback at 1.00–1.13 plan/tick; **Lock Delta / Real Time timing modes**
+  selectable in the UI
+- **Macro auto-save**: recordings are saved automatically
 - **Accuracy levels**: Vanilla and CBS (Click-Between-Steps) + COS helper — applied through
   vanilla GD mechanics; external accuracy mods (Superb Input Precision, Click-Between-Frames)
   are declared as incompatibilities
@@ -79,7 +81,6 @@ This mod won't load together with:
   - GDH (`.re4`)
   - Neverhook (`.nhm`)
   - Silicate (`.slc`)
-  - ToastyReplay (`.ttr3`)
   - ToastyReplay Lite (`.ttrl`)
   - Xenon (`.xe`)
   *(Note: for external formats that store physics coordinates, third-party physics injection is ignored and inputs are processed purely through GD's native engine to prevent physics conflicts).*
@@ -92,6 +93,29 @@ Geode build setup.
 ## Links
 - [Codeberg](https://codeberg.org/Skiro1/skkBot)
 - [Issues](https://codeberg.org/Skiro1/skkBot/issues)
+
+## Acknowledgements
+
+skkBot2 was built standing on the shoulders of the GD botting & modding community.
+Heartfelt thanks to the authors of these projects — their ideas, formats, reverse-engineering
+work and open code shaped many parts of this bot (inspiration, techniques and format
+compatibility):
+
+**Bots & mods:**
+- **[Echo](https://echogd.com/)** — replay codec ideas, drift detection, step tracing, timing insights
+- **[EclipseMenu](https://eclipse.menu/)** — GDR2 macro format compatibility
+- **[GDH](https://gitlab.com/tobyadd/GDH/-/releases)** — replay format compatibility
+- **[GucciBot](https://github.com/Nigelx1/GucciBot)** — GBR format, practice range & tooling concepts
+- **[Neverhook](https://github.com/DeMaxi1337/Neverhook)** — replay format compatibility
+- **[Silicate](https://geode-sdk.org/mods/peony.silicate)** — recording & rendering techniques (FBO capture, audio pumping)
+- **[ToastyReplay](https://toastyreplay.xyz/#pricing)** / **[ToastyReplay Lite](https://geode-sdk.org/mods/toastexgd.toastyreplay-lite)** — replay format compatibility
+- **[Vbot](https://github.com/Vbot-Macro/Vbot)** — TPS bypass approach, step patching, frame-window tooling
+- **[Xenon](https://xenon.baleszka.dev/)** — CBF handling, NOP patches, queue sanitization practices
+- **[XeniaHack](https://github.com/noxoraid/XeniaHack/tree/testdriver/setup-tests)** — half-tick macro support insights
+
+**Research & reverse-engineering projects:**
+- **[GD-2.2081-Decompiled](https://github.com/iArtie/GD-2.2081-Decompiled)** — full readable decompilation of Geometry Dash 2.2081
+- **[open-source-gd-project](https://github.com/StarryDawn72/open-source-gd-project)** — verified reconstructions of GD functions and bindings
 
 ## License
 

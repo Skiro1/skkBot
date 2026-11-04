@@ -97,12 +97,6 @@ DecodedState decodeState(uint64_t s) {
                         (s & 2) != 0, (s & 1) != 0};
 }
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    // Swift expands to Jump before it ever reaches here, so 1..3 is the range.
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
@@ -293,27 +287,12 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
     }
 
     out = skc::Macro{};
-    out.header.tps = static_cast<float>(replay.meta.tps);
+    out.header.tps = replay.meta.tps;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
     for (const auto& a : replay.actions) {
         const auto button = static_cast<uint8_t>(a.button);
-        const std::size_t ch = channelIndex(button, a.player2);
-        if (!a.holding) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
         if (a.frame > 0xFFFFFFFFull) {
             return fail("slc: frame " + std::to_string(a.frame) +
                         " exceeds SKC's 32-bit frame counter");
@@ -321,6 +300,17 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
         out.actions.push_back(skc::Action{static_cast<uint32_t>(a.frame), button,
                                           a.holding, a.player2});
     }
+
+    // Every SLC edge goes in verbatim. A second press on a channel that is
+    // still held is one of the encoder's collapsed TAPS (the release happened
+    // but was not stored), and normalizeActionStream() rebuilds it as a
+    // same-frame up+down instead of deleting it. Deleting it changed the run:
+    // on Windy Road the surviving single press made GD apply the jump one
+    // physics step earlier than the identical timeline replayed as up+down.
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
 
     if (out.actions.empty()) return fail("slc: no usable inputs after normalisation");
 
@@ -331,11 +321,20 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
 
     skkbot2::log::warn(
         "[SLC] v{} build {} (tps {:.0f}, seed {}): {} actions -> {} actions, "
-        "dropped {} release(s) with no press and {} duplicate press(es), no "
+        "dropped {} release(s) with no press and rebuilt {} collapsed tap(s), no "
         "frame shift",
         replay.meta.version, replay.meta.build, replay.meta.tps,
         replay.meta.seed, replay.actions.size(), out.actions.size(),
         droppedRelease, droppedDuplicate);
+    if (droppedDuplicate > 0) {
+        std::string frames;
+        for (const uint32_t frame : normalized.rebuiltAt) {
+            if (!frames.empty()) frames += ", ";
+            frames += std::to_string(frame);
+        }
+        skkbot2::log::info("[SLC] collapsed taps rebuilt at frame(s) {}{}", frames,
+                           droppedDuplicate > normalized.rebuiltAt.size() ? ", ..." : "");
+    }
     return true;
 }
 

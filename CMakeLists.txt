@@ -28,19 +28,20 @@ set(SKKBOT2_SOURCES
     src/format/xe/xe.cpp
     src/format/re4/re4.cpp
     src/format/ttrl/ttrl.cpp
-    src/format/ttr3/ttr3.cpp
-  src/format/echo/echo.cpp
+    src/format/echo/echo.cpp
     src/format/ast/ast.cpp
     src/core/checkpoint_handler.cpp
     src/core/replay_engine.cpp
+    src/core/step_trace.cpp
     src/core/checkpoint_system.cpp
     src/core/editor_playback.cpp
     src/core/full_player_checkpoint.cpp
     src/core/practice_fix_bridge.cpp
     src/core/gd_option_tracer.cpp
     src/core/frame_stepper.cpp
-        src/core/playback_fps.cpp
+    src/core/playback_fps.cpp
     src/core/keybinds.cpp
+    src/core/autosave_recorder.cpp
     src/core/audio_stub.cpp
     src/core/rng_lock.cpp
     src/hooks/rng_hooks.cpp
@@ -54,12 +55,17 @@ set(SKKBOT2_SOURCES
     src/hacks/safe_mode.cpp
     src/trajectory/show_trajectory.cpp
     src/physics/step_grid_hooks.cpp
+    src/physics/near_movers.cpp
+    src/physics/cocos_string_opt.cpp
+    src/physics/particle_spam_opt.cpp
+    src/physics/phys_ring_jump.cpp
     src/logger/logger.cpp
     src/skc/skc_bot.cpp
     src/skc/skc_checkpoint.cpp
     src/skc/skc_format.cpp
     src/skc/skc_frame.cpp
     src/skc/skc_hooks.cpp
+    src/skc/skc_dash_determinism.cpp
     src/skc/skc_range.cpp
 )
 
@@ -71,6 +77,8 @@ if (WIN32)
         src/render/hwprobe.cpp
         src/render/renderer.cpp
         src/render/audiocap.cpp
+        src/render/effect_batch.cpp
+        src/render/effect_copies.cpp
     )
 endif()
 
@@ -280,7 +288,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE MOD_VERSION="${CMAKE_PROJECT_
 
 if (WIN32)
     CPMAddPackage("gh:cursey/safetyhook#2f28386")
-    target_link_libraries(${PROJECT_NAME} ${SKKBOT2_LINK_LIBRARIES} Crypt32 Advapi32 safetyhook ${SKKBOT2_WAMR})
+    target_link_libraries(${PROJECT_NAME} ${SKKBOT2_LINK_LIBRARIES} Crypt32 Advapi32 dwmapi safetyhook ${SKKBOT2_WAMR})
 
     # Always emit a PDB for the DLL. Geode's crash reports only carry raw
     # offsets (skiro1.skk-bot.dll + 0x...), which are unresolvable without a

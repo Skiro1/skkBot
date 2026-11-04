@@ -1,6 +1,7 @@
 #include "audiocap.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <functional>
 
@@ -144,6 +145,17 @@ bool AudioCapture::attach(float musicVolume, float sfxVolume) {
     m_fmodTime = 0.0;
     m_time = 0.0;
     m_lastLevelTime = 0.0;
+    m_anchored = false;
+    m_prerollEnd = 0.0;
+    m_discardedSamples = 0;
+    m_masterClockBase = 0;
+    if (m_master) {
+        unsigned long long clock = 0;
+        unsigned long long parent = 0;
+        if (m_master->getDSPClock(&clock, &parent) == FMOD_OK) {
+            m_masterClockBase = clock;
+        }
+    }
 
     // Volume diagnostics: a silent track usually means the game's own mixer
     // (or the master group) is muted / at 0 volume, not a capture bug.
@@ -204,6 +216,20 @@ void AudioCapture::detach() {
     skkbot2::log::info("[RENDER] audio capture detached");
 }
 
+void AudioCapture::anchorAt(double levelTime, double trackPositionSeconds) {
+    if (!m_active || m_anchored) {
+        return;
+    }
+    m_anchored = true;
+    const double track = std::max(0.0, trackPositionSeconds);
+    m_prerollEnd = std::max(0.0, levelTime - track);
+    skkbot2::log::info(
+        "[RENDER] audio anchor: video pts 0 = levelTime={:.3f}s, level song at "
+        "{:.3f}s of its track -> {:.3f}s of pre-roll will be mixed and dropped "
+        "so the first encoded block starts the track at the position the "
+        "footage starts at", levelTime, track, m_prerollEnd);
+}
+
 void AudioCapture::pump(double levelTime) {
     if (!m_active) {
         return;
@@ -220,10 +246,73 @@ void AudioCapture::pump(double levelTime) {
     if (dt <= 0.0) {
         return;
     }
+
+    // Timeline anchor. The renderer calls pump() with the VIDEO timeline
+    // (anchor + frameIndex / fps), so the first call carries the level time
+    // the render started at. That is video pts 0: the music has to be at that
+    // same position inside the track, not at 0. Everything the mixer produces
+    // up to it is the pre-roll - nobody will ever hear it.
+    if (!m_anchored) {
+        anchorAt(levelTime, 0.0);
+    }
+
     m_lastLevelTime = levelTime;
     m_shouldUpdateFmod = true;
     FMODAudioEngine::get()->update(static_cast<float>(dt));
     m_shouldUpdateFmod = false;
+
+    if (m_prerollEnd > 0.0) {
+        // Drop EXACTLY the pre-roll, sample-accurately. Clearing the whole
+        // buffer would overshoot by up to one pump window (a frame plus a DSP
+        // block, ~25-40 ms), and the music would then start that much ahead of
+        // the footage - a small, permanent offset, which is the very thing
+        // this code exists to remove. Whatever is left after the cut stays in
+        // m_pcm and is drained as the first encoded block, at pts=0.
+        const size_t frames = m_pcm.size() / 2;
+        const double already =
+            static_cast<double>(m_discardedSamples) / m_sampleRate;
+        const double need = m_prerollEnd - already;
+        size_t drop = 0;
+        if (need > 0.0) {
+            const double needFrames = need * static_cast<double>(m_sampleRate);
+            drop = needFrames >= static_cast<double>(frames)
+                       ? frames
+                       : static_cast<size_t>(std::llround(needFrames));
+        }
+        if (drop > 0) {
+            m_pcm.erase(m_pcm.begin(),
+                        m_pcm.begin() + static_cast<std::ptrdiff_t>(drop) * 2);
+            m_discardedSamples += static_cast<int64_t>(drop);
+        }
+        m_time = static_cast<double>(m_pumpedConsumed + m_discardedSamples) /
+                 static_cast<double>(m_sampleRate);
+        const double dropped =
+            static_cast<double>(m_discardedSamples) / m_sampleRate;
+        if (dropped + 1.0e-6 >= m_prerollEnd) {
+            skkbot2::log::info(
+                "[RENDER] audio: pre-roll done at {:.3f}s ({} sample(s) "
+                "dropped, first encoded block is pts=0 = track position "
+                "{:.3f}s, mixer at {:.3f}s)", dropped, m_discardedSamples,
+                m_prerollEnd, mixerSeconds());
+            m_prerollEnd = 0.0;
+        }
+    }
+}
+
+double AudioCapture::mixerSeconds() {
+    if (m_sampleRate <= 0) {
+        return 0.0;
+    }
+    if (m_master) {
+        unsigned long long clock = 0;
+        unsigned long long parent = 0;
+        if (m_master->getDSPClock(&clock, &parent) == FMOD_OK &&
+            clock >= m_masterClockBase) {
+            return static_cast<double>(clock - m_masterClockBase) /
+                   static_cast<double>(m_sampleRate);
+        }
+    }
+    return static_cast<double>(m_pumped) / static_cast<double>(m_sampleRate);
 }
 
 size_t AudioCapture::drain(std::vector<float>& accum, int frameSize,
@@ -259,8 +348,9 @@ size_t AudioCapture::drain(std::vector<float>& accum, int frameSize,
     // v58.22: keep m_time glued to what the encoder actually consumed вЂ” the
     // System::update hook computes its required advance from
     // (m_fmodTime - m_time), so an encoder that lags the sim automatically
-    // stalls the mixer (backpressure), never lets it race ahead.
-    m_time = static_cast<double>(m_pumpedConsumed) /
+    // stalls the mixer (backpressure), never lets it race ahead. The dropped
+    // pre-roll counts here too: the mixer really did advance over it.
+    m_time = static_cast<double>(m_pumpedConsumed + m_discardedSamples) /
              static_cast<double>(m_sampleRate);
     return consumed;
 }

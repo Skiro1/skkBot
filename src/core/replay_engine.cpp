@@ -5,8 +5,10 @@
 #include "core/hotpath.hpp"
 #include "core/physical_keys.hpp"
 #include "core/replay_timing.hpp"
+#include "core/step_trace.hpp"
 #include "gui/skkbot_gui.hpp"
 #include "hacks/autoclicker.hpp"
+#include "skc/skc_batch_probe.hpp"
 #include "skc/skc_bot.hpp"
 
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -90,12 +92,19 @@ void notePlayerInput(char const* kind, int key) {
     // macro's commands are pushed (skc_hooks.cpp:413), and with it off the press
     // interleaves and the run drifts. Both are documented behaviour; which one
     // is active decides whether the line matters.
+    //
+    // Escape is special: this hook does NOT swallow it - UILayer still receives
+    // it and RobTop's own code pauses the game with it. Calling that "swallowed"
+    // sent the BUG-69 investigation looking for a swallowed-pause defect while
+    // the pause menu was on screen the whole time.
     const char* verdict =
-        playing
-        ? (skcIgnoring
-               ? "during playback, swallowed by Ignore Inputs"
-               : "during playback, NOT ignored - it interleaves with the macro")
-        : (active ? "while a run is open but not playing" : "outside a run");
+        key == 27
+            ? "GD pauses the game on Escape - playback is frozen in the pause menu"
+            : playing
+                ? (skcIgnoring
+                       ? "during playback, swallowed by Ignore Inputs"
+                       : "during playback, NOT ignored - it interleaves with the macro")
+                : (active ? "while a run is open but not playing" : "outside a run");
 
     if (tally.printed < PlayerInputTally::kPrintCap) {
         ++tally.printed;
@@ -247,6 +256,24 @@ namespace {
             int tick = static_cast<int>(active->m_gameState.m_levelTime * engine->runtimeTickRate());
             return std::max(0, tick + 1);
         }
+    }
+
+    // BUG-79 start trace: where exactly does the macro's FIRST click land
+    // relative to the level clock? distance input.tick - effectiveTick is the
+    // macro's own lede; anything further out should match the [START-WIN]
+    // frozen-window line in physicsbypass.cpp. Once per session, INFO.
+    static void logFirstPlaybackInput(ReplayEngine* engine, int inputTick,
+                                      int referenceTick, double levelTime,
+                                      size_t index, size_t total) {
+        if (engine->playbackFirstInputReported) {
+            return;
+        }
+        engine->playbackFirstInputReported = true;
+        skkbot2::log::info(
+            "[PLAY-START] first macro input dispatched: input.tick={} refTick={} "
+            "levelTime={:.4f}s idx={}/{} - positive (inputTick - refTick) is the "
+            "macro's lede; compare with [START-WIN] for the attempt-start freeze",
+            inputTick, referenceTick, levelTime, index, total);
     }
 
     static bool resolveFlipState() {
@@ -515,6 +542,16 @@ void ReplayEngine::simulateQueuedSubstepTick(
 class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     struct Fields {
         bool macroInput = false;
+        // Playback commands that must be visible in m_queuedButtons for the
+        // readers that consult the QUEUE instead of the hold map (dash-ring
+        // activation). They are collected at dispatch time and re-pushed right
+        // before this step's vanilla drain, because the drain also has to drop
+        // the user's own clicks - see processQueuedButtons.
+        std::vector<PlayerButtonCommand> queueMirror;
+        // True while vanilla is draining the queue. The input-only path
+        // dispatches AFTER the drain, so a queued copy there would be applied a
+        // step late; those events are deliberately not mirrored.
+        bool drainingQueue = false;
     };
 
     bool resolvePlaybackPlayer2(bool player2) {
@@ -602,13 +639,18 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         // queue-readers see the same events as in the recording. Vanilla
         // consumption routes back through our EXECUTE hook and is swallowed
         // there (map already correct), so this is side-effect free.
-        if (button >= 1 && button <= 3) {
+        //
+        // The copy is parked in queueMirror and flushed by processQueuedButtons
+        // immediately before the drain: pushing it here instead would let the
+        // step's own "drop the user's clicks" pass erase it (that was the
+        // bug - the mirror never reached a single reader).
+        if (button >= 1 && button <= 3 && !m_fields->drainingQueue) {
             PlayerButtonCommand command = {};
             command.m_button = static_cast<PlayerButton>(button);
             command.m_isPush = down;
             command.m_isPlayer2 = player2;
             command.m_timestamp = m_timestamp;
-            m_queuedButtons.push_back(command);
+            m_fields->queueMirror.push_back(command);
         }
     }
 
@@ -665,6 +707,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         // Drive the step clock for a PlayLayer attempt OR an editor playtest
         // (LevelEditorLayer playtest funnels through this base-layer update).
         if (!playLayer && !skk::gameplay::isEditorPlaytest()) {
+            skkbot2::step_trace::finish();
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
@@ -677,12 +720,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             skk::editor::attemptPlaytestArm(this, engine);
         }
 
-        // Step-grid clock boundary: every processCommands call IS one 1/240
-        // physics sub-step in a PlayLayer (probe-proven: dt=1/240 per call,
+        // Step-grid clock boundary: every processCommands call IS one physics
+        // sub-step in a PlayLayer (probe-proven: one call per forced step,
         // half/last are not pair flags, and m_currentStep stays 0 in this
         // batched pipeline). An editor playtest is different: GD funnels the
         // same calls at ~180/s with dt=1/180, so one call is only ~1.33 macro
-        // ticks. Advance by dt*tickRate (keeping the sub-tick remainder) so the
+        // ticks. Advance by dt*tickRate (keeping the fractional remainder) so the
         // playback grid stays locked to the level's game time instead of
         // drifting ~25% slow (the "speedhack-like" slowdown).
         if (engine->stepClock) {
@@ -742,23 +785,152 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         // and a fresh RECORD of the same span can be diffed line by line.
         const bool activeMode = engine->engineMode == MODE_CAPTURE ||
                                 engine->engineMode == MODE_EXECUTE;
+        // BUG-102 v3 hotfix: SKC record/play NEVER touch the SKK engineMode -
+        // the SKC bot is a sibling engine (State::Record/Playback on its own
+        // State), so the 04.11 sessions ran with SKK MODE_DISABLED, the probe
+        // never armed and the 11:29/11:35 logs have no probe lines at all.
+        const bool skcActive = skk::skc::Bot::get().isRecording() ||
+                               skk::skc::Bot::get().isPlaying();
+        const bool anyActive = activeMode || skcActive;
         const bool budgetProbe = engine->substepProbe > 0 && activeMode;
+        // BUG-102 v3: arm the window probe on an arbitrary tick from saved
+        // settings, not only around a playback death. The 04.11 divergences
+        // are LIVE at a deterministic tick (rec flips the portal f=417, play
+        // f=421) with bit-identical coordinates AND bit-identical levelTime
+        // (verified from trace bins), so the probe window must answer WHICH
+        // channel differs there: the half/last grouping phase of the feed
+        // (vanilla portal contact quantizes against half-ticks) or the
+        // moving-object timeline. Set `skc-probe-tick` in the mod's saved
+        // values (+= mod.json extras) to the tick of interest.
+        if (engine->probeAroundTick < 0 && engine->probeAroundTicks.empty() && anyActive) {
+            static bool sProbeTickRead = false;
+            if (!sProbeTickRead) {
+                sProbeTickRead = true;
+                // Щедро: несколько окон сразу - "skc-probe-ticks" = "416,516,1237".
+                const std::string list = geode::Mod::get()->getSavedValue<std::string>(
+                    "skc-probe-ticks", "");
+                std::string cur;
+                for (size_t i = 0; i <= list.size(); ++i) {
+                    if (i == list.size() || list[i] == ',' || list[i] == ';') {
+                        if (!cur.empty()) {
+                            try {
+                                engine->probeAroundTicks.push_back(std::stoi(cur));
+                            } catch (...) {}
+                            cur.clear();
+                        }
+                    } else if (list[i] >= '0' && list[i] <= '9') {
+                        cur.push_back(list[i]);
+                    }
+                }
+                const int64_t saved = geode::Mod::get()->getSavedValue<int64_t>(
+                    "skc-probe-tick", -1);
+                if (saved >= 0) {
+                    engine->probeAroundTick = static_cast<int>(saved);
+                    engine->probeAroundTicks.push_back(static_cast<int>(saved));
+                }
+                if (!engine->probeAroundTicks.empty()) {
+                    std::string joined;
+                    for (int t : engine->probeAroundTicks) {
+                        if (!joined.empty()) joined += ",";
+                        joined += std::to_string(t);
+                    }
+                    skkbot2::log::info(
+                        "[SKC] window probe armed at ticks [{}] (skc-probe-ticks/skc-probe-tick)",
+                        joined);
+                }
+            }
+        }
         bool windowProbe = false;
         int probeTick = 0;
-        if (engine->probeAroundTick >= 0 && activeMode) {
+        if ((!engine->probeAroundTicks.empty() || engine->probeAroundTick >= 0) && anyActive) {
             probeTick = tick_util::current(this, engine);
-            windowProbe = std::abs(probeTick - engine->probeAroundTick) <= 24;
+            for (int center : engine->probeAroundTicks) {
+                if (std::abs(probeTick - center) <= 24) {
+                    windowProbe = true;
+                    break;
+                }
+            }
         }
         if (budgetProbe) {
             --engine->substepProbe;
         }
+        // BUG-102 v3: позиция подшага внутри кадра дисплея - счётчик
+        // сбрасывается в update-хуке раз в кадр (skc_batch_probe.hpp).
+        // Инкремент на КАЖДЫЙ вызов processCommands: вне probe-окна счётчик
+        // тоже должен быть жив - gravity-flip строки печатают batch в любой
+        // точке уровня, а окно не всегда накрывает флип (1057 вне 476-524).
+        skkbot2::skcprobe::noteStep();
         if (budgetProbe || windowProbe) {
-            skkbot2::log::debug(
-                "substep probe{}: mode={} half={} last={} dt={:.7f} lt={:.7f} ltTicks={:.4f} step={} tick={}",
+            // info: debug lines never reach the tiny flush buffer, and the
+            // window comparison (rec session vs play session on the same
+            // tick) is exactly what the diverging level needs to answer.
+            // Label: SKC keeps its own state enum (SKK engineMode stays
+            // MODE_DISABLED in SKC-only sessions), so pick per engine.
+            const char* modeLabel =
+                skcActive ? (skk::skc::Bot::get().isRecording() ? "rec-skc"
+                                                               : "play-skc")
+                          : (engine->engineMode == MODE_CAPTURE ? "rec-skk"
+                                                                : "play-skk");
+            // BUG-102 v3: m_objectID - это ТИП объекта, инстансов 2926
+            // в уровне много (сессия 14:35: кэш из portal-see поймал
+            // чужой инстанс в (5042,3165) scale 0.76 rot 90, а
+            // активный портал оседает в (2492,3150) scale 0.89
+            // rot 270). Один раз собираем ВСЕ инстансы и печатаем
+            // ближайший к игроку - его rect и есть гейт флипа.
+            static std::vector<GameObject*> s_portalInstances;
+            static bool s_portalsInit = false;
+            if (!s_portalsInit) {
+                s_portalsInit = true;
+                if (m_objects) {
+                    for (int i = 0; i < m_objects->count(); ++i) {
+                        auto* obj = static_cast<GameObject*>(m_objects->objectAtIndex(i));
+                        if (obj && obj->m_objectID == 2926) s_portalInstances.push_back(obj);
+                    }
+                }
+                skkbot2::log::info("[SKC] portal-2926 instances collected: n={}",
+                                   s_portalInstances.size());
+            }
+            GameObject* probePortal = nullptr;
+            {
+                const float px = m_player1 ? m_player1->getPositionX() : 0.0f;
+                float bestDist = 1e9f;
+                for (auto* inst : s_portalInstances) {
+                    const float d = std::fabs(inst->getPositionX() - px);
+                    if (d < bestDist) { bestDist = d; probePortal = inst; }
+                }
+            }
+            skkbot2::log::info(
+                "substep probe{}: mode={} half={} last={} dt={:.7f} lt={:.7f} "
+                "ltTicks={:.4f} step={} tick={} batch={} fdt={:.7f} "
+                "vy={:.4f} nx={:.3f} ny={:.3f} mx={:.3f} my={:.3f} "
+                "gx={:.3f} gy={:.3f} rminy={:.3f} rmaxy={:.3f} "
+                "sfg={} shh={} upy={:.3f} pY={:.3f} maxPY={:.3f} minPY={:.3f} "
+                "portal={}:px={:.3f} py={:.3f} ps={:.4f} pr={:.4f}",
                 windowProbe ? "[win]" : "",
-                engine->engineMode == MODE_CAPTURE ? "rec" : "play",
+                modeLabel,
                 isHalfTick, isLastTick, dt, m_gameState.m_levelTime,
-                m_gameState.m_levelTime * engine->runtimeTickRate(), m_currentStep, probeTick);
+                m_gameState.m_levelTime * engine->runtimeTickRate(), m_currentStep, probeTick,
+                skkbot2::skcprobe::g_batchStep, skkbot2::skcprobe::g_frameDt,
+                m_player1 ? static_cast<double>(m_player1->m_yVelocity) : -1.0,
+                m_player1 ? m_player1->getPosition().x : -1.0,
+                m_player1 ? m_player1->getPosition().y : -1.0,
+                m_player1 ? m_player1->m_position.x : -1.0,
+                m_player1 ? m_player1->m_position.y : -1.0,
+                m_player1 ? m_player1->m_positionX : -1.0,
+                m_player1 ? m_player1->m_positionY : -1.0,
+                m_player1 ? m_player1->getObjectRect().getMinY() : -1.0,
+                m_player1 ? m_player1->getObjectRect().getMaxY() : -1.0,
+                m_player1 ? m_player1->m_stateFlipGravity : -1,
+                m_player1 ? m_player1->m_stateHitHead : -1,
+                static_cast<double>(m_gameState.m_unkUint17),
+                static_cast<double>(m_gameState.m_portalY),
+                static_cast<double>(getMaxPortalY()),
+                static_cast<double>(getMinPortalY()),
+                probePortal ? probePortal->m_objectID : 0,
+                probePortal ? static_cast<double>(probePortal->getPositionX()) : -1.0,
+                probePortal ? static_cast<double>(probePortal->getPositionY()) : -1.0,
+                probePortal ? static_cast<double>(probePortal->getScale()) : -1.0,
+                probePortal ? static_cast<double>(probePortal->getRotation()) : -1.0);
             // Mover timeline probe: hash of every moving object's
             // id/pos/rot. Movers advance with the cocos action manager - if
             // that path runs on raw frame time instead of the fixed grid,
@@ -784,7 +956,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         (static_cast<uint64_t>(std::llround(obj->getRotation() * 4.0)) << 56);
                     moversHash = moversHash * 1000003ULL + mix;
                 }
-                skkbot2::log::debug(
+                skkbot2::log::info(
                     "movers probe{}: tick={} n={} h={:016X} first={}@({:.2f},{:.2f})",
                     windowProbe ? "[win]" : "", probeTick, movers->count(), moversHash,
                     firstId, fx, fy);
@@ -851,19 +1023,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             if (engine->engineMode != MODE_DISABLED) {
                 if (tick > 2 && engine->initialRun && engine->hasMacro()) {
                     engine->initialRun = false;
-                    if (engine->suppressInitialRunReset) {
-                        // Fresh level entry after queueing outside: already at
-                        // the start, no need to reset. Consume the flag.
-                        engine->suppressInitialRunReset = false;
-                    } else if (!m_levelEndAnimationStarted && playLayer) {
-                        skkbot2::log::info("initialRun: re-syncing attempt start (resetLevel at tick {})", tick);
-                        if (m_levelSettings->m_platformerMode) {
-                            playLayer->resetLevelFromStart();
-                        } else {
-                            playLayer->resetLevel();
-                        }
-                        return std::nullopt;
-                    }
+                    engine->suppressInitialRunReset = false;
                 }
 
                 if (skk::replay_timing::shouldSkipRepeatedProcessSlice(
@@ -1005,6 +1165,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     dbgP1J, dbgP1L, dbgP1R, dbgP2J, dbgP2L, dbgP2R);
             }
 
+            skkbot2::step_trace::finish();
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
@@ -1049,6 +1210,15 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         tGdStart = std::chrono::steady_clock::now();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
+        // Compare raw live physics before executeTick can reconcile positions,
+        // velocity, or other recorded state. This detector never writes state.
+        if (skkbot2::step_trace::enabled()) {
+            skkbot2::step_trace::checkDrift(
+                this, tick + engine->tickOffset,
+                engine->engineMode == MODE_CAPTURE,
+                engine->engineMode == MODE_EXECUTE, false);
+        }
+
         engine->lastTickIndex = tick;
         engine->lastStepDelta = stepDelta;
         engine->lastProcessSliceTimestamp = processSliceTimestamp;
@@ -1086,6 +1256,13 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
             }
         }
+
+        // One row per completed processCommands call, after capture/playback
+        // reconciliation. The trace frame is the macro clock; batch records
+        // the game-step count consumed for this macro tick (zero for any
+        // additional substeps belonging to the same tick).
+        skkbot2::step_trace::record(this, tick + engine->tickOffset,
+                                    newTick ? static_cast<unsigned>(std::max(stepDelta, 0)) : 0u);
 
         // === PLAYBACK JUMP TRACER: frame boundary detector ==================
         // isLastTick marks the last physics step of a visual (60Hz) frame, i.e.
@@ -1142,12 +1319,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             gFrameLastVy = vy;
         }
         // === RENDERED-DRIFT METER (Этап 0) =====================================
-        // playDriftMax reads preP1x inside reconcilePerFrames (pre-position-write)
-        // and therefore always shows the ±~1.95px phase saw even when the
-        // recorded frame is applied exactly. THIS meter samples the actual
-        // post-reconcile rendered state at the visual boundary (isLastTick):
-        // (live - last applied recorded frame). A nonzero value here is a real
-        // residual a user could see; phase-saw artifacts do not appear.
+        // playDriftMax reads preP1x inside reconcilePerFrames (pre-position-write):
+        // it measures how far vanilla physics wandered BEFORE the recorded
+        // position is applied. It is not a visible playback residual. This meter
+        // samples the actual post-reconcile state at the visual boundary
+        // (isLastTick): (live - last applied recorded frame). A nonzero value
+        // here is a residual a user could see; phase-saw artifacts do not appear.
         auto* rdriftFrames = engine->activePerFrames();
         if (isLastTick && rdriftFrames && !rdriftFrames->empty() && m_player1) {
             const float rpx = m_player1->getPositionX();
@@ -1202,13 +1379,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
         if (tick > 2 && engine->initialRun && engine->hasMacro() && !m_levelEndAnimationStarted) {
             engine->initialRun = false;
-            if (engine->suppressInitialRunReset) {
-                engine->suppressInitialRunReset = false;
-            } else {
-                if (m_levelSettings->m_platformerMode) playLayer->resetLevelFromStart();
-                else playLayer->resetLevel();
-                return GJBaseGameLayer::update(dt);
-            }
+            engine->suppressInitialRunReset = false;
         }
 
             if (newTick) {
@@ -1258,6 +1429,14 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         auto* engine = ReplayEngine::get();
         auto* playLayer = PlayLayer::get();
         if (!engine->hasMacro() || !playLayer) {
+            return;
+        }
+
+        // Do not sample trajectory/anchors while either player is in a death
+        // animation. The next reset decides whether the preceding live segment
+        // is retained (practice checkpoint) or wiped (fresh attempt).
+        if (engine->captureDeathPending ||
+            (m_player1 && m_player1->m_isDead) || (m_player2 && m_player2->m_isDead)) {
             return;
         }
 
@@ -1326,6 +1505,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
 
             bool player2 = input.isPlayer2();
+            logFirstPlaybackInput(engine, input.tick, effectiveTick,
+                                  m_gameState.m_levelTime,
+                                  static_cast<size_t>(engine->executeIndex),
+                                  inputList.size());
             dispatchImmediatePlaybackAction(tick, input.actionType, input.isPressed(), player2, input.stepOffset);
             ++engine->executeIndex;
         }
@@ -1347,6 +1530,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
 
             bool player2 = input.isPlayer2();
+            logFirstPlaybackInput(engine, input.tick, progress,
+                                  m_gameState.m_levelTime,
+                                  static_cast<size_t>(engine->executeIndex),
+                                  inputList.size());
             dispatchImmediatePlaybackAction(input.tick, input.actionType, input.isPressed(), player2, input.stepOffset);
             ++engine->executeIndex;
         }
@@ -1360,6 +1547,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             auto const& input = inputList[engine->executeIndex];
             int inputTick = static_cast<int>(input.frame);
             if (inputTick > progress) break;
+            logFirstPlaybackInput(engine, inputTick, progress,
+                                  m_gameState.m_levelTime,
+                                  static_cast<size_t>(engine->executeIndex),
+                                  inputList.size());
             dispatchImmediatePlaybackAction(inputTick, input.button, input.down, input.player2, input.stepOffset);
             ++engine->executeIndex;
         }
@@ -1383,6 +1574,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 break;
             }
 
+            logFirstPlaybackInput(engine, inputTick, effectiveTick,
+                                  m_gameState.m_levelTime,
+                                  static_cast<size_t>(engine->executeIndex),
+                                  inputList.size());
             dispatchImmediatePlaybackAction(tick, input.button, input.down, input.player2, input.stepOffset);
             ++engine->executeIndex;
         }
@@ -2482,7 +2677,8 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             if (drift > 1.2f && pf.tick - engine->playDriftLastLogTick >= 240) {
                 engine->playDriftLastLogTick = pf.tick;
                 skkbot2::log::info(
-                    "playback drift: tick={} dx={:.3f} dy={:.3f} (max {:.3f}@{})",
+                    "pre-reconcile physics delta: tick={} dx={:.3f} dy={:.3f} "
+                    "(max {:.3f}px@{}; position is reconciled afterward)",
                     pf.tick, dx, dy, engine->playDriftMax, engine->playDriftMaxTick);
             }
 
@@ -2728,7 +2924,26 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             macSubstepDispatch();
         }
 #endif
+        // Ignore Inputs: the player's own clicks must not interleave with the
+        // macro. Clearing is still the cheapest way to drop them (the drain
+        // would swallow them at handleButton anyway, but the queue itself is
+        // read by dash-ring code), and it used to also erase the playback
+        // mirror pushed at dispatch time. Re-push that mirror right here, after
+        // the clear and before the drain, so queue-readers finally see the
+        // macro's own events on the tick they belong to.
+        const bool dropUserInput =
+            engine->engineMode == MODE_EXECUTE && engine->manualInputIgnoredActive();
+        if (dropUserInput) {
+            m_queuedButtons.clear();
+            for (auto const& command : m_fields->queueMirror) {
+                m_queuedButtons.push_back(command);
+            }
+        }
+        m_fields->queueMirror.clear();
+        const bool previousDraining = m_fields->drainingQueue;
+        m_fields->drainingQueue = true;
         GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+        m_fields->drainingQueue = previousDraining;
 
         processInputOnly(shouldUseInputOnlySkPlayback(), [&](int p) { dispatchInputOnlySkInputs(p); });
         processInputOnly(shouldUseInputOnlyGDRPlayback(), [&](int p) { dispatchGDRInputsOnly(p); });
@@ -3031,16 +3246,31 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         const bool effChanged = (effSlot == 1 ? p2Changed : p1Changed);
 
         // Checkpoint-restore seam: GD flushes stale buffered presses AND
-        // the stale physical releases right after loadFromCheckpoint. Drop
-        // every input event inside the suppression window (presses too) -
-        // without touching the shadow, so the real events after the window
-        // still form proper edges.
-        // Releases inside the window: apply to GD (so no stuck hold can
-        // linger) but keep them out of the macro stream.
+        // the stale physical releases right after loadFromCheckpoint. The
+        // suppression window drops ONLY state no-op releases: by the time the
+        // flush arrives the restore has already wiped the hold maps
+        // (clearRestoredHolds) - a flush release finds the map at 0 and
+        // nothing recorded, so effBefore==0 && !shadowHeld. Such releases are
+        // exactly what the no-transition gate would reject anyway.
+        // BUG-103 class (fixed in SKC, live evidence release@1681 walked
+        // exactly onto the window edge): a GENUINE quick release inside the
+        // window - the tap whose press was recorded at the boundary - used to
+        // be dropped WITHOUT updating recordedHoldShadow, clipping the tap
+        // tail and leaving the shadow stale for the wave-flip flush paths.
+        // A release that actually releases a recorded hold (effBefore==1 or
+        // shadowHeld) passes the window and goes through the normal edge
+        // logic below.
         if (!hold && engine->captureReleaseSuppressUntil >= eventTick) {
-            skkbot2::log::debug("capture drop [restore-window]: tick={} button={} p2={} down=false effSlot={} (post-restore release, not recorded)",
-                eventTick, button, player2, effSlot);
-            return;
+            if (effBefore == 1 || shadowHeld) {
+                skkbot2::log::debug(
+                    "capture [restore-window] genuine release PASSES: tick={} button={} p2={} "
+                    "effSlot={} effBefore={} shadowHeld={}",
+                    eventTick, button, player2, effSlot, effBefore, shadowHeld ? 1 : 0);
+            } else {
+                skkbot2::log::debug("capture drop [restore-window]: tick={} button={} p2={} down=false effSlot={} (post-restore release, not recorded)",
+                    eventTick, button, player2, effSlot);
+                return;
+            }
         }
 
         if (trackHoldTransition && !hold && wasHeld && engine->isCheckpointHoldResumed(recordSlot, button)) {
@@ -3183,6 +3413,13 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
     // direct=false. Logging who pressed, which player, and the resulting hold
     // map tells us if the self-jump originates OUTSIDE the button system.
     void reportButtonCall(const char* kind, int button) {
+        // Level gate FIRST: the lines below build tick stamps and dig through
+        // two m_holdingButtons maps per call, at up to ~14k calls a second in
+        // a dual playback. wouldLog(Debug) is one integer compare; everything
+        // past it is wasted when the flood is not being written.
+        if (!skkbot2::Logger::get().wouldLog(skkbot2::Logger::Debug)) {
+            return;
+        }
         auto* playLayer = PlayLayer::get();
         if (!playLayer) {
                 return;
@@ -3211,13 +3448,8 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
             auto it = hb.find(1);
             holdP2 = it == hb.end() ? 0 : (it->second ? 1 : 0);
         }
-        skkbot2::log::debug(
-            "diag {}: tick={} button={} p1={} p2={} vanilla={} mode={} deadP1={} holdP1={} holdP2={}",
-            kind, tick, button, isP1 ? 1 : 0, isP2 ? 1 : 0,
-            g_diagInVanillaHandleButton ? 1 : 0, engineMode,
-            playLayer->m_player1 && playLayer->m_player1->m_isDead ? 1 : 0,
-            holdP1, holdP2
-        );
+        // Hot path diag debug log disabled to prevent 7 FPS disk stalls
+        (void)kind; (void)tick; (void)button; (void)isP1; (void)isP2; (void)holdP1; (void)holdP2;
     }
 
     bool pushButton(PlayerButton button) {

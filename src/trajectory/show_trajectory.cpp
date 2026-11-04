@@ -1,3 +1,4 @@
+#include "physics/near_movers.hpp"
 // Trajectory overlay - "hold / release" prediction lines.
 //
 // STATUS: NOT COMPILED YET. This file is a starting point copied from GDH
@@ -295,7 +296,7 @@ void copyPlayerState(PlayerObject* from, PlayerObject* to) {
     to->m_isOnGround3 = from->m_isOnGround3;
     to->m_checkpointTimeout = from->m_checkpointTimeout;
     to->m_lastCheckpointTime = from->m_lastCheckpointTime;
-    to->m_lastJumpTime = from->m_lastJumpTime;
+    // m_lastJumpTime (wall-clock) NOT copied between sim players.
     to->m_lastFlipTime = from->m_lastFlipTime;
     to->m_flashTime = from->m_flashTime;
     to->m_flashDuration = from->m_flashDuration;
@@ -798,6 +799,10 @@ class $modify(SkkTrajectoryBaseGameLayer, GJBaseGameLayer) {
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
                                int objectCount, float dt) {
         if (!skk::trajectory::g_simulating) {
+            if (objects == &m_calcNonEffectObjects && objectCount > 0 && skk::phys::nearMoversEnabled()) {
+                objects = skk::phys::filterNearMovers(player, objects, objectCount, dt);
+                objectCount = static_cast<int>(objects->size());
+            }
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }

@@ -188,11 +188,6 @@ bool decodeStream(std::span<const uint8_t> data, bool streamIsP2,
     return true;
 }
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::gbr::looksLikeGbr(std::span<const uint8_t> data) {
@@ -302,12 +297,11 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
     if (!std::isfinite(replay.tps) || replay.tps <= 1.0f) {
         return fail("gbr: unusable tps " + std::to_string(replay.tps));
     }
-    if (replay.platformer()) {
-        return fail("gbr: platformer replays are not supported yet");
-    }
-    // SKC has no death chain, so a macro carrying deaths cannot be played and
-    // silently dropping them would produce one that dies where the original did
-    // not - with nothing in the log pointing at the cause.
+    // Platformer macros are importable now: SKC carries the mode flag and the
+    // buttons (2/3) were already in the action stream. What SKC cannot carry is
+    // a death chain: a macro carrying deaths cannot be played, and silently
+    // dropping them would produce one that dies where the original did not -
+    // with nothing in the log pointing at the cause.
     if (!replay.deaths.empty()) {
         return fail("gbr: replay has " + std::to_string(replay.deaths.size()) +
                     " death(s), first at frame " +
@@ -318,26 +312,15 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
 
     out = skc::Macro{};
     out.header.tps = replay.tps;
+    out.platformerMode = replay.platformer();
+    out.platformerKnown = true;
+    out.header.platformerMode = out.platformerMode;
+    out.header.platformerKnown = true;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
     std::size_t fromAc = 0;
     for (const auto& a : replay.actions) {
-        const std::size_t ch = channelIndex(a.button, a.player2);
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
         if (a.fromAutoclicker) ++fromAc;
         if (a.frame > 0xFFFFFFFFull) {
             return fail("gbr: frame " + std::to_string(a.frame) +
@@ -351,6 +334,13 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
         out.actions.push_back(
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
+
+    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
+    // up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
 
     if (out.actions.empty()) return fail("gbr: no usable inputs after normalisation");
 
@@ -371,10 +361,11 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
     }
 
     skkbot2::log::warn(
-        "[GBR] v{} (tps {:.0f}, rngSeed {}{}): {} actions -> {} actions, "
-        "{} from autoclicker, dropped {} release(s) with no press and {} "
-        "duplicate press(es), frame shift {:+d} (first click {} -> {})",
-        replay.version, replay.tps, replay.rngSeed,
+        "[GBR] v{} (tps {:.0f}, {}, rngSeed {}{}): {} actions -> {} actions, "
+        "{} from autoclicker, dropped {} release(s) with no press and rebuilt {} "
+        "collapsed tap(s), frame shift {:+d} (first click {} -> {})",
+        replay.version, replay.tps,
+        replay.platformer() ? "platformer" : "classic", replay.rngSeed,
         replay.rngLocked() ? ", rng locked" : "", replay.actions.size(),
         out.actions.size(), fromAc, droppedRelease, droppedDuplicate, kFrameShift,
         replay.actions.empty() ? 0 : replay.actions.front().frame,

@@ -1110,47 +1110,6 @@ void ReplayEngine::runWithUnsavedMacroGuard(std::function<void()> continueAction
     popup->show();
 }
 
-class $modify(RestorePointHandler, CheckpointObject) {
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
-    bool init() {
-        bool result = CheckpointObject::init();
-        CheckpointObject* checkpoint = this;
-#else
-    static CheckpointObject* create() {
-        CheckpointObject* result = CheckpointObject::create();
-        CheckpointObject* checkpoint = result;
-#endif
-
-        if (!checkpoint) {
-            return result;
-        }
-
-        auto* engine = ReplayEngine::get();
-        auto* playLayer = PlayLayer::get();
-        if (!playLayer
-            || engine->engineMode != MODE_CAPTURE
-            || skk::trajectory::isSimulating()) {
-            return result;
-        }
-
-        int tick = static_cast<int>(playLayer->m_gameState.m_levelTime * engine->runtimeTickRate());
-        tick++;
-
-        engine->storedRestorePoints[checkpoint] = CheckpointStateManager::capture(
-            tick,
-            engine->lastTickIndex,
-            playLayer,
-            engine->captureRngState()
-        );
-        engine->captureOnCheckpointTouched(tick);
-        skkbot2::log::debug("P1 capture: checkpoint stored tick={} totalRestorePoints={} hasFull={}",
-            tick, engine->storedRestorePoints.size(),
-            engine->storedRestorePoints[checkpoint].hasFullState);
-
-        return result;
-    }
-};
-
 class $modify(BrokenObjectHook, GJBaseGameLayer) {
     void destroyObject(GameObject* obj) {
         GJBaseGameLayer::destroyObject(obj);
@@ -1166,6 +1125,15 @@ class $modify(BrokenObjectHook, GJBaseGameLayer) {
 class $modify(MacroPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         auto* engine = ReplayEngine::get();
+        if (engine->pendingAction != ReplayEngine::PendingAction::None) {
+            skkbot2::log::info(
+                "PLAY init hook reached: queued={} level='{}' id={} platformer={}",
+                engine->pendingAction == ReplayEngine::PendingAction::Play
+                    ? "PLAY" : "RECORD",
+                level ? level->m_levelName.c_str() : "<null>",
+                level ? level->m_levelID : 0,
+                m_isPlatformer ? "true" : "false");
+        }
         // Runtime state from the previous scene survives into a newly inited
         // level ONLY when it belongs to this same level: pause-menu Restart and
         // re-entering the level recreate the PlayLayer, and recording/playing
@@ -1212,8 +1180,26 @@ class $modify(MacroPlayLayer, PlayLayer) {
         // respawns in practice never recreate the PlayLayer and keep reusing
         // the same object instances, so the registry still survives attempts.
         skk::advRandomClear();
+        // CheckpointObject pointers belong to one PlayLayer instance. Even an
+        // editor playtest that preserves the macro/runtime must not carry its
+        // retained platformer objects into the newly-created layer.
+        engine->clearPlatformerCheckpoints();
         bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
         if (auto* engine = ReplayEngine::get()) {
+            // beginCapture/initializeSkMacro can run from consumePendingAction
+            // before the base PlayLayer::init creates m_levelSettings. Stamp
+            // mode metadata now, while the actual initialized layer is live.
+            if (ret && engine->engineMode == MODE_CAPTURE && engine->skMode &&
+                engine->activeSk && engine->activeSk->levelId ==
+                    static_cast<int32_t>(level ? level->m_levelID : 0) &&
+                m_levelSettings) {
+                engine->activeSk->platformerMode = m_levelSettings->m_platformerMode;
+                engine->activeSk->twoPlayerMode = m_levelSettings->m_twoPlayerMode;
+                skkbot2::log::info(
+                    "RECORD mode metadata stamped after PlayLayer init: platformer={} twoPlayer={}",
+                    engine->activeSk->platformerMode ? "true" : "false",
+                    engine->activeSk->twoPlayerMode ? "true" : "false");
+            }
             if (engine->replayAccuracyEnvironmentActive) {
                 // The replay owns the accuracy environment — it re-applies its
                 // own mode on every arm.
@@ -1244,8 +1230,97 @@ class $modify(MacroPlayLayer, PlayLayer) {
         return ret;
     }
 
-    void applyReplayResetState(bool inPractice, int tick) {
+    void storeCheckpoint(CheckpointObject* checkpoint) {
+        const bool setupCheckpoint = m_activatedCheckpoint != nullptr;
+        PlayLayer::storeCheckpoint(checkpoint);
+
         auto* engine = ReplayEngine::get();
+        if (checkpoint && m_isPlatformer && setupCheckpoint && engine &&
+            (engine->engineMode == MODE_CAPTURE || engine->engineMode == MODE_EXECUTE)) {
+            engine->trackPlatformerCheckpoint(checkpoint);
+        }
+        if (!checkpoint || !engine || engine->engineMode != MODE_CAPTURE ||
+            !engine->skMode || !engine->activeSk || skk::trajectory::isSimulating() ||
+            engine->captureDeathPending ||
+            (m_player1 && m_player1->m_isDead) ||
+            (m_player2 && m_player2->m_isDead)) {
+            return;
+        }
+
+        // CheckpointObject::init is too early: the object can be constructed
+        // before GD copies the live game state into it. GucciBot and Echo both
+        // bind checkpoint state from PlayLayer::storeCheckpoint instead. This
+        // matters especially for platformer setup-checkpoints, whose activated
+        // object is represented by m_activatedCheckpoint.
+        const int tick = static_cast<int>(
+            m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
+        auto bundle = CheckpointStateManager::capture(
+            tick, engine->lastTickIndex, this, engine->captureRngState());
+        const bool hasFull = bundle.hasFullState;
+        engine->storedRestorePoints[checkpoint] = std::move(bundle);
+
+        // GucciBot's platformer path keys setup-checkpoints here, while
+        // m_activatedCheckpoint is still set. Do not rely on
+        // GJBaseGameLayer::checkpointActivated: GD 2.2081 does not route this
+        // setup-checkpoint path through that callback. storeCheckpoint is the
+        // live checkpoint boundary for both ordinary and setup checkpoints.
+        engine->captureOnCheckpointTouched(tick);
+        skkbot2::log::info(
+            "CAPTURE checkpoint stored: tick={} platformer={} activatedSetup={} "
+            "restorePoints={} hasFull={}",
+            tick, m_isPlatformer, setupCheckpoint,
+            engine->storedRestorePoints.size(), hasFull);
+    }
+
+    void applyReplayResetState(bool inPractice, int tick,
+                               bool platformerCheckpointMode = false) {
+        auto* engine = ReplayEngine::get();
+
+        // A platformer level uses checkpoints even when m_isPracticeMode is
+        // false: the editor "setup checkpoint" object / PlayerObject's
+        // platformer auto-checkpoint path calls PlayLayer::markCheckpoint() and
+        // GD respawns from the last CheckpointObject on death. Treating that
+        // reset as a from-start restart wiped the recorded timeline and every
+        // restore point, so the retry continued without the checkpoint the
+        // player actually respawned at. Practice mode and platformer both keep
+        // the checkpoint chain; only a real from-start reset drops it.
+        const bool checkpointMode = inPractice || platformerCheckpointMode;
+
+        // `tick` is m_gameState.m_currentProgress, which is an x coordinate in
+        // a platformer and is still ~0 at the editor "setup checkpoint" (the
+        // player has not moved yet). The old `tick <= 1` wipe guard therefore
+        // deleted the snapshot of the very checkpoint the player respawned at.
+        // In platformer the authoritative sign of a checkpoint respawn is the
+        // checkpoint array GD is about to restore from: resetLevel() calls
+        // loadFromCheckpoint(lastObject()) whenever it is non-empty. Classic
+        // keeps the progress guard (there is no x-based checkpoint array in a
+        // normal classic run).
+        const bool checkpointPresent =
+            m_checkpointArray && m_checkpointArray->count() > 0;
+        const bool progressed = platformerCheckpointMode ? checkpointPresent
+                                                         : (tick > 1);
+        const bool wipeCapture = !checkpointMode || !progressed ||
+                                 engine->storedRestorePoints.empty();
+        // Snapshot-map availability is a capture concern, not the lifetime of
+        // GD's platformer checkpoint object. During playback there is normally
+        // no storedRestorePoints map, but the exact setup CheckpointObject must
+        // remain tracked across every retry. Drop objects only on a true
+        // from-start reset, not merely because this session has no capture map.
+        if (!checkpointMode || !progressed) {
+            engine->clearPlatformerCheckpoints();
+        }
+
+        if (engine->engineMode == MODE_CAPTURE) {
+            skkbot2::log::info(
+                "CAPTURE reset: practice={} platformer={} tick={} levelTick={} "
+                "checkpoints={} restorePoints={} -> {}",
+                inPractice, platformerCheckpointMode, tick,
+                computePlaybackTick(this),
+                m_checkpointArray ? m_checkpointArray->count() : 0,
+                engine->storedRestorePoints.size(),
+                (!checkpointMode || !progressed || engine->storedRestorePoints.empty())
+                    ? "WIPE" : "KEEP");
+        }
 
         // Per-object RNG (2068/1912/3607): re-seed FIRST while the registry
         // still holds the level instance's object pointers. These states are
@@ -1294,7 +1369,13 @@ class $modify(MacroPlayLayer, PlayLayer) {
             const bool spawnCovered = engine->coversPlaybackPosition(
                 spawnX, spawnY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
             if (spawnCovered || !engine->skMode) {
-                engine->armPendingPlaybackStart(this);
+                const bool armed = engine->armPendingPlaybackStart(this);
+                skkbot2::log::info(
+                    "PLAY reset spawn decision: covered={} armed={} mode={} "
+                    "spawn=({:.1f},{:.1f})",
+                    spawnCovered ? "true" : "false",
+                    armed ? "true" : "false",
+                    static_cast<int>(engine->engineMode), spawnX, spawnY);
             } else {
                 skkbot2::log::info(
                     "PLAY armed-wait: respawn=({:.0f},{:.0f}) not covered by macro - waiting for live coverage "
@@ -1414,9 +1495,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 return;
             }
 
-            skkbot2::log::info("PLAY attempt: practice={} progressPct={} levelTick={} ref=({:.0f},{:.0f}) "
+            skkbot2::log::info("PLAY attempt: practice={} platformer={} progressPct={} levelTick={} ref=({:.0f},{:.0f}) "
                     "startPos={} recStartPos={} match={} midRun={} recOrigin=[tick={} ({:.0f},{:.0f})] anchors={}",
-                inPractice, tick, computePlaybackTick(this),
+                inPractice, platformerCheckpointMode, tick, computePlaybackTick(this),
                 refX, refY,
                 m_startPosObject != nullptr, recordedFromStartPos, startPosMatch,
                 midRun, recFirstTick, recFirstX, recFirstY,
@@ -1643,7 +1724,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
         }
 
         if (engine->engineMode == MODE_CAPTURE && engine->skMode && engine->activeSk && engine->persistenceMode) {
-            if (!inPractice || tick <= 1 || engine->storedRestorePoints.empty()) {
+            if (!checkpointMode || !progressed || engine->storedRestorePoints.empty()) {
                 engine->flushPendingPersistenceCaptureAttempt();
                 engine->resetPersistenceCaptureAttempt();
                 engine->storedRestorePoints.clear();
@@ -1651,7 +1732,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 clearPlayerHolds();
             }
         } else if (engine->engineMode == MODE_CAPTURE && engine->skMode && engine->activeSk) {
-            if (!inPractice || tick <= 1 || engine->storedRestorePoints.empty()) {
+            if (!checkpointMode || !progressed || engine->storedRestorePoints.empty()) {
                 engine->activeSk->inputs.clear();
                 engine->activeSk->anchors.clear();
                 engine->activeSk->perFrames.clear();
@@ -1660,7 +1741,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 clearPlayerHolds();
             }
         } else if (engine->engineMode == MODE_CAPTURE && !engine->skMode && engine->activeMacro) {
-            if (!inPractice || tick <= 1 || engine->storedRestorePoints.empty()) {
+            if (!checkpointMode || !progressed || engine->storedRestorePoints.empty()) {
                 engine->activeMacro->inputs.clear();
                 engine->activeMacro->anchors.clear();
                 engine->storedRestorePoints.clear();
@@ -1682,6 +1763,21 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->stepPairCount = 0;  // step clock restarts with the attempt
         engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
+        CheckpointObject* injectedPlatformerCheckpoint = nullptr;
+        if (m_isPlatformer && m_checkpointArray &&
+            !engine->platformerCheckpointObjects.empty()) {
+            injectedPlatformerCheckpoint = engine->platformerCheckpointObjects.back();
+            if (m_checkpointArray->lastObject() != injectedPlatformerCheckpoint) {
+                m_checkpointArray->addObject(injectedPlatformerCheckpoint);
+                skkbot2::log::info(
+                    "CAPTURE/PLAY setup-checkpoint reset: selected saved object={} "
+                    "ahead of GD array tail",
+                    static_cast<void*>(injectedPlatformerCheckpoint));
+            } else {
+                injectedPlatformerCheckpoint = nullptr;
+            }
+        }
+
         engine->pinSetupSeedBeforeReset();
         resetSimulationTimingState();
         // Death/restart seam: GD keeps buffered presses from the death
@@ -1690,13 +1786,33 @@ class $modify(MacroPlayLayer, PlayLayer) {
         // phantom-suppression window (labels restart at 1 -> +8).
         m_queuedButtons.clear();
         PlayLayer::resetLevel();
+        if (injectedPlatformerCheckpoint && m_checkpointArray &&
+            m_checkpointArray->count() > 0 &&
+            m_checkpointArray->lastObject() == injectedPlatformerCheckpoint) {
+            m_checkpointArray->removeLastObject();
+        }
         m_queuedButtons.clear();
         resetSimulationTimingState();
         engine->captureReleaseSuppressUntil = 8;
         engine->resetRecordedHoldShadow();
+        engine->captureDeathPending = false;
         engine->captureIgnored = false;
 
-        applyReplayResetState(m_isPracticeMode, m_gameState.m_currentProgress);
+        // Инструмент ЛД-RESET (проверка трекер-пункта «m_extraDelta = 0 на
+        // каждом resetLevel»): GD обнуляет m_extraDelta сама внутри
+        // GJBaseGameLayer::resetLevelVariables() (вызывается из
+        // PlayLayer::resetLevel), но practice-путь восстанавливает
+        // чекпоинт ПОСЛЕ этого. Логируем фактическое значение сразу после
+        // базового resetLevel — если здесь когда-нибудь != 0, первый кадр
+        // попытки получит ненулевой остаток (референс Xenia Bot.cpp:524).
+        skkbot2::log::info(
+            "RESET-EXTRA-DELTA: after resetLevel m_extraDelta={:.6f} "
+            "practice={} progress={} platformer={}",
+            static_cast<double>(m_extraDelta), m_isPracticeMode,
+            m_gameState.m_currentProgress, m_isPlatformer);
+
+        applyReplayResetState(m_isPracticeMode, m_gameState.m_currentProgress,
+                              m_isPlatformer);
     }
 
     void resetLevelFromStart() {
@@ -1707,20 +1823,30 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->stepPairCount = 0;  // step clock restarts with the attempt
         engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
+        engine->clearPlatformerCheckpoints();
         engine->pinSetupSeedBeforeReset();
         resetSimulationTimingState();
         m_queuedButtons.clear();
         PlayLayer::resetLevelFromStart();
         m_queuedButtons.clear();
         resetSimulationTimingState();
+        skkbot2::log::info(
+            "RESET-EXTRA-DELTA: after resetLevelFromStart m_extraDelta={:.6f} "
+            "practice={} progress={} platformer={}",
+            static_cast<double>(m_extraDelta), m_isPracticeMode,
+            m_gameState.m_currentProgress, m_isPlatformer);
         engine->captureReleaseSuppressUntil = 8;
         engine->resetRecordedHoldShadow();
+        engine->captureDeathPending = false;
         engine->captureIgnored = false;
 
         // Full restart: clear broken objects tracking
         BrokenObjectTracker::get().clear();
 
-        applyReplayResetState(m_isPracticeMode, m_gameState.m_currentProgress);
+        // resetLevelFromStart means "back to tick 0", even in a platformer
+        // level, so the checkpoint chain must not survive this one.
+        applyReplayResetState(m_isPracticeMode, m_gameState.m_currentProgress,
+                              false);
     }
 
     void loadFromCheckpoint(CheckpointObject* checkpoint) {
@@ -1829,10 +1955,12 @@ engine->lastTickIndex = it->second.priorTick;
             // consumed before the death) - the infinite-hold bug. Wipe the
             // restored bits; syncPhysicalHolds below re-presses whatever the
             // user is actually still holding.
-            const bool modeTwoPlayer = m_levelSettings ? m_levelSettings->m_twoPlayerMode : false;
-            const bool modePlatformer = m_isPlatformer;
-            const bool modeDual = m_gameState.m_isDualMode;
-            auto clearRestoredHolds = [this, modeTwoPlayer, modePlatformer, modeDual](PlayerObject* player) {
+            // Восстановление чекпоинта больше НЕ переносит зажатия (запрос
+            // 03.11.2026: «восстановление с зажатием — убрать»). Снимаем
+            // snapshot-биты (иначе старое зажатие прилипает навсегда), а
+            // jump-buffer всегда пуст: никакого авто-прыжка и никакого
+            // переносного держания сразу после респавна.
+            auto clearRestoredHolds = [](PlayerObject* player) {
                 if (!player) return;
                 player->m_holdingRight = false;
                 player->m_holdingLeft = false;
@@ -1840,20 +1968,18 @@ engine->lastTickIndex = it->second.priorTick;
                 hb.erase(1);
                 hb.erase(2);
                 hb.erase(3);
-                // Jump-buffer after respawn must mirror the user's CURRENT
-                // physical key, never the snapshot: the snapshot was taken
-                // mid-input (buffered while holding), so blindly restoring it
-                // re-latches 'jump on next ground touch' and the character
-                // auto-jumps forever after a practice respawn (BUG-05). But
-                // vanilla GD keeps a physically held key jumping right after
-                // respawn (BUG-01) - so buffer = "is the jump key held now".
-#ifdef GEODE_IS_WINDOWS
-                bool controlsBlocked = player->m_controlsDisabled;
-                player->m_jumpBuffered = !controlsBlocked && isPhysicalKeyHeld(
-                    1, player == m_player2, modeTwoPlayer, modePlatformer, modeDual);
-#else
                 player->m_jumpBuffered = false;
-#endif
+                // BUG-105 SKK-паритет: гасим и зеркала buffered-jump семьи.
+                // m_wasJumpBuffered возвращает CheckpointStateManager::restore
+                // из снапшота (checkpoint_handler.cpp f2 bit1); m_stateJumpBuffered
+                // таскает сам ванильный PlayerCheckpoint-снапшот (store:
+                // checkpoint->m_stateJumpBuffered = m_stateJumpBuffered).
+                // Несброшенные, они дают фантомный ringJump (гейт
+                // m_stateJumpBuffered в PlayerObject::ringJump) без события.
+                // GD сам переразвернёт оба зеркала из m_jumpBuffered на первом
+                // тике (updateJumpVariables), так что обнуление безопасно.
+                player->m_wasJumpBuffered = false;
+                player->m_stateJumpBuffered = 0;
             };
             clearRestoredHolds(m_player1);
             clearRestoredHolds(m_player2);
@@ -1864,40 +1990,6 @@ engine->lastTickIndex = it->second.priorTick;
             engine->captureReleaseSuppressUntil = it->second.priorTick + 8;
             engine->captureIgnored = false;
             resetSimulationTimingState();
-
-            // Re-apply physical key hold AFTER captureIgnored=false, routed
-            // through handleButton so the recording layer captures the press.
-            // Vanilla cleared m_holdingButtons during loadFromCheckpoint; if the
-            // user's key is still physically held, no new GD handleButton fires
-            // (no edge transition) — we must synthesize the press event.
-            auto syncPhysicalHolds = [this, modeTwoPlayer, modePlatformer, modeDual](GJBaseGameLayer* layer, PlayerObject* player, bool isP2) {
-                if (!player || !layer) return;
-#ifdef GEODE_IS_WINDOWS
-                auto& hb = player->m_holdingButtons;
-                bool controlsBlocked = player->m_controlsDisabled;
-auto tryPush = [&](int button) {
-                bool held = !controlsBlocked && isPhysicalKeyHeld(
-                    button, isP2, modeTwoPlayer, modePlatformer, modeDual);
-                bool mapHeld = hb.count(button) && hb[button];
-                if (held && !mapHeld) {
-                    layer->handleButton(true, button, handleButtonPlayer2Param(isP2, controlFlipActive(layer)));
-                }
-            };
-            tryPush(1);
-            tryPush(2);
-            tryPush(3);
-#endif
-        };
-        syncPhysicalHolds(this, m_player1, false);
-        if (m_player2) syncPhysicalHolds(this, m_player2, true);
-skkbot2::log::debug("holdSync MODE_CAPTURE: twoPlayer={} platformer={} dual={} flipShift={} p1Jump={} p1Left={} p1Right={} p2Jump={} p2Left={} p2Right={}",
-                modeTwoPlayer, modePlatformer, modeDual, controlFlipActive(this) ? 1 : 0,
-                isPhysicalKeyHeld(1, false, modeTwoPlayer, modePlatformer, modeDual),
-                isPhysicalKeyHeld(2, false, modeTwoPlayer, modePlatformer, modeDual),
-                isPhysicalKeyHeld(3, false, modeTwoPlayer, modePlatformer, modeDual),
-                isPhysicalKeyHeld(1, true, modeTwoPlayer, modePlatformer, modeDual),
-                isPhysicalKeyHeld(2, true, modeTwoPlayer, modePlatformer, modeDual),
-                isPhysicalKeyHeld(3, true, modeTwoPlayer, modePlatformer, modeDual));
             return;
         }
 
@@ -1941,29 +2033,31 @@ engine->lastTickIndex = ref.priorTick;
                 m_queuedButtons.clear();
                 CheckpointStateManager::restore(this, ref);
 
-                auto pushPhysicalHolds = [this]() {
-#ifdef GEODE_IS_WINDOWS
-                    const bool modeTwoPlayer = m_levelSettings ? m_levelSettings->m_twoPlayerMode : false;
-                    const bool modePlatformer = m_isPlatformer;
-                    const bool modeDual = m_gameState.m_isDualMode;
-                    auto pushFor = [&](PlayerObject* player, bool isP2) {
-                        if (!player) return;
-                        auto& hb = player->m_holdingButtons;
-                        bool controlsBlocked = player->m_controlsDisabled;
-                        for (int button = 1; button <= 3; ++button) {
-                            bool held = !controlsBlocked && isPhysicalKeyHeld(
-                                button, isP2, modeTwoPlayer, modePlatformer, modeDual);
-                            if (held && !(hb.count(button) && hb[button])) {
-                                player->pushButton(static_cast<PlayerButton>(button));
-                            }
-                        }
-                    };
-                    pushFor(m_player1, false);
-                    pushFor(m_player2, true);
-#endif
+                // BUG-105 SKK-паритет (плейбэк): CheckpointStateManager::restore
+                // ЗАНОВО возвращает hold-биты из фулл-снапшота после ванильного
+                // load'а (m_jumpBuffered f1 bit18, m_wasJumpBuffered f2 bit1,
+                // m_holdingRight/Left из fullP) — коммент выше про «vanilla
+                // очищает hold-биты» к снапшот-рестору не относится. Без гашения
+                // плейбэк получает зажатие, которого нет в потоке событий — тот же
+                // класс, что убил SKC-плейбэк на f=13527.
+                // Зажатие через чекпоинт-рестор убрано (03.11.2026):
+                // итоговые hold-биты после рестора — «ничего не держит», пока
+                // события потока не скажут иное; зеркала буфера гасятся вместе
+                // с m_jumpBuffered.
+                auto clearPlaybackHolds = [](PlayerObject* player) {
+                    if (!player) return;
+                    player->m_holdingRight = false;
+                    player->m_holdingLeft = false;
+                    auto& hb = player->m_holdingButtons;
+                    hb.erase(1);
+                    hb.erase(2);
+                    hb.erase(3);
+                    player->m_jumpBuffered = false;
+                    player->m_wasJumpBuffered = false;
+                    player->m_stateJumpBuffered = 0;
                 };
-                pushPhysicalHolds();
-
+                clearPlaybackHolds(m_player1);
+                clearPlaybackHolds(m_player2);
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
                 engine->stepPairFrac = 0.0;
                 engine->lastTickIndex = ref.priorTick;
@@ -1980,45 +2074,24 @@ engine->lastTickIndex = ref.priorTick;
         PlayLayer::loadFromCheckpoint(checkpoint);
         m_queuedButtons.clear();
 
-        // Re-apply physical key hold across checkpoint restore for ALL modes.
-        // Vanilla GD clears m_holdingButtons during loadFromCheckpoint. If the
-        // user's key is still physically held, no new handleButton fires (no
-        // edge transition), so the hold is silently lost. Route through
-        // handleButton to properly set all internal state (m_holdingJump,
-        // m_hasJustHeld, m_isHolding, etc.) — direct map writes miss these.
-        const bool modeTwoPlayer = m_levelSettings ? m_levelSettings->m_twoPlayerMode : false;
-        const bool modePlatformer = m_isPlatformer;
-        const bool modeDual = m_gameState.m_isDualMode;
-        auto syncPhysicalHolds = [this, modeTwoPlayer, modePlatformer, modeDual](GJBaseGameLayer* layer, PlayerObject* player, bool isP2) {
-            if (!player || !layer) return;
-#ifdef GEODE_IS_WINDOWS
-            auto& hb = player->m_holdingButtons;
-            bool controlsBlocked = player->m_controlsDisabled;
-            auto tryPush = [&](int button) {
-                bool held = !controlsBlocked && isPhysicalKeyHeld(
-                    button, isP2, modeTwoPlayer, modePlatformer, modeDual);
-                bool mapHeld = hb.count(button) && hb[button];
-                if (held && !mapHeld) {
-                    layer->handleButton(true, button, handleButtonPlayer2Param(isP2, controlFlipActive(layer)));
-                }
-            };
-            tryPush(1);
-            tryPush(2);
-            tryPush(3);
-#endif
-        };
-        syncPhysicalHolds(this, m_player1, false);
-        if (m_player2) syncPhysicalHolds(this, m_player2, true);
-        skkbot2::log::debug("holdSync fallback: twoPlayer={} platformer={} dual={} flipShift={} p1Jump={} p1Left={} p1Right={} p2Jump={} p2Left={} p2Right={}",
-            modeTwoPlayer, modePlatformer, modeDual, controlFlipActive(this) ? 1 : 0,
-            isPhysicalKeyHeld(1, false, modeTwoPlayer, modePlatformer, modeDual),
-            isPhysicalKeyHeld(2, false, modeTwoPlayer, modePlatformer, modeDual),
-            isPhysicalKeyHeld(3, false, modeTwoPlayer, modePlatformer, modeDual),
-            isPhysicalKeyHeld(1, true, modeTwoPlayer, modePlatformer, modeDual),
-            isPhysicalKeyHeld(2, true, modeTwoPlayer, modePlatformer, modeDual),
-            isPhysicalKeyHeld(3, true, modeTwoPlayer, modePlatformer, modeDual));
+        // Зажатие через чекпоинт-рестор убрано (запрос 03.11.2026). Vanilla
+        // очищает hold-биты при loadFromCheckpoint — после рестора игрок
+        // ничего не держит, пока пользователь не нажмёт сам: никакой
+        // ре-прессинга физических клавиш и никакого bridgeUserHoldsToPlayer
+        // по пути рестора (в frame stepper'е мост остался — там он вне
+        // пути рестора).
+        // BUG-105 SKK-паритет: ванильный PlayerCheckpoint-снапшот таскает
+        // m_stateJumpBuffered (store: checkpoint->m_stateJumpBuffered =
+        // m_stateJumpBuffered), а clearRestoredHolds здесь не вызывается —
+        // гасим зеркала buffered-jump семьи после ванильного рестора.
+        for (PlayerObject* player :
+             {m_player1, m_player2 ? m_player2 : nullptr}) {
+            if (!player) continue;
+            player->m_jumpBuffered = false;
+            player->m_wasJumpBuffered = false;
+            player->m_stateJumpBuffered = 0;
+        }
 
-        engine->bridgeUserHoldsToPlayer(this);
         // Re-disable broken objects after vanilla loadFromCheckpoint
         // (GD re-enables breakables on load; our tracker keeps them destroyed)
         BrokenObjectTracker::get().reDisableBroken();
@@ -2142,6 +2215,14 @@ engine->lastTickIndex = ref.priorTick;
         // resetLevel cleanup calls destroyPlayer too, but those never stick -
         // logging them produced the tick-1..17 barrage of false positives.
         if (!preDead && player && player->m_isDead &&
+            engine->engineMode == MODE_CAPTURE) {
+            engine->captureDeathPending = true;
+            skkbot2::log::info(
+                "CAPTURE death latched: player{} tick={} - input/trajectory capture "
+                "paused until reset; death chain is not recorded",
+                deathPlayer2 ? 2 : 1, deathTick);
+        }
+        if (!preDead && player && player->m_isDead &&
             engine->engineMode == MODE_EXECUTE && !persistenceDeath) {
             const SkPerFrame* rec = nullptr;
             if (auto* frames = engine->activePerFrames()) {
@@ -2229,6 +2310,7 @@ engine->lastTickIndex = ref.priorTick;
                     engine->activeSk->practiceFixCheckpoints.size());
             }
             engine->storedRestorePoints.clear();
+            engine->clearPlatformerCheckpoints();
             engine->practiceFixQueue.clear();
             BrokenObjectTracker::get().clear();
             FrameStepper::get().onPlayLayerDestroy();
@@ -2236,6 +2318,31 @@ engine->lastTickIndex = ref.priorTick;
         };
 
         quitLevel();
+    }
+};
+
+class $modify(SetupCheckpointCapture, GJBaseGameLayer) {
+    void checkpointActivated(CheckpointGameObject* object) {
+        GJBaseGameLayer::checkpointActivated(object);
+
+        auto* engine = ReplayEngine::get();
+        auto* layer = PlayLayer::get();
+        if (!layer || !engine || engine->engineMode != MODE_CAPTURE ||
+            !engine->skMode || !engine->activeSk || !layer->m_isPlatformer ||
+            engine->captureDeathPending ||
+            (layer->m_player1 && layer->m_player1->m_isDead) ||
+            (layer->m_player2 && layer->m_player2->m_isDead)) {
+            return;
+        }
+
+        // This is the actual live touch of a platformer setup-checkpoint.
+        // Do not infer it from CheckpointObject creation, which may happen as
+        // GD prepares the later death-respawn.
+        const int tick = static_cast<int>(
+            layer->m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
+        skkbot2::log::info(
+            "CAPTURE checkpointActivated observed: tick={} object={} platformer=true",
+            tick, object ? object->m_objectID : -1);
     }
 };
 

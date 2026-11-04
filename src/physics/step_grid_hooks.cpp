@@ -213,6 +213,16 @@ bool stepGridEnforcementActive() {
     return g_forcedSteps > 0;
 }
 
+static bool g_deferPlayerArt = false;
+
+bool isPlayerArtDeferred() {
+    return g_deferPlayerArt;
+}
+
+void setPlayerArtDeferred(bool defer) {
+    g_deferPlayerArt = defer;
+}
+
 StepGridEnforcement::StepGridEnforcement(int steps, double timestep) {
     if (g_available && steps > 0 && timestep > 0.0 && g_forcedSteps == 0) {
         g_forcedSteps = steps;

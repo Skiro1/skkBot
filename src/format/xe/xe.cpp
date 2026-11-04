@@ -174,33 +174,11 @@ bool skk::xe::toSkcMacro(const skk::xe::Replay& replay, skc::Macro& out,
     }
 
     out = skc::Macro{};
-    out.header.tps = static_cast<float>(replay.tps);
+    out.header.tps = replay.tps;
     out.actions.reserve(replay.actions.size());
 
-    // Every Xenon event is a Jump, so there is exactly one channel per player.
-    std::array<bool, 2> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
-    uint64_t firstKeptRaw = 0;
-    bool haveFirstKept = false;
     for (const auto& a : replay.actions) {
-        const std::size_t ch = a.player2 ? 1u : 0u;
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
-        if (!haveFirstKept) {
-            firstKeptRaw = a.frame;
-            haveFirstKept = true;
-        }
         const int64_t shifted = static_cast<int64_t>(a.frame) + kFrameShift;
         if (shifted < 0 || shifted > 0xFFFFFFFFll) {
             return fail("xe: frame " + std::to_string(a.frame) + " shifted by " +
@@ -210,7 +188,17 @@ bool skk::xe::toSkcMacro(const skk::xe::Replay& replay, skc::Macro& out,
                                           a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) return fail("xe: no usable inputs after normalisation");
+
+    const uint64_t firstKeptRaw =
+        static_cast<uint64_t>(static_cast<int64_t>(out.actions.front().frame) - kFrameShift);
 
     std::string reason;
     if (!skc::validateActions(out.actions, reason)) {
@@ -219,7 +207,7 @@ bool skk::xe::toSkcMacro(const skk::xe::Replay& replay, skc::Macro& out,
 
     skkbot2::log::warn(
         "[XE] {} (tps {:.0f}, cbf={}): {} actions -> {} actions, dropped {} "
-        "release(s) with no press and {} duplicate press(es), frame shift {:+d} "
+        "release(s) with no press and rebuilt {} collapsed tap(s), frame shift {:+d} "
         "(first click {} -> {})",
         replay.hasHeader ? "with header" : "no header", replay.tps, replay.cbf,
         replay.actions.size(), out.actions.size(), droppedRelease,

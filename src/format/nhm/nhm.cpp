@@ -23,11 +23,6 @@ constexpr uint8_t kMagic[4] = {'N', 'H', 'M', '1'};
 // outlier - hence the constant rather than a decision.)
 static constexpr int64_t kFrameShift = -1;
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::nhm::looksLikeNhm(std::span<const uint8_t> data) {
@@ -108,33 +103,8 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
     out.header.tps = 240.0f;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
-    // Remember the SOURCE frame of the first action that survives
-    // normalisation. Reporting replay.actions.front() instead would quote the
-    // dangling release at frame 1 and compare it against the first kept click
-    // at 142, which reads as a 141-frame shift that does not exist.
-    uint64_t firstKeptRaw = 0;
-    bool haveFirstKept = false;
     for (const auto& a : replay.actions) {
-        const std::size_t ch = channelIndex(a.button, a.player2);
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
-        if (!haveFirstKept) {
-            firstKeptRaw = a.frame;
-            haveFirstKept = true;
-        }
         const int64_t shifted = static_cast<int64_t>(a.frame) + kFrameShift;
         if (shifted < 0 || shifted > 0xFFFFFFFFll) {
             return fail("nhm: frame " + std::to_string(a.frame) + " shifted by " +
@@ -144,7 +114,21 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) return fail("nhm: no usable inputs after normalisation");
+
+    // Report the SOURCE frame of the first action that actually survived
+    // normalisation. Reporting replay.actions.front() instead would quote the
+    // dangling release at frame 1 and compare it against the first kept click
+    // at 142, which reads as a 141-frame shift that does not exist.
+    const uint64_t firstKeptRaw =
+        static_cast<uint64_t>(static_cast<int64_t>(out.actions.front().frame) - kFrameShift);
 
     std::string reason;
     if (!skc::validateActions(out.actions, reason)) {
@@ -153,7 +137,7 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
 
     skkbot2::log::warn(
         "[NHM] {} records -> {} actions, dropped {} release(s) with no press and "
-        "{} duplicate press(es), frame shift {:+d} (first click {} -> {})",
+        "rebuilt {} collapsed tap(s), frame shift {:+d} (first click {} -> {})",
         replay.actions.size(), out.actions.size(), droppedRelease,
         droppedDuplicate, kFrameShift, firstKeptRaw,
         out.actions.empty() ? 0 : out.actions.front().frame);

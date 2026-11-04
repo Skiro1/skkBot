@@ -53,16 +53,13 @@ class Bot {
 public:
     static Bot& get();
 
-    // Force Click-Between-Steps / Click-On-Steps off: game variables AND the
-    // live layer. Safe to call as often as you like - GD can re-read these on
-    // resetLevel, and a practice respawn is a resetLevel, so a session that only
-    // forced them once at start would start recording on half-steps after the
-    // first death. EclipseMenu re-applies its settings from resetLevel for
-    // exactly this reason (Bot.cpp:341).
-    static void forceVanillaAccuracy();
+    // Apply the macro's native accuracy mode to both GD's persisted vars and its
+    // live layer fields. Original user values are captured once and restored at
+    // session end; resetLevel re-applies these values after GD's own reset.
+    static void applySessionAccuracy(bool cbs, bool cos);
 
     // Put the user's own CBS / COS back, exactly as they stood before the first
-    // forceVanillaAccuracy() of this session, and forget the snapshot so the next
+    // applySessionAccuracy() of this session, and forget the snapshot so the next
     // session re-reads GD rather than our own leftovers.
     //
     // Without this, forcing vanilla accuracy was not a session setting but a
@@ -72,6 +69,7 @@ public:
     // months (beginReplayAccuracyEnvironment / endReplayAccuracyEnvironment,
     // skkBot.hpp:1739 / 1796) - SKC only ever got the first half.
     static void restoreUserAccuracy();
+    void reapplySessionAccuracy() const;
 
     // --- lifecycle ---------------------------------------------------------
 
@@ -109,6 +107,7 @@ public:
         NoInputs,    // nothing loaded
         MidAttempt,  // the clock has advanced past the attempt start
         Ended,       // level finished / end animation running
+        WrongMode,   // macro and level disagree on classic vs platformer
     };
 
     struct PlaybackStart {
@@ -126,6 +125,12 @@ public:
     // startPlayback() when playbackStartCheck() says Ready, otherwise leave the
     // bot alone. Returns what it did through `out`.
     bool startPlaybackIfReady(PlaybackStart* out);
+
+    // True when the loaded macro declares a mode and the current level is the
+    // other one. A macro that does not declare a mode (old file, or a format
+    // with no platformer bit) is never a mismatch: refusing it on a guess would
+    // break every existing .skc.
+    [[nodiscard]] bool platformerModeMismatch() const;
 
     // One line for the notification: says where the clock is and where the
     // macro starts, so "it will not play" becomes a number the user can act on.
@@ -148,11 +153,14 @@ public:
     [[nodiscard]] bool isPlaybackExhausted() const {
         return m_state == State::Playback && m_inputIndex >= m_macro.actions.size();
     }
+    [[nodiscard]] bool isPlaybackExhaustionNotified() const { return m_playbackExhaustionNotified; }
 
     void setState(State state) { m_state = state; }
     [[nodiscard]] State getState() const { return m_state; }
     [[nodiscard]] bool isRecording() const { return m_state == State::Record; }
     [[nodiscard]] bool isPlaying() const { return m_state == State::Playback; }
+    [[nodiscard]] bool isDeathCapturePaused() const { return m_deathNoted; }
+    void resumeCaptureAfterReset() { m_deathNoted = false; }
     [[nodiscard]] bool isEnabled() const { return m_state != State::Disabled; }
 
     void setPendingAction(PendingAction action) { m_pendingAction = action; }
@@ -163,12 +171,21 @@ public:
 
     [[nodiscard]] size_t getInputCount() const { return m_macro.actions.size(); }
     [[nodiscard]] size_t getInputIndex() const { return m_inputIndex; }
+    // Frame of the NEXT action the playback cursor points at (0 when the macro
+    // is exhausted). Diagnostics only: a death line that names the next authored
+    // input says whether the player died in an input-free window of the file or
+    // before a click that was supposed to arrive.
+    [[nodiscard]] uint32_t peekNextInputFrame() const {
+        return m_inputIndex < m_macro.actions.size()
+                   ? m_macro.actions[m_inputIndex].frame
+                   : 0u;
+    }
     [[nodiscard]] const std::vector<Action>& getActions() const { return m_macro.actions; }
     [[nodiscard]] const Macro& getMacro() const { return m_macro; }
 
-    [[nodiscard]] float getTps() const { return m_macro.header.tps; }
-    void setTps(float tps) {
-        if (tps > 0.0f && std::isfinite(tps)) m_macro.header.tps = tps;
+    [[nodiscard]] double getTps() const { return m_macro.header.tps; }
+    void setTps(double tps) {
+        if (tps > 0.0 && std::isfinite(tps)) m_macro.header.tps = tps;
     }
 
     // The display rate the macro was recorded under. 0 = follow TPS, which is
@@ -202,6 +219,9 @@ public:
     // Stamp one input event at the given frame. Called from the handleButton
     // hook. Duplicate-consecutive protection is the caller's job: handleButton
     // already fires exactly once per state change.
+    //
+    // SKC is vanilla-only: there is no sub-step position, so an event belongs
+    // to its frame and nothing else.
     void recordInput(uint32_t frame, uint8_t button, bool player2, bool pressed);
 
     // Return the next event at or before `frame`, advancing the cursor. Called
@@ -210,13 +230,68 @@ public:
     // until it returns nullopt.
     [[nodiscard]] std::optional<Action> poll(uint32_t frame);
 
+    // --- seam queue sanitation ---------------------------------------------
+    //
+    // Whatever the player does while dead still lands in GD's input queue
+    // (m_queuedButtons): the step that died had already drained it, so presses
+    // and releases made during the death animation are drained on the FIRST
+    // step after the respawn - they hit the fresh attempt, not the dead one.
+    // Xenon isolated the three shapes that hurt every input-only bot
+    // (Xenon-master/src/bot/replay.cpp:152-165) and clears the queue for each:
+    //   1. trailing release while the stream is already released
+    //      (pointless release),
+    //   2. trailing press while the stream is still holding (hold/release
+    //      mismatch - GD ignores the push, so only a release would come out of
+    //      it),
+    //   3. release while the stream has not pressed anything at all yet
+    //      (the ghost release: the player leaves the checkpoint released).
+    // SKC has one extra case Xenon does not: recording. There, EVERY command
+    // still queued at the seam was queued during the attempt that just ended,
+    // so the whole queue is stale and is dropped instead of classified.
+    //
+    // Play mode deliberately keeps a command that no rule names (a real press
+    // made during the death on a channel the stream is not holding). That is
+    // exactly Xenon's behaviour, and with "Ignore Inputs" ON it is moot anyway:
+    // the playback dispatch clears the queue before it drains.
+    enum class SeamQueueMode {
+        Record,  // every queued command belongs to the dead attempt
+        Play,    // Xenon's three rules against the stream's held state
+    };
+
+    struct SeamQueueReport {
+        size_t inspected = 0;
+        size_t cleared = 0;
+        size_t extraRelease = 0;  // rule 1
+        size_t extraPush = 0;     // rule 2
+        size_t ghostRelease = 0;  // rule 3
+        bool clearedQueue = false;
+        // Rule that decided the clear, for the log; nullptr when nothing fired.
+        const char* rule = nullptr;
+    };
+
+    // Called by the reset hooks right after GD's own reset. `resumeFrame` is
+    // the frame the stream continues at: 0 after a wipe, the checkpoint frame
+    // after a stitch. `site` only names the hook in the log.
+    SeamQueueReport sanitizeSeamQueue(gd::vector<PlayerButtonCommand>& queue,
+                                      uint32_t resumeFrame, SeamQueueMode mode,
+                                      const char* site);
+
+    // Held state a restart at `frame` would begin in, per (player, button);
+    // folded from the stream's own actions strictly BEFORE `frame`.
+    struct HeldState {
+        bool held[2][3] = {};
+    };
+    [[nodiscard]] HeldState heldBefore(uint32_t frame) const;
+
     // --- single owner of macro-data deletion --------------------------------
     //
     // SKK has exactly TWO data operations and ONE rule that picks between them
     // (checkpoint_system.cpp:1224, :498-535):
     //   wipe    - the attempt's recorded future is invalid in its entirety
     //   stitch  - cut the stream at a boundary and close the dangling holds
-    // and the rule is `!inPractice || tick <= 1 || noRestorePoints`.
+    // and the rule is `!checkpointMode || tick <= 1 || noRestorePoints`,
+    // where checkpointMode = practice mode OR platformer (the setup-checkpoint
+    // object makes platformer respawn from a checkpoint without practice mode).
     //
     // SKC grew a DIFFERENT rule at every one of its six reset call sites, which
     // is why deleting macro data was the single largest source of corrupt
@@ -255,6 +330,10 @@ public:
     // what was really recorded and store an event only when the shadow flips.
     void noteInternalRestore(uint32_t frame);
     void resetHoldShadow();
+    // BUG-103: rebuild m_holdShadow from the players' m_holdingButtons at a
+    // checkpoint restore, so the no-transition gate keeps working without the
+    // old 8-frame release-suppression window.
+    void syncHoldShadowToPlayer();
 
     // Attempt bookkeeping for recording. SKC has no death chain, so every death
     // restarts an empty timeline - the previous attempt's events are dropped.
@@ -332,6 +411,10 @@ private:
     // at. A completed recording always ends with attempt 1 surviving.
     uint32_t m_attemptCount = 0;
     uint32_t m_lastFailureFrame = 0;
+    // destroyPlayer can be called on every simulation step during one death
+    // animation. Count/log the failed attempt once, then re-arm at reset.
+    bool m_deathNoted = false;
+    bool m_playbackExhaustionNotified = false;
     size_t m_lastTrimmed = 0;
     size_t m_droppedEvents = 0;
     size_t m_duplicateEvents = 0;
@@ -350,6 +433,15 @@ private:
     // playback diverged exactly at boundary+8. Mirrors SKK's
     // captureReleaseSuppressUntil, which is releases-only by name and by code.
     uint32_t m_suppressUntilFrame = 0;
+    // Lower bound of the same window. The window is stamped in ABSOLUTE frame
+    // numbers, but a failed attempt can be followed by a restart that rewinds
+    // FrameClock to 0. Without this bound the window armed at, say, frame 163
+    // stayed "armed through 171" and swallowed every real release of the next
+    // attempts whose frames were 98, 121, 131 - the recorded macro then held
+    // jump from the first press to the next press (one long hold), and playback
+    // died where the player had clicked. Measured live on 31 Oct: three
+    // full restarts after one restore all lost their releases.
+    uint32_t m_suppressFromFrame = 0;
     bool m_suppressionArmed = false;
 
     // tickRate before an SKC session claimed it, restored on stop so the menu's

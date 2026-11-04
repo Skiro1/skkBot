@@ -22,6 +22,11 @@ bool stepGridHooksAvailable();
 // must pass it through untouched to avoid a second rounding).
 bool stepGridEnforcementActive();
 
+// Visual optimisation for batched substeps: suppresses redundant sprite hierarchy
+// matrix calculations on intermediate substeps, placing player visuals once per frame.
+bool isPlayerArtDeferred();
+void setPlayerArtDeferred(bool defer);
+
 // RAII: while alive, every engine step-loop store is forced to `steps`
 // iterations of `timestep` seconds. Game-thread only, must wrap a single
 // GJBaseGameLayer::update() call; never nest.

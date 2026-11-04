@@ -438,7 +438,7 @@ bool importFile(const std::filesystem::path& path, skc::Macro& out,
     if (!parse(bytes, replay, outReason)) return false;
 
     out = skc::Macro{};
-    out.header.tps = static_cast<float>(replay.meta.tps);
+    out.header.tps = replay.meta.tps;
     out.actions = std::move(replay.actions);
     out.sortActions();
 

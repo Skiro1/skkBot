@@ -250,8 +250,35 @@ void release();
 // wrote to it. Nothing is modified: the hook logs and calls through.
 bool installOptionKeyTracer();
 
-// The per-frame step budget, derived from the FPS actually in effect.
+// Called ONCE at mod startup. If the previous session left VSync off (the game
+// was closed mid-pin, or the mod reloaded while a pin was held), this restores
+// GD's VSync game variable and the SDL-mod's pacing settings so the user does
+// not inherit stale state. Only runs when gui_fps_enabled is false — if FPS is
+// on, the first sync() call will set the correct state anyway.
+void restoreVsyncOnStartup();
+
+// The per-frame step budget, derived from the MEASURED cost of one physics
+// step - never from the frame rate.
 [[nodiscard]] int stepCap(double tps, double gameSpeed);
+
+// Feed the budget's view of what one physics step costs. Called once per
+// executed step with that step's wall time.
+//
+// HISTORY, because the wrong anchor was tried first and it made things worse.
+// The budget was then derived from the DELIVERED frame rate, and that is a
+// self-reinforcing loop: a heavier frame lowers the delivered fps, the budget
+// grows, the next frame runs even more steps, grows longer still, and the
+// display collapses to 1 fps - measured on the user's machine at tps 3414
+// within one session. The frame rate is an OUTPUT of the loop, not an input.
+// The per-step cost is the input that actually decides how much physics a
+// frame can afford, and it does not move when the budget moves, so the loop
+// stays open.
+void noteStepCost(double seconds);
+
+// The current smoothed per-step cost, in milliseconds - for diagnostics and
+// the budget-hit warning, so the log states the measured fact instead of
+// guessing from rates.
+[[nodiscard]] double stepCostMs();
 
 // --- macro-carried rate -----------------------------------------------------
 //

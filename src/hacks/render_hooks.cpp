@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <fmt/format.h>
 
 using namespace geode::prelude;
 
@@ -64,6 +65,51 @@ void disarmMusicRestart() {
     s_musicRestartPending.store(false);
 }
 
+bool musicRestartPending() {
+    return s_musicRestartPending.load();
+}
+
+// Where the level song currently sits inside its own track, in seconds, or a
+// negative value when no channel can be identified. The renderer uses it to
+// anchor the audio timeline: begin() restarts the song from 0, so this is
+// normally 0, but if that restart silently failed the track is already
+// somewhere else and the pre-roll must not double the offset.
+double musicPositionSeconds() {
+    auto* audio = FMODAudioEngine::get();
+    if (!audio) {
+        return -1.0;
+    }
+    FMOD::Channel* chan = nullptr;
+    if (s_lastMusicId > 0) {
+        const int chanId = audio->getMusicChannelID(s_lastMusicId);
+        if (chanId >= 0) {
+            chan = audio->channelForChannelID(chanId);
+        }
+    }
+    if (!chan) {
+        // Fallback: the channel that has been running the longest is the
+        // track (SFX are short and restart constantly).
+        unsigned int best = 0;
+        for (auto& [id, c] : audio->m_channelIDToChannel) {
+            if (!c) continue;
+            bool playing = false;
+            if (c->isPlaying(&playing) != FMOD_OK || !playing) continue;
+            unsigned int pos = 0;
+            if (c->getPosition(&pos, FMOD_TIMEUNIT_MS) == FMOD_OK &&
+                pos > best) {
+                best = pos;
+                chan = c;
+            }
+        }
+        return chan ? static_cast<double>(best) / 1000.0 : -1.0;
+    }
+    unsigned int pos = 0;
+    if (chan->getPosition(&pos, FMOD_TIMEUNIT_MS) != FMOD_OK) {
+        return -1.0;
+    }
+    return static_cast<double>(pos) / 1000.0;
+}
+
 // Deferred song start used by the renderer: the level song may still be
 // loading when a render begins (m_musicPrepared = false). Armed by begin(),
 // ticked from FMODAudioEngine::update (below) until the song is ready, then
@@ -91,6 +137,10 @@ bool tickPendingMusicRestart() {
         return false;  // still loading вЂ” keep waiting
     }
     s_musicRestartPending.store(false);
+    // Audio-kick audit: report the success to the renderer before doing
+    // anything else, so even a partially failed start records that the
+    // deferred path fired.
+    skkbot2::render::Renderer::get().noteMusicRestartFired();
     pl->startMusic();
     if (auto* engine = FMODAudioEngine::get()) {
         engine->setBackgroundMusicVolume(engine->m_musicVolume);
@@ -293,6 +343,14 @@ class $modify(CCEGLView) {
         }
         CCEGLView::onGLFWWindowSizeFunCallback(window, width, height);
     }
+
+    $override
+    void toggleLockCursor(bool locked) {
+        if (locked && skkbot2::gui::get().open) {
+            locked = false;
+        }
+        CCEGLView::toggleLockCursor(locked);
+    }
 };
 
 // ===================== DEFERRED MUSIC RESTART CLEANUP =====================
@@ -301,11 +359,28 @@ class $modify(CCEGLView) {
 // otherwise stay set forever, and tickPendingMusicRestart() would log
 // AUDIO_DEFERRED_WAIT once per second for the rest of the session. Drop the
 // arm when the PlayLayer exits.
+void traceMusicStart(const char* tag, unsigned int musicID, unsigned int timeArg);
 class $modify(PlayLayer) {
     $override
     void onExit() {
         skkbot2::render::disarmMusicRestart();
+        // BUG-80: the dead PlayLayer's heap address will be reused by the
+        // next one; disarm the shared [ENTRY-FREEZE] watcher so the next
+        // entry (vanilla or queued-session) rearms instead of being mistaken
+        // for the watched one.
+        skkbot2::entryFreezeReset();
         PlayLayer::onExit();
+    }
+
+    // BUG-80: the attempt-start song kick. This is the function that decides
+    // WHEN the (already loaded by loadMusic) channel becomes the run's audible
+    // track. Vanilla calls it with the run; logging it next to [START-WIN]
+    // shows whether the bot entry kicks the song at the same physics moment
+    // or lets the loadMusic channel play through the freeze window.
+    $override
+    void startMusic() {
+        traceMusicStart("playLayer.startMusic", 0, 0);
+        PlayLayer::startMusic();
     }
 };
 
@@ -314,6 +389,61 @@ class $modify(PlayLayer) {
 // mixer advanced manually from drive() (Renderer::audioPump) at the level's
 // game time. GD's own per-frame engine update must NOT run in parallel or the
 // mixer would also advance in wall time and desync.
+
+// BUG-80 music-start trace: the user reports the level song plays DURING the
+// ~1 s level-entry freeze when a bot session is queued outside the level,
+// while a vanilla entry starts the song with the run. Log every song-start
+// entry point with the game clock + the pause-family byte GD freezes physics
+// on; comparing vanilla vs bot entries then shows WHO started the song early
+// and WHEN relative to the frozen-gate window.
+// v3: also read the FMOD truth of the song channel (channel 0): playing /
+// paused / position in ms + the music bus volume - the AUDIBLE moment, not
+// just the API calls.
+static void traceMusicStart(const char* tag, unsigned int musicID, unsigned int timeArg) {
+    auto* playLayer = PlayLayer::get();
+    double levelTime = 0.0;
+    int frozenFlag = -1;
+    if (playLayer) {
+        levelTime = playLayer->m_gameState.m_levelTime;
+        frozenFlag = static_cast<int>(
+            *reinterpret_cast<const uint8_t*>(
+                reinterpret_cast<uintptr_t>(playLayer) + 12888));
+    }
+    auto* engine = ReplayEngine::get();
+    skkbot2::log::info(
+        "[SONG] {} id={} offset={}ms levelTime={:.4f} pauseFlag={} engineMode={} playLayer={}",
+        tag, musicID, timeArg, levelTime, frozenFlag,
+        engine ? static_cast<int>(engine->engineMode) : -2,
+        playLayer ? 1 : 0);
+    // FMOD truth: dump ALL channels with playing/paused/position. The level
+    // song's key in m_channelIDToChannel is not obviously 0 (chan0=-2 misses),
+    // so instead of guessing the key, log every live channel - one line.
+    auto* audio = FMODAudioEngine::get();
+    if (!audio) {
+        skkbot2::log::info("[SONG] fmod: no engine");
+        return;
+    }
+    if (audio->m_channelIDToChannel.empty()) {
+        skkbot2::log::info("[SONG] fmod: no channels");
+        return;
+    }
+    std::string dump;
+    for (auto& [id, chan] : audio->m_channelIDToChannel) {
+        if (!chan) continue;
+        bool playing = false;
+        bool paused = false;
+        unsigned int pos = 0;
+        int state = 0;
+        if (chan->isPlaying(&playing) == FMOD_OK && playing) {
+            state = (chan->getPaused(&paused) == FMOD_OK && paused) ? 2 : 1;
+        }
+        (void)chan->getPosition(&pos, FMOD_TIMEUNIT_MS);
+        dump += fmt::format(" [{}:s{}@{}]", id, state, pos);
+    }
+    skkbot2::log::info("[SONG] fmod: busVol={:.2f} allPaused={} chans={}",
+        audio->m_musicVolume, audio->m_allAudioPaused ? 1 : 0, dump);
+}
+
 class $modify(FMODAudioEngine) {
     $override
     void update(float dt) {
@@ -341,6 +471,7 @@ class $modify(FMODAudioEngine) {
     // with this ID at capture start and logs the AUDIO_* flow.
     $override
     void loadAndPlayMusic(gd::string path, unsigned int time, int musicID) {
+        traceMusicStart("loadAndPlayMusic", static_cast<unsigned int>(musicID), time);
         skkbot2::render::setLastMusicId(musicID);
         FMODAudioEngine::loadAndPlayMusic(path, time, musicID);
     }
@@ -350,6 +481,8 @@ class $modify(FMODAudioEngine) {
                          float volume, bool loop, int start, int end,
                          int fadeIn, int fadeOut, int musicID, bool p10,
                          int channelID, bool noPrepare, bool dontReset) {
+        traceMusicStart("queueStartMusic", static_cast<unsigned int>(musicID),
+                        static_cast<unsigned int>(start));
         skkbot2::render::setLastMusicId(musicID);
         FMODAudioEngine::queueStartMusic(audioFilename, pitch, unknown, volume,
             loop, start, end, fadeIn, fadeOut, musicID, p10, channelID,
@@ -357,9 +490,36 @@ class $modify(FMODAudioEngine) {
     }
 
     $override
+    void startMusic(int start, int end, int fadeIn, int fadeOut, bool loop,
+                    int musicID, bool noResume, bool dontReset) {
+        traceMusicStart("startMusic", static_cast<unsigned int>(musicID),
+                        static_cast<unsigned int>(start));
+        skkbot2::render::setLastMusicId(musicID);
+        FMODAudioEngine::startMusic(start, end, fadeIn, fadeOut, loop, musicID,
+            noResume, dontReset);
+    }
+
+    // Channel lifecycle around the run: setMusicTimeMS repositions the level
+    // song; pauseAllMusic/stopMusic are inline in the bindings (not hookable)
+    // so only the seek is traced.
+    $override
+    void setMusicTimeMS(unsigned int time, bool dontWait, int musicID) {
+        traceMusicStart("setMusicTimeMS", static_cast<unsigned int>(musicID), time);
+        FMODAudioEngine::setMusicTimeMS(time, dontWait, musicID);
+    }
+
+    $override
+    void playMusic(gd::string path, bool shouldLoop, float fadeInTime,
+                   int channel) {
+        traceMusicStart("playMusic", 0, 0);
+        FMODAudioEngine::playMusic(path, shouldLoop, fadeInTime, channel);
+    }
+
+    $override
     void loadMusic(gd::string path, float speed, float unknown, float volume,
                    bool shouldLoop, int musicID, int channelID,
                    bool dontReset) {
+        traceMusicStart("loadMusic", static_cast<unsigned int>(musicID), 0);
         skkbot2::render::setLastMusicId(musicID);
         FMODAudioEngine::loadMusic(path, speed, unknown, volume, shouldLoop,
             musicID, channelID, dontReset);

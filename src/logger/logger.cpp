@@ -106,24 +106,34 @@ void Logger::openLogFile() {
 void Logger::log(Level level, const std::string& msg) {
     if (level < m_level) return;
 
+    // Timestamp via fmt (fmt/format.h is already in every TU that includes
+    // logger.hpp). The old path built the same string through
+    // std::ostringstream + std::put_time, which goes through the C locale -
+    // one of the slowest formatted-output paths in the standard library. At
+    // the drift probe's line rate that was measurable per frame.
     const char* levelStrs[] = { "DEBUG", "INFO", "WARN", "ERROR" };
     const char* levelStr = (level >= 0 && level <= 3) ? levelStrs[level] : "???";
 
     auto now = std::chrono::system_clock::now();
-    auto timeT = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()) % 1000;
 
+    std::time_t timeT = std::chrono::system_clock::to_time_t(now);
     std::tm tm;
     localtime_s(&tm, &timeT);
 
-    std::ostringstream ss;
-    ss << "[" << std::put_time(&tm, "%H:%M:%S") << "." << std::setw(3) << std::setfill('0') << ms.count() << "]";
-    ss << " [" << levelStr << "] " << msg;
+    const std::string output = fmt::format(
+        "[{:02d}:{:02d}:{:02d}.{:03d}] [{}] {}",
+        tm.tm_hour, tm.tm_min, tm.tm_sec,
+        static_cast<long long>(ms.count()), levelStr, msg);
 
-    std::string output = ss.str();
-
-    geode::log::info("{}", output);
+    // GD console mirror: INFO and above. The mirror re-allocates and locks
+    // geode's log pipeline per line; mirroring the debug flood (thousands of
+    // lines a second in a dual playback) turned it into a measurable share of
+    // the frame budget. The log FILE below keeps every level unchanged.
+    if (level >= Info) {
+        geode::log::info("{}", output);
+    }
 
     // Every line follows the user's file-logging switch, render diagnostics
     // included. Until 19.10.2026 render.txt was written unconditionally, on the
@@ -136,7 +146,17 @@ void Logger::log(Level level, const std::string& msg) {
     }
     std::lock_guard<std::mutex> lock(m_mutex);
     if (std::ofstream* f = selectLogFile(); f && f->is_open()) {
-        *f << output << std::endl;
-        f->flush();
+        // No explicit flush and no std::endl: the ofstream buffers, so the
+        // OS write happens when the internal buffer fills instead of once per
+        // line. An explicit flush here was a syscall per line - at the
+        // playback flood rate that was hundreds of milliseconds per wall
+        // second, hiding inside the [HOT] "GD base scheduler" share because
+        // the probes fire inside GD's own update walk. Diagnostics are not
+        // ordered data: losing the last buffered kilobyte if the game dies is
+        // the right trade, and WARN/ERROR below stay immediate.
+        *f << output << '\n';
+        if (level >= Warn) {
+            f->flush();
+        }
     }
 }

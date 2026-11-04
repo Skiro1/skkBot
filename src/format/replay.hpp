@@ -497,6 +497,8 @@ public:
     // nothing to add, and a file that records the answer "no" every time is a
     // file nobody reads.
     double displayFps = 0.0;
+    bool lockDelta = true;
+    bool realTime = false;
 
     MacroSequence()
         : Replay("skkBot", MOD_VERSION) {}
@@ -516,6 +518,8 @@ public:
             std::abs(displayFps - framerate) > 1e-3) {
             ext["display_fps"] = displayFps;
         }
+        ext["timing_lock_delta"] = lockDelta;
+        ext["timing_real_time"] = realTime;
 
         if (recordedFromStartPos) {
             ext["from_start_pos"] = true;

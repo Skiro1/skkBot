@@ -545,7 +545,7 @@ CheckpointStateBundle CheckpointStateManager::capture(
         fp.dashStartTime = p->m_dashStartTime;
         fp.totalTime = p->m_totalTime;
         fp.lastCheckpointTime = p->m_lastCheckpointTime;
-        fp.lastJumpTime = p->m_lastJumpTime;
+        // m_lastJumpTime (wall-clock) NOT captured (BUG-89 / BUG-91).
         fp.lastFlipTime = p->m_lastFlipTime;
         fp.lastSpiderFlipTime = p->m_lastSpiderFlipTime;
         fp.gameModeChangedTime = p->m_gameModeChangedTime;
@@ -778,7 +778,7 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
             p->m_dashStartTime = fp.dashStartTime;
             p->m_totalTime = fp.totalTime;
             p->m_lastCheckpointTime = fp.lastCheckpointTime;
-            p->m_lastJumpTime = fp.lastJumpTime;
+            // m_lastJumpTime (wall-clock) NOT restored (BUG-89 / BUG-91).
             p->m_lastFlipTime = fp.lastFlipTime;
             p->m_lastSpiderFlipTime = fp.lastSpiderFlipTime;
             p->m_gameModeChangedTime = fp.gameModeChangedTime;

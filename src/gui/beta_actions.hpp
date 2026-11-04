@@ -10,7 +10,6 @@
 #include "format/ttrl/ttrl.hpp"
 #include "format/echo/echo.hpp"
 #include "format/ast/ast.hpp"
-#include "format/ttr3/ttr3.hpp"
 #include "logger/logger.hpp"
 
 #include <Geode/Geode.hpp>
@@ -28,6 +27,7 @@
 #endif
 
 #include "gui/skkbot_gui.hpp"
+#include "core/autosave_recorder.hpp"
 #include "skc/skc_bot.hpp"
 
 // Shared actions for the beta UI.
@@ -61,7 +61,7 @@ inline bool startRecording(std::string const& macroName) {
         if (!macroName.empty()) {
             bot.setMacroName(macroName);
         }
-        bot.setTps(gui.tpsEnabled ? static_cast<float>(gui.tpsValue) : 240.0f);
+        bot.setTps(gui.tpsEnabled ? gui.tpsValue : 240.0);
         bot.bindLevel(playLayer->m_level);
         // Starting a fresh recording discards whatever was in memory - routed
         // through the single deletion owner so it gets logged like every other
@@ -120,6 +120,15 @@ inline bool startRecording(std::string const& macroName) {
 
 inline void stopRecording(std::string const& macroName) {
     auto& gui = skkbot2::gui::get();
+
+    // Final autosave snapshot BEFORE the engines stop: flushRecording() is
+    // gated on "is anything recording" on purpose (autosave must never write
+    // from playback/idle), so stopping first would make it a no-op. Called
+    // while isRecording()/MODE_CAPTURE still report Record, this guarantees
+    // the rescue file on disk matches the end of the recording, not whatever
+    // the last periodic tick (up to 10 s earlier) caught.
+    skkbot2::autosave::flushRecording();
+
     if (gui.macroBotType == Gui::MacroBotType::SKC) {
         auto& bot = skk::skc::Bot::get();
         if (!macroName.empty()) {
@@ -156,6 +165,26 @@ inline void stopRecording(std::string const& macroName) {
 inline bool importForeignMacroIntoSkc(std::string const& ext,
                                       std::filesystem::path const& path,
                                       std::string const& name) {
+    // Каждый чужой импортированный макрос автоматически ставит TIMING MODE
+    // в Real Time (запрос 03.11.2026): иностранные форматы не несут нашей
+    // метрики Lock Delta, так что честная воспроизводимость для них —
+    // только по реальному времени. Пишется и в GUI-состояние, и в
+    // saved-ключи (те же, что у пилюль Mode), плюс dropCarry() — тот же
+    // контекст обновления, что у ручного переключения.
+    auto foreignAdopt = [](skk::skc::Macro macro, std::string const& n,
+                           uint32_t levelId = 0, std::string levelName = {}) {
+        auto& gui = skkbot2::gui::get();
+        if (gui.lockDelta || !gui.realTime) {
+            gui.lockDelta = false;
+            gui.realTime = true;
+            Mod::get()->setSavedValue("gui_timing_lock_delta", false);
+            Mod::get()->setSavedValue("gui_timing_real_time", true);
+            dropCarry();
+            skkbot2::log::info("skkBot2: foreign import -> Timing Mode REAL TIME (auto)");
+        }
+        return skk::skc::Bot::get().adopt(std::move(macro), n, levelId, levelName);
+    };
+
     // Both foreign formats are import-only and both land in SKC: GDR2's Input
     // and SLC's Action are the same four fields our Macro carries, and neither
     // format stores physics. From the moment they load they ARE SKC macros,
@@ -168,8 +197,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
             skkbot2::log::error("[GDR2] import failed: {}", reason);
             return false;
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name, info.levelId,
-                                          info.levelName);
+        return foreignAdopt(std::move(macro), name, info.levelId, info.levelName);
     }
     // Any of the ten GBR6 aliases, not just .brrr - the container is identical
     // and matching on the extension list keeps the nine siblings working
@@ -181,7 +209,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
             skkbot2::log::error("[NHM] import failed: {}", reason);
             return false;
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     if (ext == ".xe") {
         skk::skc::Macro macro;
@@ -190,7 +218,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
             skkbot2::log::error("[XE] import failed: {}", reason);
             return false;
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     if (ext == ".re4") {
         skk::skc::Macro macro;
@@ -203,7 +231,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
         if (!info.caution.empty()) {
             Notification::create(info.caution, NotificationIcon::Warning)->show();
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     if (ext == ".ttrl") {
         skk::skc::Macro macro;
@@ -212,20 +240,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
             skkbot2::log::error("[TTRL] import failed: {}", reason);
             return false;
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
-    }
-    if (ext == ".ttr3") {
-        skk::skc::Macro macro;
-        skk::ttr3::Replay info;
-        std::string reason;
-        if (!skk::ttr3::importFile(path, macro, &info, reason)) {
-            skkbot2::log::error("[TTR3] import failed: {}", reason);
-            return false;
-        }
-        if (!info.caution.empty()) {
-            Notification::create(info.caution, NotificationIcon::Warning)->show();
-        }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     if (ext == ".echo") {
         skk::skc::Macro macro;
@@ -240,7 +255,7 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
                 info.caution, NotificationIcon::Warning, NOTIFICATION_LONG_TIME
             )->show();
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
 if (skk::gbr::looksLikeGbrByExtension(ext)) {
         skk::skc::Macro macro;
@@ -250,7 +265,7 @@ if (skk::gbr::looksLikeGbrByExtension(ext)) {
             skkbot2::log::error("[GBR] import failed: {}", reason);
             return false;
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     if (ext == ".ast") {
         // Astral Lite. The reader accounts for the whole payload apart from
@@ -268,7 +283,7 @@ if (skk::gbr::looksLikeGbrByExtension(ext)) {
                 info.caution, NotificationIcon::Warning, NOTIFICATION_LONG_TIME
             )->show();
         }
-        return skk::skc::Bot::get().adopt(std::move(macro), name);
+        return foreignAdopt(std::move(macro), name);
     }
     skk::skc::Macro macro;
     std::string reason;
@@ -279,7 +294,7 @@ if (skk::gbr::looksLikeGbrByExtension(ext)) {
     // SLC v3 metadata carries no level identity to bind against, so the macro
     // stays unbound: onLevelEnter() treats that as "no level to compare", which
     // is the honest state - we genuinely do not know which level it is from.
-    return skk::skc::Bot::get().adopt(std::move(macro), name);
+    return foreignAdopt(std::move(macro), name);
 }
 
 inline bool loadMacroIntoMemory(std::string const& name,
@@ -306,11 +321,11 @@ inline bool loadMacroIntoMemory(std::string const& name,
     auto fileGdr2 = dir / (name + ".gdr2");
     auto fileSlc = dir / (name + ".slc");
     auto fileGbr = dir / (name + ".brrr");
+    auto fileGbrPlain = dir / (name + ".gbr");
     auto fileNhm = dir / (name + ".nhm");
     auto fileXe = dir / (name + ".xe");
     auto fileRe4 = dir / (name + ".re4");
     auto fileTtrl = dir / (name + ".ttrl");
-    auto fileTtr3 = dir / (name + ".ttr3");
     auto fileEcho = dir / (name + ".echo");
     auto fileAst = dir / (name + ".ast");
 
@@ -328,7 +343,7 @@ if (!forcedExt.empty()) {
         // empty - the library said it was there and playback did nothing.
         const bool isForeign = forcedExt == ".gdr2" || forcedExt == ".slc" ||
                                forcedExt == ".nhm" || forcedExt == ".xe" ||
-                               forcedExt == ".re4" || forcedExt == ".ttrl" || forcedExt == ".ttr3" ||
+                               forcedExt == ".re4" || forcedExt == ".ttrl" ||
                                 forcedExt == ".echo" ||
                                forcedExt == ".ast" ||
                                skk::gbr::looksLikeGbrByExtension(forcedExt);
@@ -362,7 +377,7 @@ if (!forcedExt.empty()) {
     // No extension given (the classic GUI's Load button). A .gdr2 is imported
     // into SKC, so it belongs on the SKC side of the preference check rather
     // than after it - a macro that only exists as GDR2 must still load.
-    for (const auto& pair : {std::pair{fileGdr2, ".gdr2"}, std::pair{fileSlc, ".slc"}, std::pair{fileGbr, ".brrr"}, std::pair{fileNhm, ".nhm"}, std::pair{fileXe, ".xe"}, std::pair{fileRe4, ".re4"}, std::pair{fileTtrl, ".ttrl"}, std::pair{fileTtr3, ".ttr3"},
+    for (const auto& pair : {std::pair{fileGdr2, ".gdr2"}, std::pair{fileSlc, ".slc"}, std::pair{fileGbrPlain, ".gbr"}, std::pair{fileGbr, ".brrr"}, std::pair{fileNhm, ".nhm"}, std::pair{fileXe, ".xe"}, std::pair{fileRe4, ".re4"}, std::pair{fileTtrl, ".ttrl"},
                        std::pair{fileEcho, ".echo"},
                        std::pair{fileAst, ".ast"}}) {
         if (fs::exists(pair.first)) {
@@ -428,11 +443,52 @@ inline void armPlayback(std::string const& name) {
 
         // A typed name must win over whatever is already loaded, same as the
         // SKK branch.
+        // A native .skc is only one of the library's sources: a foreign import
+        // (.slc/.echo/...) exists as its RAW FILE only - adopt() keeps it in
+        // memory and dies with the GD process. So when the .skc miss comes
+        // from that, run the universal loader (the same one the library row
+        // click uses) before giving up. Without this, pressing PLAY right
+        // after a GD restart refused silently: the .slc sat in the library,
+        // the bot was empty, and nothing - button, log, toast - said why (the
+        // user-visible "PLAY не включается" report of 31.10, Windy Road.slc).
         if (!name.empty() && bot.getMacroName() != name) {
             auto dir = skkbot2::paths::replays();
-            (void)bot.load(dir / (name + ".skc"));
+            if (!bot.load(dir / (name + ".skc"))) {
+                if (!loadMacroIntoMemory(name)) {
+                    skkbot2::log::error(
+                        "[SKC] PLAY: cannot load any '{}.skc/.skk/.slc/... "
+                        "from {}' - no such library entry",
+                        name, skk::pathToUtf8(dir));
+                }
+            }
+        } else if (name.empty()) {
+            skkbot2::log::warn(
+                "[SKC] PLAY: macro name is empty - pick a row in the "
+                "library (or type a name) before playback");
+            // BUG-98: with nothing loaded the engine must not be touched at
+            // all. The 05:59 session died silently right after the warn
+            // (crashlog empty) - the empty-name run of 05:36 survived the
+            // same path because it still held inputs; an empty bot going on
+            // to halt/clear/pause plumbing is the suspect. Refuse here.
+            if (!bot.hasInputs()) {
+                return;
+            }
+            skkbot2::log::info("[SKC] PLAY: empty name, replaying the macro "
+                               "already in memory ({})",
+                               bot.getMacroName());
         }
+        skkbot2::log::info("[SKC] PLAY: checkpoint A (inputs={}, engine={})",
+                           bot.getInputCount(),
+                           [&] {
+                               auto* e = ReplayEngine::get();
+                               return e ? static_cast<int>(e->engineMode) : -1;
+                           }());
         if (!bot.hasInputs()) {
+            skkbot2::log::error(
+                "[SKC] PLAY refused: the bot holds no actions for '{}' "
+                "(load failed or the import was refused - see the "
+                "earlier [SLC]/[SKC] lines)",
+                name);
             return;
         }
 
@@ -440,6 +496,7 @@ inline void armPlayback(std::string const& name) {
         if (engine && engine->engineMode != MODE_DISABLED) {
             engine->haltExecution();
         }
+        skkbot2::log::info("[SKC] PLAY: checkpoint B (engine halted/cleared)");
         // A queued SKK Record/Play left over from earlier must not fire on the
         // next level entry while SKC owns the transport.
         if (engine && engine->pendingAction != ReplayEngine::PendingAction::None) {
@@ -449,6 +506,8 @@ inline void armPlayback(std::string const& name) {
         skkbot2::Logger::get().setSessionMode(
             skkbot2::Logger::SessionMode::Playback
         );
+        skkbot2::log::info("[SKC] PLAY: checkpoint C (session mode set, mode={})",
+                           gui.lockDelta ? "Lock Delta" : "Real Time");
 
         // Does the macro have anywhere to play from RIGHT HERE? The old rule was
         // `runActive`, which is true for the most common case of all - a normal
@@ -459,6 +518,7 @@ inline void armPlayback(std::string const& name) {
         if (!playLayer) {
             // Editor build mode (or menu): arm now and let the playtest-start
             // / PlayLayer::init hook align the spawn when physics begin.
+            skkbot2::log::info("[SKC] PLAY: checkpoint D (no PlayLayer -> arm)");
             bot.armPlayback();
             return;
         }
@@ -466,6 +526,8 @@ inline void armPlayback(std::string const& name) {
         skk::skc::Bot::PlaybackStart start{};
         if (bot.startPlaybackIfReady(&start)) {
             // Started on the spot. No arming, no reset, no waiting for a death.
+            skkbot2::log::info("[SKC] PLAY: checkpoint E (startPlaybackIfReady "
+                               "true, firstActionFrame={})", start.firstActionFrame);
             skkbot2::log::info("[SKC] PLAY started immediately: attempt is at "
                                "frame 0, macro begins at frame {}",
                                start.firstActionFrame);
@@ -487,8 +549,19 @@ inline void armPlayback(std::string const& name) {
             return;
         }
 
+        if (start.decision == skk::skc::Bot::StartDecision::WrongMode) {
+            // Arming would be wrong too: the next attempt is on the same level,
+            // so the mode would still be wrong. Say it and stop.
+            const std::string why = bot.describeStartBlock(start);
+            skkbot2::log::warn("{}", why);
+            skkbot2::Logger::get().error("{}", why);
+            return;
+        }
+
         // Dead, finished, or practice respawn: the old immediate path, which
         // restarts the level and plays from frame 0. Unchanged.
+        skkbot2::log::info("[SKC] PLAY: checkpoint F (immediate start path: "
+                           "startPlayback + resetLevel)");
         bot.startPlayback();
         if (playLayer->m_levelSettings && playLayer->m_levelSettings->m_platformerMode) {
             playLayer->resetLevelFromStart();
@@ -511,10 +584,22 @@ inline void armPlayback(std::string const& name) {
     // hasMacroInputs() already returns true for A).
     if (!name.empty() && engine->getMacroName() != name) {
         if (!engine->loadMacroFromName(name)) {
+            skkbot2::log::error(
+                "[SKK] PLAY: cannot load '{}.skk' from the replays "
+                "directory",
+                name);
             return;
         }
+    } else if (name.empty()) {
+        skkbot2::log::warn(
+            "[SKK] PLAY: macro name is empty - pick a row in the "
+            "library (or type a name) before playback");
     }
     if (!engine->hasMacroInputs()) {
+        skkbot2::log::error(
+            "[SKK] PLAY refused: '{}' holds no actions (load failed or "
+            "the macro carries no clicks)",
+            name);
         return;
     }
 

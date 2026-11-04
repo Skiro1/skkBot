@@ -199,6 +199,8 @@ struct Macro {
     // Display rate the macro was recorded under; 0 = follow framerateHint. The
     // only rate that reaches the wire file, and only when it differs.
     double displayFps = 0.0;
+    bool lockDelta = true;
+    bool realTime = false;
     double duration = 0.0;
     float startPosX = 0.0f;
     float startPosY = 0.0f;

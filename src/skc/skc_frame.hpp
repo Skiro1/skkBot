@@ -37,10 +37,36 @@ public:
     [[nodiscard]] uint32_t getFrame() const { return m_frame; }
     void setFrame(uint32_t frame) { m_frame = frame; }
 
+    // BUG-70 levelTime-deficit probe. processCommands is the per-iteration
+    // physics signal, and the dt it carries is exactly the time that
+    // iteration integrates; m_levelTime must accumulate sum(dt) / warp.
+    // Counting calls split by half/full and summing the dt lets the
+    // [BAT] window probe separate "update integrated less time" from
+    // "levelTime was written less than what was integrated".
+    void noteCall(float dt, bool isHalfTick) {
+        if (isHalfTick) {
+            ++m_probeHalf;
+        } else {
+            ++m_probeFull;
+        }
+        m_probeDtSum += static_cast<double>(dt);
+    }
+    void probeReset() {
+        m_probeHalf = 0;
+        m_probeFull = 0;
+        m_probeDtSum = 0.0;
+    }
+    [[nodiscard]] uint64_t probeHalf() const { return m_probeHalf; }
+    [[nodiscard]] uint64_t probeFull() const { return m_probeFull; }
+    [[nodiscard]] double probeDtSum() const { return m_probeDtSum; }
+
 private:
     FrameClock() = default;
 
     uint32_t m_frame = 0;
+    uint64_t m_probeHalf = 0;
+    uint64_t m_probeFull = 0;
+    double m_probeDtSum = 0.0;
 };
 
 } // namespace skk::skc

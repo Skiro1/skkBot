@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -80,7 +81,46 @@ class AudioCapture {
     // samples (game seconds). Call once per drive() вЂ” the loop only runs
     // when the level time has advanced past the pumped samples, so it
     // naturally stalls while the sim is held (encoder backpressure, pause).
+    //
+    // The FIRST call also anchors the audio timeline: everything the mixer
+    // produces up to that `levelTime` is the pre-roll and is DROPPED, because
+    // video pts 0 is that same moment. A render started mid-attempt (the
+    // normal flow: the macro is already playing when Start Render is pressed)
+    // would otherwise encode the track from 0 while the video starts at
+    // levelTime L0, and the whole video would be out of sync by L0 seconds.
     void pump(double levelTime);
+
+    // Pins the audio timeline to the video timeline. `levelTime` is the level
+    // time of video pts 0 and `trackPositionSeconds` is where the level song
+    // actually is inside its own track at that moment (begin() restarts it
+    // from 0, so normally 0). Everything the mixer produces up to
+    // `levelTime - trackPositionSeconds` is pre-roll and gets dropped, so the
+    // first encoded block (pts 0) carries the track at the position the
+    // footage shows. Without it a render started mid-attempt plays the track
+    // from 0 over footage from L0 and the whole video is late by L0.
+    void anchorAt(double levelTime, double trackPositionSeconds);
+
+    // Seconds of audio the encoder has written (pts of the next frame).
+    double producedSeconds() const {
+        return m_sampleRate > 0
+                   ? static_cast<double>(m_pumpedConsumed) /
+                         static_cast<double>(m_sampleRate)
+                   : 0.0;
+    }
+    // Seconds the offline mixer has actually mixed since attach() (master
+    // group DSP clock). Equals producedSeconds() + the dropped pre-roll once
+    // the pump is caught up; a difference means the mixer is behind or ahead.
+    double mixerSeconds();
+    // Pre-roll still to be dropped (0 once the anchor is reached).
+    double prerollRemainSeconds() const {
+        if (m_prerollEnd <= 0.0 || m_sampleRate <= 0) {
+            return 0.0;
+        }
+        const double dropped =
+            static_cast<double>(m_discardedSamples) /
+            static_cast<double>(m_sampleRate);
+        return std::max(0.0, m_prerollEnd - dropped);
+    }
 
     // Encodes as many complete codec frames as possible from the captured
     // PCM. sink(block, ptsSamples) is called once per codec frame with an
@@ -140,6 +180,18 @@ class AudioCapture {
     double m_fmodTime = 0.0;
     double m_time = 0.0;
     double m_lastLevelTime = 0.0;
+
+    // Timeline anchor (see pump()): the first pump records the level time the
+    // render actually starts at; everything mixed before that is dropped so
+    // the music starts at the same position the footage does.
+    bool m_anchored = false;
+    double m_prerollEnd = 0.0;
+    // Samples (per channel) dropped by the pre-roll. They are NOT part of the
+    // written track (pts stays at 0 for the first encoded block) but they DID
+    // advance the mixer, so backpressure has to count them in m_time.
+    int64_t m_discardedSamples = 0;
+    // Master-group DSP clock at attach: the mixer's own sample counter.
+    unsigned long long m_masterClockBase = 0;
 };
 
 }  // namespace render

@@ -1606,6 +1606,10 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
     if (followTps || pinned || equalsTps) {
         writeLE<double>(output, equalsTps ? std::copysign(0.0, -1.0) : macro.displayFps);
     }
+    // Timing mode: 0 = Lock Delta, 1 = Real Time (omitted for default lock delta to keep plain header identical)
+    if (macro.realTime) {
+        writeLE<uint8_t>(output, 1u);
+    }
 
     if (output.size() > std::numeric_limits<uint32_t>::max()) {
         return {};
@@ -1759,6 +1763,13 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
             (macro.displayFps != 0.0 && (macro.displayFps < 1.0 || macro.displayFps > 1'000'000.0))) {
             return fail("invalid SKK3 display fps");
         }
+    } else if (metadataCtx.remaining() != 0 && metadataCtx.remaining() != sizeof(uint8_t)) {
+        return fail("invalid SKK3 metadata");
+    }
+    if (metadataCtx.remaining() >= sizeof(uint8_t)) {
+        uint8_t timingByte = readLE<uint8_t>(metadataCtx);
+        macro.realTime = (timingByte == 1u);
+        macro.lockDelta = !macro.realTime;
     } else if (metadataCtx.remaining() != 0) {
         return fail("invalid SKK3 metadata");
     }
@@ -2279,6 +2290,8 @@ Macro fromSkMacro(SkMacro const& macro) {
     result.author = macro.author;
     result.framerateHint = tps;
     result.displayFps = macro.displayFps;
+    result.lockDelta = macro.lockDelta;
+    result.realTime = macro.realTime;
     result.duration = macro.duration;
     result.startPosX = macro.startPosX;
     result.startPosY = macro.startPosY;
@@ -2353,6 +2366,8 @@ SkMacro toSkMacro(Macro const& macro) {
     result.levelId = macro.levelId;
     result.framerate = tps;
     result.displayFps = macro.displayFps;
+    result.lockDelta = macro.lockDelta;
+    result.realTime = macro.realTime;
     result.duration = macro.duration;
     result.gameVersion = static_cast<uint32_t>(std::min<uint64_t>(
         macro.gameVersion,
@@ -2502,6 +2517,18 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
+    // SKK3 stores framerateHint as float64. This regression check ensures the
+    // non-float32-exact example survives the actual header serializer exactly,
+    // not merely as a nearby tick rate.
+    Macro fractionalTps = base;
+    fractionalTps.framerateHint = 144.144;
+    const auto fractionalTpsBytes = serialize(fractionalTps);
+    auto fractionalTpsBack = deserialize(fractionalTpsBytes, &error);
+    if (!fractionalTpsBack || fractionalTpsBack->framerateHint != 144.144) {
+        result.detail = "fractional TPS 144.144 did not survive the exact SKK3 round-trip";
+        return result;
+    }
+
     // Case 2: a real display rate. The header must grow by exactly one field
     // and nothing else, and the value has to come back.
     const size_t plainHeader = headerLenOf(plainBytes);
@@ -2521,6 +2548,22 @@ HeaderSelfTestResult selfTestHeader() {
     auto pinnedBack = deserialize(pinnedBytes, &error);
     if (!pinnedBack || pinnedBack->displayFps != 60.0) {
         result.detail = "display rate did not survive the round-trip";
+        return result;
+    }
+
+    // Case 2b: real time timing mode. Header grows by 1 byte.
+    Macro rtMacro = base;
+    rtMacro.realTime = true;
+    rtMacro.lockDelta = false;
+    const auto rtBytes = serialize(rtMacro);
+    const size_t rtHeader = headerLenOf(rtBytes);
+    if (rtHeader != plainHeader + sizeof(uint8_t)) {
+        result.detail = "timing mode grew header unexpectedly";
+        return result;
+    }
+    auto rtBack = deserialize(rtBytes, &error);
+    if (!rtBack || !rtBack->realTime || rtBack->lockDelta) {
+        result.detail = "timing mode did not survive round-trip";
         return result;
     }
 

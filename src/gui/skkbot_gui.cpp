@@ -62,27 +62,36 @@ void Gui::init() {
     showSettings = false;
     showFeatures = true;
     showMacroList = false;
-    menuKeybind = mod->getSavedValue<int>("menu_keybind", 0xA5);
-    stepForwardKeybind = mod->getSavedValue<int>("keybind_step_forward", 0x43);
-    // Default moved G -> C. A saved 0x47 is the OLD default, not a user choice,
-    // so migrate it once вЂ” otherwise the new default never reaches anyone who
-    // ran a build before the change.
-    if (stepForwardKeybind == 0x47) {
-        stepForwardKeybind = 0x43;
-        mod->setSavedValue("keybind_step_forward", stepForwardKeybind);
+    // ПО УМОЛЧАНИЮ все кейбинды NONE (запрос 03.11.2026), кроме Open
+    // Menu — он вернулся на Tab (0x09) по просьбе пользователя.
+    // Stored-значение, равное старому дефолту (0xA5 right-alt, NONE
+    // предыдущего коммита), считается «не выбором пользователя» и
+    // мигрирует (тот же приём, что и миграция G -> C ниже). Привязка —
+    // вручную через KEYBINDS (capture), а снять — правый клик по
+    // пилюле или Delete во время capture.
+    menuKeybind = mod->getSavedValue<int>("menu_keybind", 0x09);
+    if (menuKeybind == 0xA5 || menuKeybind == 0) {
+        menuKeybind = 0x09;
+        mod->setSavedValue("menu_keybind", 0x09);
     }
-
-    // Keybind table. The two legacy keys above are the authoritative storage for
-    // Menu and StepForward (existing installs already have them); the rest read
-    // their own saved keys. Legacy defaults are migrated the same way the G->C
-    // move was: a value equal to a superseded default is treated as "not chosen
-    // yet" so the new default still reaches old installs.
-    // Only MENU, RESET LEVEL and STEP FORWARD ship with a default. Everything else
-    // is UNBOUND (0): transport keys and assist toggles are actions the user
-    // opts into, and pre-assigning letters silently steals keys the game or
-    // other mods may want. The rows stay listed in KEYBIND, so a bind is one
-    // click away. `legacyDef` carries the superseded default so existing installs
-    // get their stored value reset once to the new one.
+    stepForwardKeybind = mod->getSavedValue<int>("keybind_step_forward", 0);
+    // Слитая миграция «G -> C» (19.10): и старый G (0x47), и прежний
+    // дефолт C (0x43) считаются «не выбором» — снимаются в NONE.
+    if (stepForwardKeybind == 0x47 || stepForwardKeybind == 0x43) {
+        stepForwardKeybind = 0;
+        mod->setSavedValue("keybind_step_forward", 0);
+    }
+    // Keybind table. Menu и StepForward двух легаси-полей выше; остальное
+    // читает свои saved-ключи. ПО УМОЛЧАНИЮ ВСЁ НЕТ (запрос 03.11.2026):
+    // ни один бинд не задаётся автоматически — Menu/StepForward/ResetLevel/
+    // Hitboxes тоже NONE (0). У остальных stored-значение появляется
+    // ТОЛЬКО по явному capture, так что миграции не требуют — а снять
+    // привязку можно правым кликом по пилюле (drawKeybindSection) или
+    // Delete во время capture.
+    // Transport-клавиши и assist-тогглы — действия, которые пользователь
+    // выбирает сам: пред-назначенные буквы молча крадут клавиши у игры
+    // или других модов. Строки остаются в KEYBINDS, так что привязать —
+    // один клик. legacyDef хранит superseded-дефолт (0 = нет).
     static const struct {
         Bind bind;
         const char* label;
@@ -91,15 +100,15 @@ void Gui::init() {
         const char* saveKey;
         int legacyDef;  // superseded default to migrate away from, 0 = none
     } kBindDefs[] = {
-        { Bind::Menu,        "Open Menu",   0xA5, 0, "menu_keybind",           0    },
+        { Bind::Menu,        "Open Menu",  0x09, 0, "menu_keybind",           0xA5 },
         // "Reset Level" is GDH's own name for it (src/interface/imgui/windows/
         // shortcuts.cpp:143, bind id "shortcut::reset_level"); its implementation
         // there is a bare PlayLayer::resetLevel() (src/core/shortcuts.hpp:29-30).
         // R was Record's old default; Record is now unbound, so the key is free.
-        { Bind::ResetLevel,   "Reset Level", 0x52, 0, "keybind_reset_level",    0x56 },
+        { Bind::ResetLevel,   "Reset Level", 0, 0, "keybind_reset_level",    0x52 },
         { Bind::Record,      "Record",      0,   1, "keybind_record",         0x52 },
         { Bind::Play,        "Play",        0,   1, "keybind_play",           0x50 },
-        { Bind::StepForward, "Step Forward",0x43, 1, "keybind_step_forward",   0x47 },
+        { Bind::StepForward, "Step Forward",0,   1, "keybind_step_forward",   0x43 },
         { Bind::StepToggle,  "Step Toggle", 0,   1, "keybind_step_toggle",    0x54 },
         { Bind::Hitboxes,    "Hitboxes",    0,   2, "keybind_hitboxes",       0x48 },
         { Bind::Speedhack,   "Speedhack",   0,   2, "keybind_speedhack",      0x42 },
@@ -116,10 +125,6 @@ void Gui::init() {
             bindKeys[i] = stepForwardKeybind;
         } else {
             bindKeys[i] = mod->getSavedValue<int>(d.saveKey, d.def);
-            if (d.legacyDef && bindKeys[i] == d.legacyDef) {
-                bindKeys[i] = d.def;
-                mod->setSavedValue(d.saveKey, bindKeys[i]);
-            }
         }
     }
     kbWaiting = -1;
@@ -150,12 +155,9 @@ void Gui::init() {
     //
     // The saved key is cleared rather than merely ignored: leaving a "true" in
     // the user's file after removing the control that could un-set it is the
-    // exact shape of the setting that comes back on a later version.
-    if (mod->getSavedValue<bool>("gui_fps_lock_delta", false)) {
-        mod->setSavedValue("gui_fps_lock_delta", false);
-        skkbot2::Logger::get().info(
-            "skkbot2: saved Lock FPS setting cleared - the control is gone");
-    }
+    lockDelta = mod->getSavedValue<bool>("gui_timing_lock_delta", true);
+    realTime = mod->getSavedValue<bool>("gui_timing_real_time", false);
+    if (realTime) lockDelta = false;
     skkbot2::fps::setEnabled(fpsEnabled);
     skkbot2::fps::setTarget(fpsValue == 0.0 ? skkbot2::fps::kFollowTps : fpsValue);
     engine->gameSpeed = 1.0;
@@ -897,21 +899,27 @@ static void applyTheme() {
 }
 
 void Gui::applyCursorForOpenState() {
-    // GD owns the OS cursor on desktop: it hides it during gameplay and shows
-    // it on menu scenes. The bot menu must always be mouse-friendly, so force
-    // the cursor visible while the menu is open and hand control back to the
-    // state GD had before opening once the menu closes.
     auto* view = CCEGLView::sharedOpenGLView();
     if (!view) return;
+    auto* play = PlayLayer::get();
+    bool hiddenInGame = play && !GameManager::get()->getGameVariable("0024");
+
     if (open) {
         if (!cursorForced) {
             cursorForced = true;
             cursorPrevShouldHide = view->getShouldHideCursor();
         }
         view->showCursor(true);
+        PlatformToolbox::showCursor();
     } else if (cursorForced) {
         cursorForced = false;
-        view->showCursor(!cursorPrevShouldHide);
+        if (hiddenInGame && !play->m_isPaused && !play->m_hasCompletedLevel) {
+            view->showCursor(false);
+            PlatformToolbox::hideCursor();
+        } else {
+            view->showCursor(true);
+            PlatformToolbox::showCursor();
+        }
     }
 }
 
@@ -1386,8 +1394,13 @@ void Gui::drawFeaturesWindow() {
              skk::skc::Bot::get().getState() == skk::skc::State::Playback);
         if (isPlaying) {
             ImGui::BeginDisabled(true);
-            float liveTps = static_cast<float>(engine->runtimeTickRate());
-            ImGui::SliderFloat("TPS", &liveTps, 1.0f, 1000000.0f, "%.0f");
+            double liveTps = engine->runtimeTickRate();
+            char liveTpsFmt[16];
+            skkbot2::gui::beta_widgets::formatNumberPattern(
+                liveTpsFmt, sizeof(liveTpsFmt), liveTps);
+            const double tpsMin = 1.0, tpsMax = 1000000.0;
+            ImGui::SliderScalar("TPS", ImGuiDataType_Double, &liveTps,
+                                &tpsMin, &tpsMax, liveTpsFmt);
             ImGui::SameLine();
             bool on = true;
             ImGui::Checkbox("##tps_enable", &on);
@@ -1395,9 +1408,14 @@ void Gui::drawFeaturesWindow() {
         } else {
             engine->tickRate = tpsEnabled ? tpsValue : 240.0;
             ImGui::BeginDisabled(!tpsEnabled);
-            float tps = static_cast<float>(tpsEnabled ? tpsValue : 240.0);
-            if (ImGui::SliderFloat("TPS", &tps, 1.0f, 1000000.0f, "%.0f")) {
-                tpsValue = static_cast<double>(tps);
+            double tps = tpsEnabled ? tpsValue : 240.0;
+            char tpsFmt[16];
+            skkbot2::gui::beta_widgets::formatNumberPattern(
+                tpsFmt, sizeof(tpsFmt), tps);
+            const double tpsMin = 1.0, tpsMax = 1000000.0;
+            if (ImGui::SliderScalar("TPS", ImGuiDataType_Double, &tps,
+                                    &tpsMin, &tpsMax, tpsFmt)) {
+                tpsValue = tps;
                 engine->tickRate = tpsValue;
                 settingsDirty = true;
             }
@@ -1405,12 +1423,12 @@ void Gui::drawFeaturesWindow() {
             if (ImGui::IsItemHovered() && tpsEnabled) {
                 anyValueHovered = true;
                 if (wheelDelta != 0.0f) {
-                    // Step exactly +-1 per wheel event (not by |wheelDelta|):
-                    // multi-detent wheels report 2-3 per event and would skip
-                    // values like 360 (359 -> 361). Sign-based single-step keeps
-                    // every integer reachable.
+                    // Coarse quarter-Hz steps; Shift makes the step 0.001 Hz.
                     tpsValue = std::clamp(
-                        tpsValue + (wheelDelta > 0.0f ? 1.0 : -1.0), 1.0, 1000000.0);
+                        tpsValue + (wheelDelta > 0.0f
+                            ? (ImGui::GetIO().KeyShift ? 0.001 : 0.25)
+                            : (ImGui::GetIO().KeyShift ? -0.001 : -0.25)),
+                        1.0, 1000000.0);
                     engine->tickRate = tpsValue;
                     settingsDirty = true;
                 }
@@ -1446,15 +1464,19 @@ void Gui::drawFeaturesWindow() {
         // What the macro put in force. 0 means "follow tps" - showing the tick
         // rate here would push a pinned number back on the next frame, which
         // the module reads as a hand edit and then honours over the macro.
-        const float macroFpsV = static_cast<float>(
-            skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0);
+        const double macroFpsV =
+            skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0;
         const bool macroFpsOn = skkbot2::fps::enabled();
-        float fpsSlider = fpsMacro ? macroFpsV : static_cast<float>(fpsValue);
+        double fpsSlider = fpsMacro ? macroFpsV : fpsValue;
         bool fpsToggle = fpsMacro ? macroFpsOn : fpsEnabled;
         if (!fpsLocked) {
             bool edited = false;
-            if (ImGui::SliderFloat("FPS##fps", &fpsSlider, 0.0f, 1000.0f,
-                                   "%.0f")) {
+            char fpsFmt[16];
+            skkbot2::gui::beta_widgets::formatNumberPattern(
+                fpsFmt, sizeof(fpsFmt), fpsSlider);
+            const double fpsMin = 0.0, fpsMax = 1000.0;
+            if (ImGui::SliderScalar("FPS##fps", ImGuiDataType_Double, &fpsSlider,
+                                    &fpsMin, &fpsMax, fpsFmt)) {
                 edited = true;
             }
             ImGui::SameLine();
@@ -1465,7 +1487,7 @@ void Gui::drawFeaturesWindow() {
             // mirrored number into fpsValue would make it the menu's value
             // after the session, which endMacro() restores over.
             if (edited) {
-                fpsValue = static_cast<double>(fpsSlider);
+                fpsValue = fpsSlider;
                 fpsEnabled = fpsToggle;
                 settingsDirty = true;
             }
@@ -1473,17 +1495,17 @@ void Gui::drawFeaturesWindow() {
             // comparing against what the macro set, so the push has to happen
             // for that comparison to exist.
             skkbot2::fps::setEnabled(fpsToggle);
-            skkbot2::fps::setTarget(fpsSlider <= 0.0f ? skkbot2::fps::kFollowTps
-                                                      : static_cast<double>(fpsSlider));
+            skkbot2::fps::setTarget(fpsSlider <= 0.0 ? skkbot2::fps::kFollowTps
+                                                      : fpsSlider);
         } else {
-            ImGui::Text("FPS: %.0f  (recording)", fpsSlider);
+            ImGui::Text("FPS: %.3f  (recording)", fpsSlider);
         }
         // One line, same fact as the beta GUI's suffix: how many physics steps
         // this frame rate asks for at the current tick rate. With FPS at 0 the
         // display follows TPS and this reads 1, which is the whole story.
         {
             const double rate = engine->runtimeTickRate();
-            const double shown = static_cast<double>(fpsSlider);
+            const double shown = fpsSlider;
             const double eff = shown <= 0.0 ? rate : shown;
             if (rate > 0.0 && eff > 0.0) {
                 ImGui::TextDisabled("%d steps/frame at %.0f tps",
@@ -1792,7 +1814,7 @@ static constexpr Gui::BindInfo kBindRows[Gui::kBindCount] = {
     { Gui::Bind::Play,        "Play",        0,    1 },
     { Gui::Bind::StepForward, "Step Forward",0x43, 1 },
     { Gui::Bind::StepToggle,  "Step Toggle", 0,    1 },
-    { Gui::Bind::Hitboxes,    "Hitboxes",    0,    2 },
+    { Gui::Bind::Hitboxes,    "Hitboxes",    0x48, 2 },
     { Gui::Bind::Speedhack,   "Speedhack",   0,    2 },
     { Gui::Bind::Noclip,      "Noclip",      0,    2 },
     { Gui::Bind::Trajectory,  "Trajectory",  0,    2 },
@@ -2079,6 +2101,14 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
             if (key == 0x1B) { // Escape = cancel
                 kbWaiting = -1;
                 skkbot2::Logger::get().info("skkBot2: keybind capture cancelled");
+            } else if (key == 0x2E) { // Delete = unbind the armed row
+                const int idx = kbWaiting;
+                bindKeys[idx] = 0;
+                persistBind(static_cast<Bind>(idx));
+                kbWaiting = -1;
+                heldBind = -1;
+                skkbot2::Logger::get().info("skkBot2: keybind removed: {} (Delete during capture)",
+                                            kBindRows[idx].label);
             } else {
                 const int idx = kbWaiting;
                 bindKeys[idx] = key;

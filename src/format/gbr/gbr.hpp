@@ -28,7 +28,7 @@ namespace skk::gbr {
 // Extensions known to carry GBR6. Kept for the library scan only - detection
 // itself is magic-based, so an unknown alias still loads.
 inline constexpr const char* kExtensions[] = {
-    ".brrr", ".maybach", ".romo",    ".grizzley", ".redkingdom",
+    ".gbr", ".brrr", ".maybach", ".romo",    ".grizzley", ".redkingdom",
     ".lemonade", ".icebrrr", ".waka", ".youngsta", ".knockerz",
 };
 

@@ -261,6 +261,8 @@ public:
     // skkbot2::fps::MacroDisplayRate::fromWire - comparing against zero cannot
     // see the marker, because -0.0 == +0.0.
     double displayFps = 0.0;
+    bool lockDelta = true;
+    bool realTime = false;
     double duration = 0.0;
     uint32_t gameVersion = 0;
     float startPosX = 0.f;

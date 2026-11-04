@@ -280,7 +280,8 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
 
     cp.totalTime = p->m_totalTime;
     cp.lastCheckpointTime = p->m_lastCheckpointTime;
-    cp.lastJumpTime = p->m_lastJumpTime;
+    // m_lastJumpTime (wall-clock, std::chrono) deliberately NOT captured:
+    // it must never leave the live world (BUG-89 / BUG-91).
     cp.lastFlipTime = p->m_lastFlipTime;
     cp.lastSpiderFlipTime = p->m_lastSpiderFlipTime;
     cp.gameModeChangedTime = p->m_gameModeChangedTime;
@@ -464,7 +465,8 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
 
     p->m_totalTime = totalTime;
     p->m_lastCheckpointTime = lastCheckpointTime;
-    p->m_lastJumpTime = lastJumpTime;
+    // m_lastJumpTime (wall-clock) deliberately NOT restored - GD recomputes
+    // it from live clicks (BUG-89 / BUG-91).
     p->m_lastFlipTime = lastFlipTime;
     p->m_lastSpiderFlipTime = lastSpiderFlipTime;
     p->m_gameModeChangedTime = gameModeChangedTime;

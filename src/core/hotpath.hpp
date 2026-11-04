@@ -29,6 +29,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -47,6 +48,33 @@ enum Slot {
     SafeModeJumps,     // incrementJumps
     SkEffectSetup,     // EffectGameObject::customObjectSetup
     BlurSnap,          // full-screen backdrop copy behind the menu blur
+    ProcCmdBase,       // vanilla GJBaseGameLayer::processCommands body
+    PqBtnBase,         // vanilla GJBaseGameLayer::processQueuedButtons body
+    CheckColl,         // vanilla GJBaseGameLayer::checkCollisions
+    PlayerBtn,         // vanilla GJBaseGameLayer::handleButton (whole click chain)
+    PlayerPushBtn,     // vanilla PlayerObject::pushButton
+    PlayerRelBtn,      // vanilla PlayerObject::releaseButton
+    EffectPlayerBtn,   // vanilla GJEffectManager::playerButton
+    JumpLogic,         // raw sub_14038B900: jump/press physics body inside pushButton
+    RingAct,           // raw sub_140398C00: per-object activation inside pushButton
+    BtnEventDispatch,  // raw sub_140231FF0: per-button event dispatch inside handleButton
+    RingJump,          // PlayerObject::ringJump (probe)
+    CircleWaveCreate,  // CCCircleWave::create (probe)
+    GjGameEvent,       // GJBaseGameLayer::gameEventTriggered (probe: event dispatch cost)
+    RingTriggerFx,     // EnhancedGameObject::playTriggerEffect (probe+skip)
+    RingActByPlayer,   // EnhancedGameObject::activatedByPlayer (probe)
+    RingPowerOff,      // EnhancedGameObject::powerOffObject (probe)
+    RingPerfGate,      // vanilla ringJump WITH our performance-mode gate
+    RingNoGate,        // vanilla ringJump WITHOUT gate (gate not taken)
+    ActivateStreak,    // PlayerObject::activateStreak (probe)
+    SetYVel,           // PlayerObject::setYVelocity (probe)
+    RunBallRot2,       // PlayerObject::runBallRotation2 (probe)
+    PlaceStreakPoint,  // PlayerObject::placeStreakPoint (probe)
+    StreakAddPoint,    // HardStreak::addPoint (probe + Echo dedupe)
+    StreakDraw,        // HardStreak::draw (CCDrawNode virtual, probe)
+    StreakUpdateStroke, // HardStreak::updateStroke (our wave-trail fix renderer)
+    ParticleSysUpdate, // CCParticleSystem::update (simulation of all emitters)
+    ParticleQuadDraw,  // CCParticleSystemQuad::draw (GPU-side particle rendering)
     N
 };
 
@@ -74,6 +102,60 @@ inline const char* name(Slot s) {
             return "effect.setup";
         case BlurSnap:
             return "blur.snapshot";
+        case ProcCmdBase:
+            return "processCommands(vanilla)";
+        case PqBtnBase:
+            return "queuedButtons(vanilla)";
+        case CheckColl:
+            return "checkCollisions";
+        case PlayerBtn:
+            return "handleButton(vanilla)";
+        case PlayerPushBtn:
+            return "pushButton(vanilla)";
+        case PlayerRelBtn:
+            return "releaseButton(vanilla)";
+        case EffectPlayerBtn:
+            return "effect.playerButton";
+        case JumpLogic:
+            return "jumpLogic(raw)";
+        case RingAct:
+            return "ring.activate(raw)";
+        case BtnEventDispatch:
+            return "btnEvent.dispatch(raw)";
+        case RingJump:
+            return "player.ringJump";
+        case CircleWaveCreate:
+            return "circleWave.create";
+        case GjGameEvent:
+            return "gjbase.gameEvent";
+        case RingTriggerFx:
+            return "ring.triggerEffect";
+        case RingActByPlayer:
+            return "ring.activatedByPlayer";
+        case RingPowerOff:
+            return "ring.powerOffObject";
+        case RingPerfGate:
+            return "ringJump.vanilla(perfgate)";
+        case RingNoGate:
+            return "ringJump.vanilla(ungated)";
+        case ActivateStreak:
+            return "player.activateStreak";
+        case SetYVel:
+            return "player.setYVelocity";
+        case RunBallRot2:
+            return "player.runBallRotation2";
+        case PlaceStreakPoint:
+            return "player.placeStreakPoint";
+        case StreakAddPoint:
+            return "streak.addPoint";
+        case StreakDraw:
+            return "streak.draw";
+        case StreakUpdateStroke:
+            return "streak.updateStroke";
+        case ParticleSysUpdate:
+            return "particle.update";
+        case ParticleQuadDraw:
+            return "particle.draw";
         default:
             return "?";
     }
@@ -88,6 +170,19 @@ inline Stats& stats() {
     static Stats s;
     return s;
 }
+
+// Visual frame identity for per-frame throttling of playback visuals.
+//
+// The full-skip variant (9f04418) restored the fps but dropped every visual
+// the user cares about (trail, orb circles, spawn effects). Visuals drawn at
+// 1800 calls/s look identical to visuals drawn once per rendered frame, so
+// the hooks now gate on this counter instead of returning unconditionally:
+// first caller inside a driven frame runs, the rest early-return. Bumped
+// once per driven frame at the top of SpeedControlScheduler::update, which
+// fires exactly once per frame in every mode.
+inline std::atomic<uint32_t> visualFrameCounter{0};
+inline void bumpVisualFrame() { visualFrameCounter.fetch_add(1, std::memory_order_relaxed); }
+inline uint32_t visualFrame() { return visualFrameCounter.load(std::memory_order_relaxed); }
 
 inline double now() {
     return std::chrono::duration<double>(

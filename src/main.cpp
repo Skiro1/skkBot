@@ -2,6 +2,7 @@
 
 #include "skkBot.hpp"
 #include "core/hotpath.hpp"
+#include "core/playback_fps.hpp"
 #include "format/skk3_format.hpp"
 #include "skc/skc_bot.hpp"
 #include "skc/skc_format.hpp"
@@ -32,7 +33,13 @@ using namespace skkbot2::gui;
 
 $on_mod(Loaded) {
     auto& logger = skkbot2::Logger::get();
-    logger.setLevel(skkbot2::Logger::Debug);
+    // INFO, not Debug: the diag push/release lines fire up to ~14k times a
+    // second in a dual playback (Schafs), and every line above the level still
+    // pays fmt::format. At Debug that measured as a share of the frame budget
+    // hiding inside the [HOT] "GD base scheduler" number (BUG-70 session,
+    // 21:45). The instrument stays: raise the level in the GUI (Log Level)
+    // when a button-seam or drift hunt needs the flood back.
+    logger.setLevel(skkbot2::Logger::Info);
     logger.setFileLogging(true);
 
     logger.info("========================================");
@@ -112,6 +119,15 @@ $on_mod(Loaded) {
 #endif
 
     skkbot2::gui::get().init();
+
+    // If the user's FPS toggle is OFF, any previous session that left VSync
+    // disabled (game crashed while a pin was active, or the user quit mid-pin)
+    // needs to be cleaned up. This runs after gui.init() which loads
+    // gui_fps_enabled and pushes it into the fps module, so the module's own
+    // g_enabled is already the user's intended state.
+    if (!skkbot2::fps::enabled()) {
+        skkbot2::fps::restoreVsyncOnStartup();
+    }
 
     ImGuiCocos::get()
         .setup([] {
@@ -201,20 +217,20 @@ $on_mod(Loaded) {
             static double lastDump = 0.0;
             if (!renderer.isRecording()) {
                 const double now = skkbot2::hot::now();
-                if (now - lastDump > 10.0) {
+                if (now - lastDump > 5.0) {
                     lastDump = now;
                     auto& hs = skkbot2::hot::stats();
-                    std::string table = "[HOT] hot path, last 10s of play:";
+                    std::string table = "[HOT] hot path, last 5s of play:";
                     for (size_t i = 0; i < skkbot2::hot::N; i++) {
                         if (hs.calls[i] == 0 && hs.ms[i] == 0.0) continue;
-                        const double perSec = hs.calls[i] / 10.0;
+                        const double perSec = hs.calls[i] / 5.0;
                         const char* slotName =
                             skkbot2::hot::name(static_cast<skkbot2::hot::Slot>(i));
                         table += std::string("\n  ") + slotName + " = " +
                                  std::to_string(hs.calls[i]) + " calls (" +
                                  std::to_string(static_cast<long long>(perSec)) + "/s)";
                         if (hs.ms[i] > 0.0) {
-                            table += ", " + std::to_string(hs.ms[i] / 10.0) +
+                            table += ", " + std::to_string(hs.ms[i] / 5.0) +
                                      "ms per wall second";
                         }
                     }
@@ -236,19 +252,19 @@ $on_mod(Loaded) {
                         const double perHook = s.calls[static_cast<size_t>(skkbot2::hot::SchedUpdate)];
                         std::string verdict =
                             std::string("\n  >>> mod's own share = ") +
-                            std::to_string(std::max(0.0, hookMs - gdMs) / 10.0) +
+                            std::to_string(std::max(0.0, hookMs - gdMs) / 5.0) +
                             "ms per wall second, " +
                             std::to_string(perHook > 0 ? std::max(0.0, hookMs - gdMs) / perHook : 0.0) +
                             "us per hook call (" +
-                            std::to_string(hookMs / 10.0) +
-                            "ms hook total, " + std::to_string(gdMs / 10.0) +
+                            std::to_string(hookMs / 5.0) +
+                            "ms hook total, " + std::to_string(gdMs / 5.0) +
                             "ms of it GD's base scheduler)";
                         verdict += "\n  >>> always-on per-player hooks: " +
                                    std::to_string(
                                        (s.ms[static_cast<size_t>(skkbot2::hot::PlayerUpdate)] +
                                         s.ms[static_cast<size_t>(skkbot2::hot::WtsPlayerUpdate)] +
                                         s.ms[static_cast<size_t>(skkbot2::hot::MacroPlayerUpdate)]) /
-                                       10.0) +
+                                        5.0) +
                                    "ms per wall second";
                         skkbot2::log::info("{}", verdict);
                     }

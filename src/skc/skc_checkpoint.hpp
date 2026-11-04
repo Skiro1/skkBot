@@ -41,13 +41,31 @@ namespace skk::skc {
 // (checkpoint_system.cpp:537-563), and the state restore above is SKK's code.
 // ---------------------------------------------------------------------------
 struct SkcCheckpoint {
+    // Keep the GD object identity as well as its time/progress key. Platformer
+    // setup-checkpoints are restored through m_activatedCheckpoint and can
+    // share a levelTime key with a different synthetic checkpoint object.
+    CheckpointObject* object = nullptr;
     // FrameClock frame at capture - SKC's own clock, the unit recordInput
     // stamps events with, so trim/seek bounds are in the recording's units.
     uint32_t frame = 0;
 
     // The checkpoint's m_currentProgress/2 at capture. The only stable identity
     // a CheckpointObject carries, used to match a restore back to its snapshot.
+    // Valid for classic levels; in platformer mode progress is x-based and
+    // non-monotone (walking left moves it backwards), so two different
+    // checkpoints can share it - use timeFrame there instead.
     uint32_t progressFrame = 0;
+
+    // The checkpoint's m_levelTime converted to the recording's frame grid.
+    // m_levelTime is monotone within an attempt and is restored verbatim with
+    // the CheckpointObject, so this identifies the snapshot exactly even when
+    // the player backtracks. Filled for every capture, used only in platformer.
+    uint32_t timeFrame = 0;
+
+    // Mode the snapshot was captured in. Selects which identity key apply()
+    // compares; stored per snapshot so the decision does not depend on the
+    // level the macro is later played on.
+    bool platformer = false;
 
     // The actual payload: SKK's bundle, verbatim.
     CheckpointStateBundle state;
@@ -60,6 +78,11 @@ public:
     // Capture via SKK's CheckpointStateManager, while the physics is still live.
     // Called from the storeCheckpoint hook while recording.
     void capture(uint32_t frame, PlayLayer* playLayer, CheckpointObject* checkpoint);
+    void trackPlatformerCheckpoint(CheckpointObject* checkpoint);
+    [[nodiscard]] CheckpointObject* latestPlatformerCheckpoint() const;
+    [[nodiscard]] size_t getPlatformerCheckpointCount() const {
+        return m_platformerCheckpoints.size();
+    }
 
     // Match the snapshot to the checkpoint GD is restoring and hand it to SKK's
     // CheckpointStateManager::restore. Returns the FrameClock frame of the
@@ -86,6 +109,7 @@ private:
 
     // Ordered by capture time; apply() searches backwards for the newest match.
     std::vector<SkcCheckpoint> m_checkpoints;
+    std::vector<CheckpointObject*> m_platformerCheckpoints;
     uint32_t m_seams = 0;
 };
 

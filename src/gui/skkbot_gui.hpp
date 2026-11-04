@@ -94,6 +94,8 @@ struct Gui {
     // cannot surprise anyone.
     bool fpsEnabled = false;
     double fpsValue = 0.0;
+    bool lockDelta = true;
+    bool realTime = false;
     // Lock fps: exactly one physics step per drawn frame. Only meaningful while
     // fpsEnabled is on, because without a pinned rate the step count depends on
     // whatever the compositor delivers. Turning FPS off clears it.

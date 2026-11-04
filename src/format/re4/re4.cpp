@@ -34,11 +34,6 @@ constexpr uint8_t kMagic[3] = {'R', 'E', '4'};
 // recorded under correction.
 static constexpr int64_t kFrameShift = -1;
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::re4::looksLikeRe4(std::span<const uint8_t> data) {
@@ -172,29 +167,8 @@ bool skk::re4::toSkcMacro(const skk::re4::Replay& replay, skc::Macro& out,
     out.header.tps = replay.tps;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
-    uint64_t firstKeptRaw = 0;
-    bool haveFirstKept = false;
     for (const auto& a : replay.actions) {
-        const std::size_t ch = channelIndex(a.button, a.player2);
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
-        if (!haveFirstKept) {
-            firstKeptRaw = a.frame;
-            haveFirstKept = true;
-        }
         if (a.frame > 0xFFFFFFFFull) {
             return fail("re4: frame " + std::to_string(a.frame) +
                         " exceeds SKC's 32-bit frame counter");
@@ -208,7 +182,19 @@ bool skk::re4::toSkcMacro(const skk::re4::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()). Doing
+    // it after the shift keeps the "first click" report honest: quoting the
+    // first KEPT action, not a dangling leading release.
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) return fail("re4: no usable inputs after normalisation");
+
+    const uint64_t firstKeptRaw =
+        static_cast<uint64_t>(static_cast<int64_t>(out.actions.front().frame) - kFrameShift);
 
     std::string reason;
     if (!skc::validateActions(out.actions, reason)) {
@@ -217,7 +203,7 @@ bool skk::re4::toSkcMacro(const skk::re4::Replay& replay, skc::Macro& out,
 
     skkbot2::log::warn(
         "[RE4] {} inputs -> {} actions, dropped {} release(s) with no press and "
-        "{} duplicate press(es), frame shift {:+d} (first click {} -> {})",
+        "rebuilt {} collapsed tap(s), frame shift {:+d} (first click {} -> {})",
         replay.actions.size(), out.actions.size(), droppedRelease,
         droppedDuplicate, kFrameShift, firstKeptRaw, out.actions.front().frame);
     return true;

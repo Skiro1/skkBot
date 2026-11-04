@@ -90,11 +90,6 @@ private:
     size_t m_pos = 0;
 };
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::ttrl::looksLikeTtrl(std::span<const uint8_t> data) {
@@ -291,32 +286,15 @@ bool skk::ttrl::toSkcMacro(const skk::ttrl::Replay& replay, skc::Macro& out,
 
     out = skc::Macro{};
     out.header.tps = replay.tps;
+    out.platformerMode = (replay.flags & kFlagPlatformer) != 0;
+    out.platformerKnown = true;
+    out.header.platformerMode = out.platformerMode;
+    out.header.platformerKnown = true;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
-    uint64_t firstKeptRaw = 0;
-    bool haveFirstKept = false;
 
     for (const auto& a : replay.actions) {
-        const std::size_t ch = channelIndex(a.button, a.player2);
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
-        if (!haveFirstKept) {
-            firstKeptRaw = a.frame;
-            haveFirstKept = true;
-        }
         if (a.frame > 0xFFFFFFFFull) {
             return fail("ttrl: frame " + std::to_string(a.frame) +
                         " exceeds SKC's 32-bit frame counter");
@@ -330,14 +308,24 @@ bool skk::ttrl::toSkcMacro(const skk::ttrl::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) return fail("ttrl: no usable inputs after normalisation");
+
+    const uint64_t firstKeptRaw =
+        static_cast<uint64_t>(static_cast<int64_t>(out.actions.front().frame) - kFrameShift);
 
     std::string reason;
     if (!skc::validateActions(out.actions, reason)) return fail("ttrl: " + reason);
 
     skkbot2::log::warn(
         "[TTRL] {} inputs -> {} actions, dropped {} release(s) with no press and "
-        "{} duplicate press(es), frame shift {:+d} (first click {} -> {})",
+        "rebuilt {} collapsed tap(s), frame shift {:+d} (first click {} -> {})",
         replay.actions.size(), out.actions.size(), droppedRelease, droppedDuplicate,
         kFrameShift, firstKeptRaw, out.actions.front().frame);
     return true;

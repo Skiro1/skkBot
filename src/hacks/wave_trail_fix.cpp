@@ -120,11 +120,16 @@ static CCPoint offsetPoint(std::optional<CCPoint> prev, CCPoint cur,
 
 // Offset a whole path, returning the offset points and a per-segment label
 // (true = offset segment runs the same direction as its source segment).
-static std::tuple<std::vector<CCPoint>, std::vector<bool>>
-createOffset(std::vector<CCPoint>& path, float offset, float extensionLength) {
-    std::vector<CCPoint> points;
+// Zero-allocation: output vectors are caller-owned scratch (cleared, capacity
+// reused between calls) - this is the same shape Echo uses with its static
+// g_path/g_bands buffers, instead of rebuilding fresh std::vectors on every
+// updateStroke call (that churn was the bulk of our 166us/call).
+static void createOffset(const std::vector<CCPoint>& path, float offset,
+                         float extensionLength,
+                         std::vector<CCPoint>& points, std::vector<bool>& labels) {
+    points.clear();
     points.reserve(path.size());
-    std::vector<bool> labels;
+    labels.clear();
     labels.reserve(path.size() > 0 ? path.size() - 1 : 0);
     for (size_t i = 0; i < path.size(); i++) {
         std::optional<CCPoint> previousPoint;
@@ -156,7 +161,6 @@ createOffset(std::vector<CCPoint>& path, float offset, float extensionLength) {
         trailDirection = trailDirection.normalize();
         labels.push_back(actualDirection.dot(trailDirection) < -1.0f + 0.000001f ? false : true);
     }
-    return {points, labels};
 }
 
 // Remove self-intersections introduced by the offset on U-turns.
@@ -270,6 +274,29 @@ static std::vector<Part> buildConfiguration() {
 class $modify(WTSHardStreak, HardStreak) {
     struct Fields {
         std::vector<skk::wavetrail::Part> configuration;
+        // Zero-allocation scratch, reused between calls. Two nodes in dual mode
+        // each get their own Fields, so no interleave hazard.
+        std::vector<CCPoint> trailPath;
+        std::vector<CCPoint> firstPts, lastPts, prevPts, nextPts;
+        std::vector<bool> firstLbl, lastLbl, prevLbl, nextLbl;
+        // Mesh-identity snapshot: the vertex buffer is persistent while the
+        // node lives, so when nothing that feeds the geometry changed since
+        // the last build, the whole O(N) rebuild can be skipped - the GPU
+        // still redraws the stored mesh every frame. This is what keeps
+        // repeated activateStreak -> resumeStroke calls (vanilla fires one per
+        // ring activation, ~2000+/s in spam) from re-tessellating the trail.
+        bool meshValid = false;
+        bool sDrawStreak = false;
+        bool sSolid = false;
+        bool sFlipped = false;
+        float sWave = -1.0f;
+        float sPulse = -1.0f;
+        float sOpacity = -1.0f;
+        ccColor3B sColor{0, 0, 0};
+        CCPoint sPosition; // trail node position is an input too (SKC moves it)
+        size_t sCount = 0;
+        CCPoint sCurrent;
+        bool haveSnapshot = false;
     };
 
     // CCDrawNode::drawTriangle is not exported in this SDK build, so the
@@ -289,20 +316,45 @@ class $modify(WTSHardStreak, HardStreak) {
     }
 
     void updateStroke(float dt) {
+        skkbot2::hot::Timed skkbot2Timing(skkbot2::hot::StreakUpdateStroke);
         if (!skk::wavetrail::drawEnabled()) {
             HardStreak::updateStroke(dt);
             return;
         }
 
-        // Vanilla draws the streak as a single solid band; we rebuild the same
-        // vertex buffer with our sub-part configuration (miter-joined bands).
+        // Mesh-identity check. Vanilla fires updateStroke per ring activation
+        // (activateStreak -> resumeStroke -> updateStroke(0), ~2000+/s in
+        // spam). The data feeding the geometry rarely changes between calls,
+        // and the vertex buffer is persistent while the node lives, so an
+        // unchanged snapshot means the stored mesh is already correct: skip
+        // the whole O(N) rebuild. The GPU still redraws the stored mesh every
+        // frame, so visuals are untouched.
+        const ccColor3B colorNow = getColor();
+        if (m_fields->meshValid && m_fields->sDrawStreak == m_drawStreak
+            && m_fields->sCount == m_pointArray->count()
+            && m_fields->sCurrent == m_currentPoint
+            && m_fields->sWave == m_waveSize && m_fields->sPulse == m_pulseSize
+            && m_fields->sOpacity == getOpacity()
+            && m_fields->sSolid == m_isSolid && m_fields->sFlipped == m_isFlipped
+            && m_fields->sColor.r == colorNow.r && m_fields->sColor.g == colorNow.g
+            && m_fields->sColor.b == colorNow.b
+            && m_fields->sPosition == getPosition()) {
+            return;
+        }
+
+        // Unlike vanilla (which returns without touching the buffer when
+        // !m_drawStreak), the previous code always cleared first so a stopped
+        // streak's leftover mesh dies on the next call - keep that behaviour.
         this->clear();
+
         if (!m_drawStreak) return;
         if (m_pointArray->count() == 0) return;
         if (getOpacity() == 0) return;
 
         const CCPoint position = getPosition();
-        std::vector<CCPoint> trailPath;
+
+        auto& trailPath = m_fields->trailPath;
+        trailPath.clear();
         trailPath.reserve(m_pointArray->count());
         for (unsigned int i = 0; i < m_pointArray->count(); i++) {
             auto* node = static_cast<PointNode*>(m_pointArray->objectAtIndex(i));
@@ -318,6 +370,12 @@ class $modify(WTSHardStreak, HardStreak) {
         if (m_fields->configuration.empty()) {
             m_fields->configuration = skk::wavetrail::buildConfiguration();
         }
+
+        auto& firstPts = m_fields->firstPts;
+        auto& lastPts = m_fields->lastPts;
+        auto& prevPts = m_fields->prevPts;
+        auto& nextPts = m_fields->nextPts;
+        auto& prevLbl = m_fields->prevLbl;
 
         for (auto& part : m_fields->configuration) {
             const float waveSize = part.sizeOverride.value_or(m_waveSize);
@@ -336,34 +394,20 @@ class $modify(WTSHardStreak, HardStreak) {
             const float lastOffset = m_isFlipped ? (part.startOffset + part.start * relativeFactor)
                                                  : (part.endOffset + part.end * relativeFactor);
 
-            std::vector<CCPoint> previousPoints, nextPoints, firstPoints, lastPoints;
-            std::vector<bool> previousLabels, nextLabels, firstLabels, lastLabels;
-            float previousOffset = 0.0f, nextOffset = 0.0f;
+            skk::wavetrail::createOffset(trailPath, firstOffset, relativeFactor, firstPts, m_fields->firstLbl);
+            skk::wavetrail::createOffset(trailPath, lastOffset, relativeFactor, lastPts, m_fields->lastLbl);
+            prevPts = firstPts;  // copy moves into spare capacity; no fresh allocs
+            prevLbl = m_fields->firstLbl;
 
-            std::tie(firstPoints, firstLabels) =
-                skk::wavetrail::createOffset(trailPath, firstOffset, relativeFactor);
-            std::tie(lastPoints, lastLabels) =
-                skk::wavetrail::createOffset(trailPath, lastOffset, relativeFactor);
-            previousPoints = firstPoints;
-            previousLabels = firstLabels;
-            previousOffset = firstOffset;
-            (void)previousLabels;
-            (void)nextLabels;
-            (void)firstLabels;
-            (void)lastLabels;
-
-            skk::wavetrail::fixPoints(trailPath, previousOffset, previousPoints,
-                                      previousLabels, lastPoints);
+            skk::wavetrail::fixPoints(trailPath, firstOffset, prevPts, prevLbl, lastPts);
 
             totalWeight = part.subparts[0].weight;
             for (size_t i = 1; i < part.subparts.size() + 1; i++) {
-                nextOffset = (i == part.subparts.size())
-                                 ? lastOffset
-                                 : (firstOffset + totalWeight * oneWidth);
-                std::tie(nextPoints, nextLabels) =
-                    skk::wavetrail::createOffset(trailPath, nextOffset, relativeFactor);
-                skk::wavetrail::fixPoints(trailPath, nextOffset, nextPoints, nextLabels,
-                                          firstPoints);
+                const float nextOffset = (i == part.subparts.size())
+                                             ? lastOffset
+                                             : (firstOffset + totalWeight * oneWidth);
+                skk::wavetrail::createOffset(trailPath, nextOffset, relativeFactor, nextPts, m_fields->nextLbl);
+                skk::wavetrail::fixPoints(trailPath, nextOffset, nextPts, m_fields->nextLbl, firstPts);
 
                 const auto& sub = part.subparts[i - 1];
                 const bool applies =
@@ -371,34 +415,51 @@ class $modify(WTSHardStreak, HardStreak) {
                     (sub.solidOnly && m_isSolid) ||
                     (sub.nonSolidOnly && !m_isSolid);
                 if (applies) {
-                    const ccColor4B color = ccc4(
+                    const ccColor4B drawColor = ccc4(
                         sub.color.value_or(getColor()).r,
                         sub.color.value_or(getColor()).g,
                         sub.color.value_or(getColor()).b,
                         static_cast<uint8_t>(std::clamp(
                             sub.opacity * getOpacity(), 0.0f, 255.0f)));
-                    for (size_t j = 0; j + 1 < previousPoints.size(); j++) {
-                        if (previousPoints[j] != previousPoints[j + 1]) {
-                            drawTriangle(previousPoints[j], previousPoints[j + 1],
-                                         nextPoints[j + 1], color);
+                    for (size_t j = 0; j + 1 < prevPts.size(); j++) {
+                        if (prevPts[j] != prevPts[j + 1]) {
+                            drawTriangle(prevPts[j], prevPts[j + 1], nextPts[j + 1], drawColor);
                         }
-                        if (nextPoints[j] != nextPoints[j + 1]) {
-                            drawTriangle(nextPoints[j + 1], nextPoints[j],
-                                         previousPoints[j], color);
+                        if (nextPts[j] != nextPts[j + 1]) {
+                            drawTriangle(nextPts[j + 1], nextPts[j], prevPts[j], drawColor);
                         }
                     }
                 }
 
-                previousOffset = nextOffset;
-                previousPoints = nextPoints;
-                previousLabels = nextLabels;
+                prevPts = nextPts;   // copy-assign reuses capacity, no allocs
+                prevLbl = m_fields->nextLbl;
 
                 if (i == part.subparts.size()) break;
                 totalWeight += part.subparts[i].weight;
             }
         }
+
+        // Successful build: record the geometry snapshot so repeated calls
+        // (multiple ring activations in one frame, vanilla-style) skip.
+        m_fields->meshValid = true;
+        m_fields->haveSnapshot = true;
+        m_fields->sDrawStreak = m_drawStreak;
+        m_fields->sSolid = m_isSolid;
+        m_fields->sFlipped = m_isFlipped;
+        m_fields->sWave = m_waveSize;
+        m_fields->sPulse = m_pulseSize;
+        m_fields->sOpacity = getOpacity();
+        m_fields->sColor = colorNow;
+        m_fields->sPosition = position;
+        m_fields->sCount = m_pointArray->count();
+        m_fields->sCurrent = m_currentPoint;
     }
+
 };
+// Note: HardStreak::reset() is win-inline and cannot be hooked. Its snapshot
+// invalidation happens naturally: reset empties m_pointArray, so the stored
+// count no longer matches and the next updateStroke rebuilds (never restoring
+// meshValid for an empty array, whose early-return path is always cheap).
 
 // ---------------------------------------------------------------------------
 // DRAG FIX — rebuild streak points from updateRotation.

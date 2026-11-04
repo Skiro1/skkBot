@@ -5,24 +5,47 @@
 
 #include <Geode/binding/GameManager.hpp>
 #include <Geode/binding/PlatformToolbox.hpp>
+#include <Geode/loader/Mod.hpp>
 #include <Geode/modify/CCDirector.hpp>
 
 #include <algorithm>
 #include <cmath>
 
-// The budget keeps the shape it had before this change (8 batches) as its
-// FLOOR rather than its ceiling, and multiplies the real requirement by this
-// instead. Echo uses 10x; the factor is smaller here on purpose - that one caps
-// how much physics a frame may run as a workload limit, whereas this exists to
-// stop a slow display from throttling the macro. x4 leaves a 20 fps display at
-// 4x its need, which is far more than any real stall, without letting one
-// frame behind a breakpoint try to catch up a whole second of simulation.
-static constexpr double kHeadroom = 4.0;
+// The frame-time budget: how much wall time one drawn frame may spend running
+// physics steps before the batch loop must stop. An adaptive budget clamped
+// between 16ms and 32ms prevents the display from collapsing below 30-60 FPS
+// during intense click-storms / spam sections, while leaving enough room
+// for full tick processing.
+static constexpr double kFrameTimeBudgetMin = 0.016;
+static constexpr double kFrameTimeBudgetMax = 0.032;
 static constexpr int kFloorCap = 8;
 // The absolute bound. The carry only ever grows by real elapsed time, so
 // reaching this needs a multi-second frame (a long alt-tab, a breakpoint). The
 // bound is what stops the next frame from owing a second of steps in turn.
 static constexpr int kHardCap = 512;
+
+// The measured cost of ONE physics step, in wall seconds - the input the step
+// budget is derived from.
+//
+// HISTORY, because both wrong anchors were tried first and the second made
+// things worse. The budget was a constant 8 batches until the display dropped:
+// at 20 fps a frame owed 12 steps, the loop stopped at 8, and the leftover
+// carry was clamped away - the macro played slower with nothing logged. It was
+// then derived from the CONFIGURED interval, which lies whenever the machine
+// cannot hold the setting (pinned 360 fps, delivering 90). The last attempt
+// derived it from the DELIVERED frame rate - and that is a self-reinforcing
+// loop: a heavier frame lowers the delivered fps, the budget grows, the next
+// frame runs even more steps, grows longer still, and the display collapses.
+// Measured on the user's machine at tps 3414: 180 fps -> 1 fps within one
+// session. The frame rate is an OUTPUT of that loop, not an input.
+//
+// The per-step cost is the input that actually decides how much physics a
+// frame can afford, and it does not move when the budget moves, so the loop
+// stays open. cap = kFrameTimeBudget / cost: the system settles at the
+// fastest sustainable pace, frames never exceed ~50 ms of physics, and
+// slowdown remains only when tps * cost > 1 - i.e. the machine genuinely
+// cannot run that many steps per second.
+static double g_emaStepCost = 0.0;
 
 // The Vertical Sync checkbox. Established by observation on 19.10.2026: the
 // tracer caught GD passing these keys to toggleGameVariable, one per checkbox the
@@ -236,9 +259,46 @@ void dropExtraDelta() {
     }
 }
 
+// The menu's own saved slider value. g_target is a live module cell that the
+// GUI's every-frame push overwrites with the kFollowTps sentinel whenever the
+// toggle is off - so "off at 0.0" in a snapshot line can mean "the menu slider
+// is anywhere". Reading the persisted value here makes the begin/end pair
+// comparable across sessions: if the number drifts, the corruption is real and
+// this line is the evidence; if it does not, 0.0 was just the sentinel.
+double menuSavedFps() {
+    return geode::Mod::get()->getSavedValue<double>("gui_fps_value", 0.0);
+}
+
 }  // namespace
 
 namespace skkbot2::fps {
+
+void restoreVsyncOnStartup() {
+    // If FPS is currently disabled (gui_fps_enabled == false), the previous
+    // session may have left VSync off. This happens when:
+    //   - the game crashes or is force-closed while a pin is active;
+    //   - the user disables FPS, but the variable "0030" was already written
+    //     to CCGameManager.dat as false and never restored.
+    //
+    // Called from $on_mod(Loaded) after gui.init() pushes the saved
+    // gui_fps_enabled into the module. GameManager is alive by this point.
+    auto* gm = GameManager::get();
+    if (!gm) return;
+
+    const bool vsyncVar = gm->getGameVariable(kVsyncKey);
+    if (!vsyncVar) {
+        // VSync was left off by a previous session. Restore it.
+        gm->setGameVariable(kVsyncKey, kVsyncOnValue);
+        applyVerticalSync(kVsyncOnValue);
+        skkbot2::log::info(
+            "[TIMING] startup: VSync was off ({}=false) from a previous session "
+            "- restored to on. FPS is currently disabled, so nothing should have "
+            "turned it off.", kVsyncKey);
+    }
+
+    // Also restore SDL pacing if it was left dirty.
+    skkbot2::restorePacing();
+}
 
 void setEnabled(bool on) {
     // A push that differs from what the macro put in force is a user edit: the
@@ -264,8 +324,15 @@ void setEnabled(bool on) {
 void setTarget(double f) {
     if (g_macroHeld && !g_userOverride && f != g_macroTarget) {
         g_userOverride = true;
+        // BUG (02.11): this branch used to write g_savedEnabled = g_enabled
+        // too. But g_enabled at that moment is what the MACRO put in force,
+        // not what the menu had saved - a macro holding FollowTps/users-on
+        // state turned every slider edit into "the user also flipped the
+        // toggle", and endMacro() then handed the menu back ON (the macro's
+        // state) instead of the user's. The toggle has exactly one writer:
+        // setEnabled(), which snapshots it correctly against g_macroEnabled.
+        // A slider grab must only move the number.
         g_savedTarget = f;
-        g_savedEnabled = g_enabled;
         skkbot2::log::info(
             "[TIMING] FPS set by hand to {:.1f} during playback; the macro's "
             "display rate will not be re-asserted this session",
@@ -350,11 +417,12 @@ bool beginMacro(MacroDisplayRate const& rate) {
     g_userOverride = false;
     applyMacroRate(rate);
     skkbot2::log::info(
-        "[TIMING] macro display rate: {} ({:.1f}) - menu had {} at {:.1f}, "
-        "restored on stop",
+        "[TIMING] macro display rate: {} ({:.1f}) - menu had {} at {:.1f} "
+        "(menu slider saved: {:.1f}), restored on stop",
         kindName(rate), rate.kind == MacroDisplayRate::Kind::Pinned ? rate.fps : 0.0,
         g_savedEnabled ? "it on" : "it off",
-        g_savedTarget == skkbot2::fps::kFollowTps ? 0.0 : g_savedTarget);
+        g_savedTarget == skkbot2::fps::kFollowTps ? 0.0 : g_savedTarget,
+        menuSavedFps());
     return true;
 }
 
@@ -389,9 +457,10 @@ void endMacro() {
         g_enabled = g_savedEnabled;
         g_target = g_savedTarget;
         skkbot2::log::info("[TIMING] macro display rate released (menu back to {} "
-                           "at {:.1f})",
+                           "at {:.1f}, menu slider saved: {:.1f})",
                            g_enabled ? "on" : "off",
-                           g_target == skkbot2::fps::kFollowTps ? 0.0 : g_target);
+                           g_target == skkbot2::fps::kFollowTps ? 0.0 : g_target,
+                           menuSavedFps());
     }
     // Unconditional, and not an early return on !g_macroHeld: a session can hold
     // a pin entirely from the menu setting, with no macro involved. Making this
@@ -575,12 +644,52 @@ void sync(double tps, double gameSpeed) {
     g_applied = want;
 }
 
+void noteStepCost(double seconds) {
+    if (!(seconds > 0.0) || !std::isfinite(seconds)) return;
+    if (g_emaStepCost == 0.0) {
+        g_emaStepCost = seconds;
+    } else {
+        // ~10-sample time constant. Step costs are individually jittery
+        // (scheduler housekeeping, cache misses), so smoothing is what makes
+        // the derived budget stable; the fallback window below covers the
+        // samples before the EMA has anything to stand on.
+        g_emaStepCost += (seconds - g_emaStepCost) * 0.1;
+    }
+}
+
+double stepCostMs() {
+    return g_emaStepCost * 1000.0;
+}
+
 int stepCap(double tps, double gameSpeed) {
-    // The EFFECTIVE fps, not the requested one. Reading the live interval is
-    // what makes this survive the case the setting cannot control: a machine
-    // that simply cannot draw at 60 fps still reports an interval near 1/60,
-    // but if the user pins 240 on a 144 Hz panel, or a heavy frame lands, the
-    // live value is the truth and the budget follows it.
+    // Budget = frame-time budget / measured cost of one step. Deliberately
+    // independent of tps and gameSpeed: neither changes what one step costs,
+    // and a fast machine simply never hits the cap (it clamps at kHardCap and
+    // the carry decides how many steps actually run). The cap only binds when
+    // physics is expensive enough that running every owed step would eat the
+    // whole frame - which is exactly when slowdown is physically unavoidable.
+    if (g_emaStepCost > 0.0 && std::isfinite(g_emaStepCost)) {
+        double frameInterval = 1.0 / 60.0;
+        if (auto* director = cocos2d::CCDirector::sharedDirector()) {
+            const float interval = director->getAnimationInterval();
+            if (interval > 0.0f && std::isfinite(interval)) {
+                frameInterval = static_cast<double>(interval);
+            }
+        }
+        const double adaptiveBudget = std::clamp(frameInterval * 1.5, kFrameTimeBudgetMin, kFrameTimeBudgetMax);
+        double cap = adaptiveBudget / g_emaStepCost;
+        if (!std::isfinite(cap)) {
+            cap = static_cast<double>(kHardCap);
+        }
+        cap = std::max(cap, static_cast<double>(kFloorCap));
+        cap = std::min(cap, static_cast<double>(kHardCap));
+        return std::max(1, static_cast<int>(cap));
+    }
+
+    // No measurement yet (first frames of a session, or the batch loop has not
+    // run): fall back to the configured interval - the original formula, which
+    // is correct as a default and gets replaced by the measured cost as soon
+    // as the first steps execute.
     float fps = 0.0f;
     if (auto* director = cocos2d::CCDirector::sharedDirector()) {
         const float interval = director->getAnimationInterval();
@@ -601,7 +710,7 @@ int stepCap(double tps, double gameSpeed) {
         need = 1.0;
     }
 
-    double cap = need * kHeadroom;
+    double cap = need * 4.0;
     cap = std::max(cap, static_cast<double>(kFloorCap));
     cap = std::min(cap, static_cast<double>(kHardCap));
     return std::max(1, static_cast<int>(cap));

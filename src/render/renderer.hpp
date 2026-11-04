@@ -38,6 +38,14 @@ void setLastMusicId(int id);
 void armMusicRestart();
 void disarmMusicRestart();
 bool tickPendingMusicRestart();
+// True while the deferred song start is still waiting for the level song to be
+// prepared. If that is still true at video pts 0 the song will begin at
+// position 0 a few frames in, which is a real (small) audio offset - the
+// render log names it instead of leaving it to be heard.
+bool musicRestartPending();
+// Position of the level song inside its own track (seconds), or < 0 when no
+// music channel can be identified. Used to anchor the render audio timeline.
+double musicPositionSeconds();
 
 // Video renderer (v3 вЂ” async encode pipeline).
 //
@@ -167,6 +175,12 @@ class Renderer {
     // completes. Safe to call multiple times.
     void stop();
 
+    // Audio-kick audit: the deferred song restart fires from the FMOD-update
+    // hook (render_hooks.cpp tickPendingMusicRestart), not from the renderer's
+    // own drive path - this is how that side reports the success, so the
+    // "NEVER fired" badge in av-sync/Done lines is a fact, not a guess.
+    void noteMusicRestartFired() { m_audioKickResolved = true; }
+
     bool isRecording() const { return mRecording.load(); }
 
     // Pause-edge tracking: one-shot logging of a pause/resume that happens
@@ -278,6 +292,11 @@ private:
     void audioPump(double levelTime);
     void audioEncodePending();
     void writeAudioBlock(const float* block, int64_t pts);
+    // Periodic A/V drift audit: video time (pts/fps), sim time (level time
+    // minus the anchor), written audio time and the mixer's own DSP clock.
+    // Any growing gap between them names the broken stage in the log instead
+    // of in the finished video.
+    void logAvSync(GJBaseGameLayer* layer);
     void flushAudio();
     void freeAudio();
 
@@ -342,6 +361,12 @@ private:
     unsigned mHeight = 1080;
     int mFps = 60;
     double mTps = 240.0;
+    // BUG-96 stage 8: the speedhack value CAPTURED in begin(). The render
+    // clock multiplies the video timeline by it, so footage shows the level
+    // running at speed x video time INDEPENDENT of the live timing mode
+    // (Lock Delta / Real Time). Read once per render: a mid-render slider
+    // change must not re-time the video.
+    double mSpeed = 1.0;
 
     int64_t mLastPts = -1;
     uint64_t mLastFramed = 0;    // last bot frame stepped (backward-jump guard)
@@ -529,6 +554,25 @@ private:
     AVPacket* m_audioPkt = nullptr;
     std::vector<float> m_audioAccum;  // interleaved FLT, partial frames only
     int64_t m_audioPts = 0;           // sample counter of the next audio block
+    // Level time of the first captured frame = video pts 0. The audio pump is
+    // driven by the VIDEO timeline (anchor + pts/fps), not by the raw level
+    // time: that keeps the produced sample count equal to the frame count by
+    // construction, with no drift from sim-clock mismatches or respawn
+    // rewinds. AudioCapture drops the matching pre-roll so the music starts at
+    // the same position inside the track that the footage starts at.
+    double m_audioAnchor = 0.0;
+    int64_t m_avSyncLogPts = -1;
+    // Content-speed meter (02.11): sim advance between consecutive av-sync
+    // grid points / their video-time advance. A healthy render reads the
+    // captured speedhack rate for the whole session; anything else is the
+    // wobble the eye reported and drift(sim-video) can miss between polls.
+    int64_t m_avSyncPrevPts = -1;
+    double m_avSyncPrevSim = 0.0;
+    bool m_avSyncHasPrev = false;
+    // Audio-kick audit (02.11): did begin() fail to start the song (musicID
+    // unknown / not prepared), and did the deferred restart actually fire.
+    bool m_audioKickUnknown = false;
+    bool m_audioKickResolved = false;
     uint64_t m_audioPackets = 0;
     int m_audioSampleRate = 0;
     int m_audioChannels = 2;

@@ -121,11 +121,6 @@ private:
     bool m_ok = true;
 };
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
@@ -286,12 +281,16 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     if (!std::isfinite(replay.framerate) || replay.framerate <= 1.0) {
         return fail("gdr2: unusable framerate " + std::to_string(replay.framerate));
     }
-    if (replay.platformer) {
-        return fail("gdr2: platformer replays are not supported yet");
-    }
-
+    // GDR2 stores the mode in its own header and the input stream already
+    // carries buttons 1..3, so a platformer replay imports like any other. The
+    // flag travels with the macro and playback refuses a level of the other
+    // mode instead of silently desyncing.
     out = skc::Macro{};
-    out.header.tps = static_cast<float>(replay.framerate);
+    out.header.tps = replay.framerate;
+    out.platformerMode = replay.platformer;
+    out.platformerKnown = true;
+    out.header.platformerMode = out.platformerMode;
+    out.header.platformerKnown = true;
     out.actions.reserve(replay.inputs.size());
 
     // Normalise per (button, player2) channel. Other bots emit releases with no
@@ -299,23 +298,8 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     // real exports: RAUCHKAMMER 2-EC.gdr2 opens with a release at frame 1, and
     // the megahack export ends with two releases in a row. SKC's validator
     // rejects exactly those, so drop them instead of failing the whole import.
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
     for (const auto& in : replay.inputs) {
-        const std::size_t ch = channelIndex(in.button, in.player2);
-        if (!in.down) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
         if (in.frame > 0xFFFFFFFFull) {
             return fail("gdr2: frame " + std::to_string(in.frame) +
                         " exceeds SKC's 32-bit frame counter");
@@ -332,6 +316,13 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
                                           in.down, in.player2});
     }
 
+    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
+    // up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) {
         return fail("gdr2: no usable inputs after normalisation");
     }
@@ -342,12 +333,14 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     }
 
     skkbot2::log::warn(
-        "[GDR2] '{}' by {} / bot '{}' v{} / level '{}' (tps {:.0f}): {} inputs -> "
-        "{} actions, dropped {} release(s) with no press and {} duplicate press(es), "
+        "[GDR2] '{}' by {} / bot '{}' v{} / level '{}' (tps {:.0f}, {}): {} inputs -> "
+        "{} actions, dropped {} release(s) with no press and rebuilt {} collapsed "
+        "tap(s), "
         "frame shift {:+d} (first click frame {} -> {})",
         replay.description.empty() ? std::string("<no description>") : replay.description,
         replay.author, replay.botName, replay.botVersion, replay.levelName,
-        replay.framerate, replay.inputs.size(), out.actions.size(), droppedRelease,
+        replay.framerate, replay.platformer ? "platformer" : "classic",
+        replay.inputs.size(), out.actions.size(), droppedRelease,
         droppedDuplicate, kFrameShift, replay.inputs.front().frame,
         out.actions.front().frame);
     return true;

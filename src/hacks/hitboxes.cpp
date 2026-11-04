@@ -355,25 +355,23 @@ void redraw(GJBaseGameLayer* gl, CCDrawNode* node) {
 // ---------------------------------------------------------------------------
 CCDrawNode* getOrCreateNode(GJBaseGameLayer* gl, Ref<CCDrawNode>& nodeRef, const char* id) {
     if (!gl) return nullptr;
-    CCNode* desiredParent = (gl->m_debugDrawNode && gl->m_debugDrawNode->getParent())
-        ? gl->m_debugDrawNode->getParent()
-        : static_cast<CCNode*>(gl->m_objectLayer);
-    if (!desiredParent) desiredParent = gl;
+    CCNode* desiredParent = gl->m_objectLayer ? static_cast<CCNode*>(gl->m_objectLayer) : static_cast<CCNode*>(gl);
 
-    if (nodeRef && nodeRef->getParent()) {
-        if (nodeRef->getParent() != desiredParent && desiredParent != gl) {
-            nodeRef->removeFromParentAndCleanup(false);
-            desiredParent->addChild(nodeRef);
+    if (nodeRef) {
+        if (nodeRef->getParent() != desiredParent) {
+            if (nodeRef->getParent()) {
+                nodeRef->removeFromParentAndCleanup(false);
+            }
+            desiredParent->addChild(nodeRef, 9999);
         }
         return nodeRef;
     }
 
     auto* n = CCDrawNode::create();
     n->setBlendFunc(ccBlendFunc{GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
-    n->setZOrder(9999);
     n->m_bUseArea = false;
     n->setID(id);
-    desiredParent->addChild(n);
+    desiredParent->addChild(n, 9999);
     nodeRef = n;
     return n;
 }
@@ -401,6 +399,12 @@ class $modify(HitboxPlayLayer, PlayLayer) {
 
     void createObjectsFromSetupFinished() {
         PlayLayer::createObjectsFromSetupFinished();
+        auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes"_spr);
+        updateHitboxes(this, n);
+    }
+
+    void resetLevel() {
+        PlayLayer::resetLevel();
         auto* n = getOrCreateNode(this, m_fields->node, "skk-hitboxes"_spr);
         updateHitboxes(this, n);
     }

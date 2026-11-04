@@ -1,3 +1,33 @@
+# v0.1.3 (2026-11-04)
+Timing & accuracy update: Real Time mode, SKC precision overhaul, checkpoint fixes, macro auto-save.
+
+## New
+- **Real Time timing mode**: playback can now follow the honest wall-clock frame gap instead of a locked physics delta
+- **Lock Delta / Real Time switch in UI**: timing mode is selectable per session from the GUI for both SKK and SKC playback
+- **Macro auto-save**: recordings are saved automatically (also fixed: autosave silently did nothing after a game restart)
+- **Foreign imports auto-select Real Time**: imported third-party macros automatically switch playback to Real Time
+- **Speedhack during render**: speedhack can now be used while a video render is running
+
+## Improvements
+- **Improved SKC compression**: LZ phrase prediction + predictor mixing in the range coder (fewer bytes per action on repetitive click patterns)
+- **Updated formats**: SKC and SKK format revisions
+- **Improved keybinds**: keybinds can now be unbound (no forced defaults)
+- **UI polish**: fixed cursor rendering in the UI, macro name/search field placement, menu text cleanup, Open Menu opens the tab view by default
+
+## Fixes
+- **Fixed Lock Delta and TPS handling**: deterministic step grid for SKC, honest wall-gap feeding in Real Time
+- **Fixed checkpoints for SKK and SKC**: hold bits / jump-buffer mirrors restored correctly on checkpoint restore, lost click pairs after practice stitching fixed, release-suppression window narrowed to no-ops
+- **Fixed SKC playback accuracy**: gravity portal flip determinism, dash-stop icon rotation, wall-clock jump timers no longer restored on checkpoints
+- **Fixed .echo import** (Echo Bot)
+- **Fixed .slc v3 import** (Silicate)
+- **Fixed music desync during render**: audio is now bound to the video timeline (measured drift ≤ 40 ms)
+
+## Removed
+- **ToastyReplay `.ttr3` import support** (ToastyReplay Lite `.ttrl` is still supported)
+- **CBS/COS accuracy modes for SKC**: SKC is now vanilla-only (the modes may return in a future update)
+
+---
+
 # v0.1.2 (2026-10-24)
 Major feature update introducing the ultra-compressed SKC format, universal third-party replay import, high-performance rendering pipeline, FPS bypass, redesigned trajectory simulation, and extensive customization.
 
@@ -7,7 +37,7 @@ Major feature update introducing the ultra-compressed SKC format, universal thir
   - Supports both recording and playback.
   - *Note: currently in active development / beta; platformer mode may experience desyncs on deaths/checkpoints; CBS and COS accuracy modes are not yet supported for SKC.*
 - **Universal Replay Import & Playback**:
-  - Full playback support for popular third-party macro formats: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay (`.ttr3`), ToastyReplay Lite (`.ttrl`), and Xenon (`.xe`).
+  - Full playback support for popular third-party macro formats: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay Lite (`.ttrl`), and Xenon (`.xe`).
   - Pure input dispatch: external physics state injections are safely bypassed, allowing GD's native physics engine to simulate the macro deterministically.
 - **Custom FPS Bypass**:
   - Added configurable Display FPS target (e.g. 60, 144, 240, 360, up to 1000 FPS) with automatic integration into GD's native custom FPS and vertical sync management.

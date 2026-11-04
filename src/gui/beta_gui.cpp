@@ -6,6 +6,7 @@
 
 #include "skkBot.hpp"
 #include "skc/skc_bot.hpp"
+#include "core/autosave_recorder.hpp"
 #include "core/frame_stepper.hpp"
 #include "core/paths.hpp"
 #include "hacks/music_speed.hpp"
@@ -815,12 +816,19 @@ bool fileButton(ImDrawList* draw, const char* id, ImVec2 pos, ImVec2 size,
 // wheel anywhere over the row) and THEN the enable toggle. No range track вЂ” the
 // value is entered directly, so the block is a single short row. Returns the
 // row height so callers can stack rows.
+// `Real` is float for Speed and double for TPS / FPS: the value has to reach
+// the engine with the digits the user typed, and a float intermediate would
+// round 144.144 to 144.143997 before it ever became a tick rate.
+template <typename Real>
 float timingControl(ImDrawList* draw, ImFont* mf, ImVec2 pos, float width,
                     const char* uid, const char* title,
-                    float& value, float vmin, float vmax, const char* fmt,
+                    Real& value, Real vmin, Real vmax, const char* fmt,
                     const char* suffix, bool& enabled,
-                    float k, float wheelStep = 0.0f, bool allowToggle = true,
-                    const char* titleSuffix = nullptr, bool revealed = true) {
+                    float k, Real wheelStep = Real(0), bool allowToggle = true,
+                    const char* titleSuffix = nullptr, bool revealed = true,
+                    Real fineWheelStep = Real(0)) {
+    static_assert(std::is_floating_point_v<Real>,
+                  "timingControl only handles floating-point values");
     // Unique ID scope so two stacked rows (TPS + Speed) don't collide.
     ImGui::PushID(uid);
     (void)mf;  // title/values render in the default font; mono goes to callers
@@ -870,10 +878,11 @@ float timingControl(ImDrawList* draw, ImFont* mf, ImVec2 pos, float width,
     const float nfX = pos.x + width - nfW - tgGap - tgW;
     const float tgX = pos.x + width - tgW;
 
-    float v1 = value;
+    Real v1 = value;
     const bool nfChanged = numberField(mf, "##nfield",
                                        ImVec2(nfX, pos.y + (rowH - nfH) * 0.5f),
-                                       nfW, v1, vmin, vmax, suffix, fmt, canInput, wheelStep);
+                                       nfW, v1, vmin, vmax, suffix, fmt, canInput,
+                                       wheelStep, fineWheelStep);
     const bool tgChanged = toggleAt("##ntoggle", ImVec2(tgX, pos.y + (rowH - 24.0f * k) * 0.5f),
                                     enabled, canToggle, canToggle);
     if (tgChanged && canToggle) enabled = !enabled;
@@ -1441,7 +1450,8 @@ void drawNoClipSection(ImDrawList* draw, ImFont* mf, ImVec2 from, ImVec2 to, flo
     // the offset persists to the next frame.
     const float ncContentH = (ncContentBot + state().noclipScroll) - ncTop;
     draw->PopClipRect();
-    applyNoClipScroll(draw, from, to, ncTop, to.y, ncContentH, k);
+    applyNoClipScroll(draw, ImVec2(from.x - 12.0f * k, ncTop),
+                      ImVec2(to.x + 20.0f * k, to.y), ncTop, to.y, ncContentH, k);
 }
 
 void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
@@ -1459,26 +1469,14 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
 
     float y = top;
 
-    // Macro label row.
-    const float labelSize = pxSize(8.5f * kt);
-    const float labelSpacing = 1.45f * kt;
-    const float labelY = y + 2.0f * k;
-    spacedText(draw, mf, labelSize, ImVec2(lx, labelY), "YOUR MACRO", theme::Eyebrow,
-               labelSpacing);
-    const int count = static_cast<int>(gui.macros.size());
-    char countBuf[48];
-    std::snprintf(countBuf, sizeof(countBuf), "%d saved", count);
-    const float countSize = pxSize(9.0f * kt);
-    ImVec2 countW = mf ? mf->CalcTextSizeA(countSize, FLT_MAX, 0, countBuf) : ImVec2(0, 0);
-    const float countX = lx + leftW - countW.x - 12.0f * k;
-    // The "{n} saved" caption is purely informational: the library list is
-    // opened only from the folder button next to the name field.
-    draw->AddText(mf, countSize, ImVec2(countX, y + 3.0f * k),
-                  theme::rgb(130, 140, 162), countBuf);
-    y += 20.0f * k;
+    // Текстовая шапка («YOUR MACRO», «{n} saved») убрана по запросу
+    // 03.11.2026. Поле ввода имени/поиска помещаем чуть ниже верха —
+    // небольшой воздух вместо убранной шапки (запрос 03.11.2026.
+    // «прям чуть ниже»); правый столбец не привязан к этому отступу.
 
     // Macro search box.
     const float srchH = 52.0f * k;
+    y += 12.0f * k;
     ImVec2 sb(lx, y);
     ImVec2 eb(lx + leftW, y + srchH);
     draw->AddRectFilled(sb, eb, theme::FieldDark, 28.0f * k);
@@ -1809,7 +1807,7 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     // is locked ON and cannot be switched off by the user.
     const double prevTpsV = gui.tpsValue;
     const bool prevTpsOn = gui.tpsEnabled;
-    float tpsV = static_cast<float>(gui.tpsValue);
+    double tpsV = gui.tpsValue;
     bool tpsOn = gui.tpsEnabled;
     const bool isPlaying = isSkc
         ? (bot.getState() == skk::skc::State::Playback || bot.isPlaybackArmed())
@@ -1829,12 +1827,18 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     const bool timingLocked = skcOwnsTiming || isPlaying;
     if (isPlaying) {
         tpsOn = true;
-        tpsV = isSkc ? bot.getTps() : static_cast<float>(engine->runtimeTickRate());
+        tpsV = isSkc ? bot.getTps() : engine->runtimeTickRate();
     }
+    // Fractional TPS is a first-class value: the pattern keeps 240 as "240",
+    // 240.5 as "240.5" and 144.144 as "144.144" instead of rounding all three
+    // to the same integer label. Wheel: 0.25 per notch, 0.001 with Shift.
+    char tpsFmt[16];
+    formatNumberPattern(tpsFmt, sizeof(tpsFmt), tpsV);
     const float block1 = timingControl(draw, mf, ImVec2(lx, y), leftW,
                                        "tps", "TPS",
-                                       tpsV, 1.0f, 1000000.0f, "%.0f", nullptr,
-                                       tpsOn, k, 1.0f, !timingLocked);
+                                       tpsV, 1.0, 1000000.0, tpsFmt, nullptr,
+                                       tpsOn, k, 0.25, !timingLocked,
+                                       nullptr, true, 0.001);
     if (skcOwnsTiming) {
         // Read-only while an SKC session holds the clock.
         tpsOn = true;
@@ -1842,9 +1846,9 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     } else if (isPlaying) {
         // Read-only rate while playing — swallow any edits and keep toggle on.
         tpsOn = true;
-        tpsV = static_cast<float>(engine->runtimeTickRate());
+        tpsV = engine->runtimeTickRate();
     } else {
-        gui.tpsValue = static_cast<double>(tpsV);
+        gui.tpsValue = tpsV;
         gui.tpsEnabled = tpsOn;
         engine->tickRate = tpsOn ? gui.tpsValue : 240.0;
         if (gui.tpsValue != prevTpsV || gui.tpsEnabled != prevTpsOn) {
@@ -1867,7 +1871,7 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     // instead of silently slowing the macro down.
     const double prevFpsV = gui.fpsValue;
     const bool prevFpsOn = gui.fpsEnabled;
-    float fpsV = static_cast<float>(gui.fpsValue);
+    double fpsV = gui.fpsValue;
     bool fpsOn = gui.fpsEnabled;
     // LOCKED ONLY WHILE RECORDING, and editable during playback. Those are two
     // different questions and the row used to answer both with "a macro holds
@@ -1890,8 +1894,8 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     // tps" - showing the tick rate here instead (as this used to) would push a
     // pinned value back on the very next frame, which the module would read as
     // a user edit and would then honour over the macro.
-    const float macroFpsV = static_cast<float>(
-        skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0);
+    const double macroFpsV =
+        skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0;
     const bool macroFpsOn = skkbot2::fps::enabled();
     if (fpsMacro) {
         fpsV = macroFpsV;
@@ -1899,25 +1903,36 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     }
     // One thing to say, and it is the actionable one: how many physics steps this
     // frame rate asks for at the current TPS. With FPS at 0 the display follows
-    // TPS, so this reads "1 st/f" - which is the fact that matters, without
+    // TPS, so this reads "1.00 st/f" - which is the fact that matters, without
     // spelling out the arithmetic the user already chose by leaving it at 0.
+    //
+    // FRACTIONAL, not ceil (user request 04.11.2026): the old "(int)ceil"
+    // showed "2 st/f" at 240 tps / 180 fps, but the batch planner runs
+    // floor + carry (physicsbypass.cpp planSteps) - the real pattern is the
+    // cycling 1,1,2, which averages 1.33. The integer ceiling hid that and
+    // made a non-integer ratio look identical to a true 2 st/f lock (120).
     static std::string fpsHint;
     {
         const double tickRate = skcOwnsTiming ? static_cast<double>(bot.getTps())
                              : isPlaying       ? static_cast<double>(engine->runtimeTickRate())
                                                : static_cast<double>(engine->tickRate);
-        const double effFps = fpsV > 0.5 ? static_cast<double>(fpsV) : tickRate;
+        const double effFps = fpsV > 0.5 ? fpsV : tickRate;
         if (tickRate > 0.0 && effFps > 0.0) {
-            fpsHint = fmt::format(" {} st/f", (int)std::ceil(tickRate / effFps));
+            fpsHint = fmt::format(" {:.2f} st/f", tickRate / effFps);
         } else {
             fpsHint.clear();
         }
     }
+    // FPS shows ONE decimal always (user request 04.11.2026): the row is about
+    // a display target, not physics, and "120.0" reads cleaner than the adaptive
+    // "120" while still showing fractional targets like 144.1.
+    char fpsFmt[16];
+    std::snprintf(fpsFmt, sizeof(fpsFmt), "%%.1f");
     const float blockFps = timingControl(draw, mf, ImVec2(lx, y), leftW,
                                          "fps", "FPS",
-                                         fpsV, 0.0f, 1000.0f, "%.0f", "",
-                                         fpsOn, k, 1.0f, !fpsLocked,
-                                         fpsHint.c_str());
+                                         fpsV, 0.0, 1000000.0, fpsFmt, "",
+                                         fpsOn, k, 0.25, !fpsLocked,
+                                         fpsHint.c_str(), true, 0.001);
     if (!fpsLocked) {
         // Is this frame's value the user's, or just the macro's number being
         // mirrored back? Only the first kind may touch the saved setting -
@@ -1943,6 +1958,14 @@ void drawRecordPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         Mod::get()->setSavedValue("gui_fps_value", gui.fpsValue);
     }
     y += blockFps + 10.0f * k;
+
+    // NOTE: the timing MODE row (LOCK DELTA / REAL TIME) moved to the Settings
+    // tab - MACRO BOT section, right after the Bot Engine row
+    // (drawMacroBotSection, 31.10.2026, user request). Before this row there
+    // was also a "Mode" caption: Lock Delta moves the level roughly one
+    // smoothed-frame per drawn frame, Real Time feeds raw measured dt - both
+    // at 1.0x wall speed now, the row is about grid smoothness, fine to live
+    // under engine configuration.
 
     // Divider between the timing controls and the hitbox switches, matching
     // the one above the TPS row.
@@ -2318,13 +2341,14 @@ float drawMacroBotSection(ImDrawList* draw, ImVec2 gridTL, float width, float to
                            : ImGui::GetFontSize();
     const ImU32 capOff = theme::rgb(179, 186, 204);
 
-    // Three rows: Bot Engine, Format, Block Player Input. The old fourth (P2
-    // Button) is gone - the button now comes from the file, not from a guess.
+    // Five rows: Bot Engine, Mode (Lock Delta / Real Time), Format,
+    // Block Player Input, Autosave. The old P2 Button (fourth in the old
+    // count) is gone - the button now comes from the file, not from a guess.
     // Counting it here left the body a full row taller than what is drawn, and
     // since the caller adds this return value to the next heading's y, the gap
     // showed up as a blank band ABOVE the following section's title rather than
     // anywhere inside this one.
-    const float rowsH = (rowH + pillGap) * 2.0f + rowH;
+    const float rowsH = (rowH + pillGap) * 4.0f + rowH;
     const float seen = openT * rowsH;
     if (openT <= 0.001f || seen <= 0.001f) return seen + kSectionGap * k;
 
@@ -2333,7 +2357,9 @@ float drawMacroBotSection(ImDrawList* draw, ImVec2 gridTL, float width, float to
 
     const bool row1L = seen >= rowH * 0.85f;
     const bool row2L = seen >= (rowH + pillGap + rowH) * 0.85f;
-    const bool row3L = seen >= rowsH * 0.85f;
+    const bool row3L = seen >= ((rowH + pillGap) * 2.0f + rowH) * 0.85f;
+    const bool row4L = seen >= ((rowH + pillGap) * 3.0f + rowH) * 0.85f;
+    const bool row5L = seen >= rowsH * 0.85f;
 
     float y = y0;
 
@@ -2366,7 +2392,45 @@ float drawMacroBotSection(ImDrawList* draw, ImVec2 gridTL, float width, float to
         y += rowH + pillGap;
     }
 
-    // Row 2 — Format Info / Description badge
+    // Row 2 — Timing Mode pills: Lock Delta vs Real Time. Moved here from the
+    // main tab's TIMING column (31.10.2026): it is engine-adjacent
+    // configuration, so it lives under the Bot Engine row. Same persisted
+    // keys and the same dropCarry() the old row used.
+    {
+        const float labelSize = pxSize(9.0f * kt);
+        const float labelSpacing = 1.2f * kt;
+        const float groupW = pillW * 2.0f + pillGap;
+        const float gx = gridTL.x + width - groupW;
+        const float by = y + (rowH - pillH) * 0.5f;
+
+        const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
+        drawGradientText(draw, df, titleSize, tPos, "Mode",
+                         theme::rgb(222, 228, 242), theme::rgb(240, 245, 255));
+
+        const bool isLockDelta = gui.lockDelta && !gui.realTime;
+        if (selectionToggle("##set_timing_lock_delta", ImVec2(gx, by), ImVec2(pillW, pillH), mf,
+                            labelSize, labelSpacing, "LOCK DELTA", isLockDelta, true, row2L)) {
+            gui.lockDelta = true;
+            gui.realTime = false;
+            Mod::get()->setSavedValue("gui_timing_lock_delta", true);
+            Mod::get()->setSavedValue("gui_timing_real_time", false);
+            dropCarry();
+            skkbot2::log::info("skkBot2: Timing Mode -> LOCK DELTA");
+        }
+        if (selectionToggle("##set_timing_real_time", ImVec2(gx + pillW + pillGap, by),
+                            ImVec2(pillW, pillH), mf, labelSize, labelSpacing, "REAL TIME",
+                            !isLockDelta, true, row2L)) {
+            gui.lockDelta = false;
+            gui.realTime = true;
+            Mod::get()->setSavedValue("gui_timing_lock_delta", false);
+            Mod::get()->setSavedValue("gui_timing_real_time", true);
+            dropCarry();
+            skkbot2::log::info("skkBot2: Timing Mode -> REAL TIME");
+        }
+        y += rowH + pillGap;
+    }
+
+    // Row 3 — Format Info / Description badge
     {
         const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
         drawGradientText(draw, df, titleSize, tPos, "Format",
@@ -2391,7 +2455,7 @@ float drawMacroBotSection(ImDrawList* draw, ImVec2 gridTL, float width, float to
         y += rowH + pillGap;
     }
 
-    // Row 3 — Block Player Input (Blocks physical clicks during SKC playback)
+    // Row 4 — Block Player Input (Blocks physical clicks during SKC playback)
     {
         const bool ign = bot.getIgnoreInputs();
         const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
@@ -2399,11 +2463,29 @@ float drawMacroBotSection(ImDrawList* draw, ImVec2 gridTL, float width, float to
                          ign ? theme::rgb(222, 228, 242) : capOff,
                          ign ? theme::rgb(240, 245, 255) : capOff);
         ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
-        if (toggleAt("##set_bot_ignore_inputs", tog, ign, true, row3L)) {
+        if (toggleAt("##set_bot_ignore_inputs", tog, ign, true, row4L)) {
             bot.setIgnoreInputs(!ign);
             Mod::get()->setSavedValue("gui_skc_ignore_inputs", bot.getIgnoreInputs());
             skkbot2::Logger::get().info("EclipseBot: ignore inputs -> {}",
                                         bot.getIgnoreInputs() ? "on" : "off");
+        }
+        y += rowH + pillGap;
+    }
+
+    // Row 5 — Autosave: periodic rescue snapshots of the macro WHILE RECORDING
+    // (only during record; playback/idle never write). SKK lands in
+    // `<level>_autosave.skk`, SKC in `<level>_autosave.skc` (the live level's
+    // name), both overwritten in place. Default on - the tester asked for
+    // "never lose a recording".
+    {
+        const bool on = skkbot2::autosave::enabled();
+        const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
+        drawGradientText(draw, df, titleSize, tPos, "Autosave",
+                         on ? theme::rgb(222, 228, 242) : capOff,
+                         on ? theme::rgb(240, 245, 255) : capOff);
+        ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
+        if (toggleAt("##set_bot_autosave", tog, on, true, row5L)) {
+            skkbot2::autosave::setEnabled(!on);
         }
         y += rowH;
     }
@@ -2456,15 +2538,18 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     const ImU32 capOff = theme::rgb(179, 186, 204);
     float y = y0;
 
-    // SKC is an input-only format: its click stream is a whole number of frames
-    // per Action and it deliberately carries no sub-tick offset field. With CBS
-    // on, GD splits a step into two dt/2 half-steps, so "one frame" stops being
-    // one frame and the recorded stream no longer maps onto the replayed
-    // physics. Bot::forceVanillaAccuracy already pins these off on every
-    // resetLevel; this blocks the SETTING so the UI cannot offer a choice the
-    // bot silently overrides.
+    // SKC is vanilla-only (BUG-86): its CBS/COS modes are dead end-to-end. The
+    // controls stay in the layout per the user's request - "не давать включать"
+    // (don't let them be turned on) - so with SKC selected the pills and the
+    // COS toggle render locked grey instead of disappearing. While a session is
+    // running the SKK controls stay locked too, because its timing contract is
+    // taken at start.
     const bool skcSelected =
         skkbot2::gui::get().macroBotType == Gui::MacroBotType::SKC;
+    const auto skcState = skk::skc::Bot::get().getState();
+    const bool skcBusy = skcSelected &&
+        (skcState == skk::skc::State::Record ||
+         skcState == skk::skc::State::Playback);
 
     // Pick up CBS / COS from GD's own settings. This has to happen BEFORE the
     // collapsed-accordion early-return below: the section is collapsed by
@@ -2474,9 +2559,7 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         engine->syncAccuracyFromGame();
     }
 
-    // Three rows: Mode pills, COS toggle, Safe Mode. This still counted four -
-    // Auto Save Mod and the Freeze Attempts / Freeze Jumps sub-toggles are gone
-    // - which over-reported the body by a row and pushed the next heading down.
+    // Rows: Mode pills, COS toggle, Safe Mode.
     const float rowsH = (rowH + pillGap) * 2.0f + rowH;
     const float seen = openT * rowsH;
     if (openT <= 0.001f || seen <= 0.001f) return 20.0f * k + kSectionGap * k;
@@ -2500,13 +2583,16 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         drawGradientText(draw, df, titleSize, tPos, "Mode",
                          theme::rgb(222, 228, 242), theme::rgb(240, 245, 255));
 
-        // SKC forces vanilla at runtime, so show VANILLA as the active pill and
-        // grey both out rather than echoing a SKK-only setting the bot ignores.
-        const bool isVanilla =
-            skcSelected || engine->selectedAccuracyMode == AccuracyMode::Vanilla;
-        if (selectionToggle("##set_acc_vanilla", ImVec2(gx, by), ImVec2(pillW, pillH), mf,
-                            labelSize, labelSpacing, "VANILLA", isVanilla,
-                            !skcSelected, row1L)) {
+        const bool isVanilla = engine->selectedAccuracyMode == AccuracyMode::Vanilla;
+        const bool pillsEnabled = !skcBusy && !skcSelected;
+        // Both pills always visible. With SKC selected they lock grey: SKC is
+        // vanilla-only now (BUG-86: the sub-step marks never survived a real
+        // record->play round trip), so the user request was "keep the controls,
+        // just don't let them be turned on". VANILLA stays lit, CBS grey.
+        if (selectionToggle("##set_acc_vanilla", ImVec2(gx, by),
+                            ImVec2(pillW, pillH), mf, labelSize,
+                            labelSpacing, "VANILLA",
+                            isVanilla || skcSelected, pillsEnabled, row1L)) {
             engine->selectedAccuracyMode = AccuracyMode::Vanilla;
             Mod::get()->setSavedValue("gui_accuracy",
                                       static_cast<int>(AccuracyMode::Vanilla));
@@ -2515,8 +2601,9 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
             skkbot2::Logger::get().info("skkBot2: accuracy mode -> Vanilla");
         }
         if (selectionToggle("##set_acc_cbs", ImVec2(gx + pillW + pillGap, by),
-                            ImVec2(pillW, pillH), mf, labelSize, labelSpacing, "CBS",
-                            !isVanilla, !skcSelected, row1L)) {
+                            ImVec2(pillW, pillH), mf, labelSize, labelSpacing,
+                            "CBS", !isVanilla && !skcSelected, pillsEnabled,
+                            row1L)) {
             engine->selectedAccuracyMode = AccuracyMode::CBS;
             Mod::get()->setSavedValue("gui_accuracy",
                                       static_cast<int>(AccuracyMode::CBS));
@@ -2527,15 +2614,17 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         y += rowH + pillGap;
     }
 
-    // Row 2 вЂ” COS (Click On Steps) toggle.
+    // Row 2 — COS (Click On Steps) toggle. Visible for SKC too but locked:
+    // SKC forces it off (vanilla-only), so the toggle renders off and dead.
+    const bool cosOn = engine->cosEnabled && !skcSelected;
+    const bool cosEnabled = !skcBusy && !skcSelected;
     {
-        const bool cosOn = !skcSelected && engine->cosEnabled;
         const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
         drawGradientText(draw, df, titleSize, tPos, "Click On Steps",
                          cosOn ? theme::rgb(222, 228, 242) : capOff,
                          cosOn ? theme::rgb(240, 245, 255) : capOff);
         ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
-        if (toggleAt("##set_acc_cos", tog, cosOn, !skcSelected, row2L)) {
+        if (toggleAt("##set_acc_cos", tog, cosOn, cosEnabled, row2L)) {
             engine->cosEnabled = !engine->cosEnabled;
             Mod::get()->setSavedValue("gui_cos", engine->cosEnabled);
             ReplayEngine::applyRuntimeAccuracyMode(engine->selectedAccuracyMode,
@@ -2703,6 +2792,20 @@ float drawKeybindSection(ImDrawList* draw, ImVec2 gridTL, float width, float top
             gui.kbWaiting = waiting ? -1 : idx;
             skkbot2::Logger::get().info("skkBot2: keybind capture {}",
                                         gui.kbWaiting >= 0 ? row.label : "cancelled");
+        }
+        // Right-click on a live pill removes the bind entirely (NONE, 0). Gated
+        // the same way as the pill itself (rowLive && revealed) so hidden rows
+        // never take clicks; capture in progress is left alone — Delete inside
+        // capture does the unbind there.
+        if (!waiting && rowLive && revealed &&
+            ImGui::IsMouseHoveringRect(ImVec2(gx, by),
+                                       ImVec2(gx + pillW, by + pillH), true) &&
+            ImGui::GetIO().MouseClicked[1] &&
+            gui.bindKeys[idx] != 0) {
+            gui.bindKeys[idx] = 0;
+            gui.persistBind(static_cast<skkbot2::gui::Gui::Bind>(idx));
+            skkbot2::Logger::get().info("skkBot2: keybind removed: {} (RMB)",
+                                        row.label);
         }
 
         y += rowH + pillGap;
@@ -2943,7 +3046,7 @@ float drawLoggingSection(ImDrawList* draw, ImVec2 gridTL, float width, float top
     //  - openT  вЂ” the whole LOGGING block opens/closes from its heading.
     //  - rowsT  вЂ” the Split + Level rows appear ONLY while the "File Logging"
     //    master is on. With the master off the block shows just the master row.
-    const float baseH = rowH;                              // master row
+    const float baseH = rowH * 2.0f + 10.0f * k;          // file + step trace
     const float extraH = rowH * 2.0f + 20.0f * k;          // gap + split + gap + level
     const bool fileOn = logger.isFileLogging();
     const float rowsT = anim01(ImGui::GetID("##beta_log_rows"),
@@ -2953,8 +3056,8 @@ float drawLoggingSection(ImDrawList* draw, ImVec2 gridTL, float width, float top
     draw->PushClipRect(ImVec2(gridTL.x - 12.0f * k, y - 12.0f * k),
                        ImVec2(gridTL.x + width + 12.0f * k, y + seen + 12.0f * k), true);
     const bool row1L = seen >= rowH * 0.85f;
-    const bool row2L = seen >= (rowH + 10.0f * k + rowH) * 0.85f;
-    const bool row3L = seen >= (rowH * 2.0f + 20.0f * k + rowH) * 0.85f;
+    const bool row2L = seen >= (rowH * 3.0f + 30.0f * k) * 0.85f;
+    const bool row3L = seen >= (rowH * 4.0f + 40.0f * k) * 0.85f;
 
     // Row 1 вЂ” File Logging master switch.
     float yy = y;
@@ -2969,6 +3072,21 @@ float drawLoggingSection(ImDrawList* draw, ImVec2 gridTL, float width, float top
             Mod::get()->setSavedValue("gui_file_logging", logger.isFileLogging());
             skkbot2::Logger::get().info("skkBot2: file logging -> {}",
                                         logger.isFileLogging() ? "on" : "off");
+        }
+        yy += rowH + 10.0f * k;
+    }
+
+    {
+        const bool traceOn = Mod::get()->getSavedValue<bool>("gui_step_trace", false);
+        const ImVec2 tPos(gridTL.x, yy + (rowH - textH) * 0.5f);
+        drawGradientText(draw, df, titleSize, tPos, "Step Trace",
+                         traceOn ? theme::rgb(222, 228, 242) : capOff,
+                         traceOn ? theme::rgb(240, 245, 255) : capOff);
+        ImVec2 tog(gridTL.x + width - toggleW, yy + (rowH - toggleH) * 0.5f);
+        if (toggleAt("##set_step_trace", tog, traceOn, true,
+                     seen >= (rowH + 10.0f * k + rowH) * 0.85f)) {
+            Mod::get()->setSavedValue("gui_step_trace", !traceOn);
+            skkbot2::Logger::get().info("Step Trace -> {}", !traceOn ? "on" : "off");
         }
         yy += rowH + 10.0f * k;
     }
@@ -3016,7 +3134,8 @@ float drawLoggingSection(ImDrawList* draw, ImVec2 gridTL, float width, float top
                 const float px = gx + static_cast<float>(i) * (pillW + pillGap);
                 if (selectionToggle(id, ImVec2(px, by), ImVec2(pillW, pillH), mf,
                                     labelSize, labelSpacing, kLevelNames[i],
-                                    i == curLevel, true, row3L && rowsT > 0.85f)) {
+                                    i == curLevel, true,
+                                    row3L && rowsT > 0.85f)) {
                     logger.setLevel(static_cast<skkbot2::Logger::Level>(i));
                     Mod::get()->setSavedValue("gui_log_level", i);
                     skkbot2::Logger::get().info("skkBot2: log level -> {}", kLevelNames[i]);
@@ -3702,6 +3821,13 @@ void applyTimingScroll(ImDrawList* draw, ImVec2 winMin, ImVec2 winMax,
 // RECORD right column (the NOCLIP stack): its own independent scroll.
 void applyNoClipScroll(ImDrawList* draw, ImVec2 winMin, ImVec2 winMax,
                        float viewTop, float viewBot, float contentH, float k) {
+    if (state().searchVisible) {
+        const float viewH = std::max(1.0f, viewBot - viewTop);
+        const float maxScroll = std::max(0.0f, contentH - viewH);
+        state().noclipScroll = std::clamp(state().noclipScroll, 0.0f, maxScroll);
+        state().noclipScrollDragging = false;
+        return;
+    }
     State& st = state();
     applyRegionScroll(draw, winMin, winMax, viewTop, viewBot, contentH, k,
                       st.noclipScroll, st.noclipScrollDragging,
@@ -4332,10 +4458,9 @@ void drawSearchDropdown(ImDrawList* draw, float k) {
     // (refresh, rows) always win the hit-test and clicks never fall through to
     // RECORD/PLAY.
 
-    const float labelY = tl.y + pad;
-    spacedText(draw, mf, pxSize(8.0f * kt), ImVec2(tl.x + 10.0f * k, labelY),
-               totalRows > 0 ? "FROM YOUR LIBRARY" : "A FRESH START",
-               withAlpha(theme::rgb(152, 166, 190), st.searchOpenT), 1.2f * kt);
+    // Подпись «FROM YOUR LIBRARY» / «A FRESH START» убрана по запросу
+    // 03.11.2026; банд лейбла сохраняет высоту — refresh-кнопка и строки
+    // списка остались на своих местах.
 
     // Refresh button on the right of the label band (reloads the library list).
     const float refSize = 22.0f * k;

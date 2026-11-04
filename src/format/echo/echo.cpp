@@ -439,11 +439,6 @@ uint32_t hash4(const std::vector<uint64_t>& dct) {
 // same reasoning was right for TTRL and RE4 but not here.
 static constexpr int64_t kFrameShift = 0;
 
-std::size_t channelIndex(uint8_t button, bool player2) {
-    const int base = (button >= 1 && button <= 3) ? button - 1 : 0;
-    return static_cast<std::size_t>(base) + (player2 ? 3u : 0u);
-}
-
 }  // namespace
 
 bool skk::echo::looksLikeEcho(std::span<const uint8_t> data) {
@@ -457,7 +452,19 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
         return false;
     };
 
-    if (!looksLikeEcho(data)) return fail("echo: not an ECH2 file (magic \"ECH2\")");
+    if (!looksLikeEcho(data)) {
+        std::string got;
+        constexpr char hex[] = "0123456789ABCDEF";
+        const size_t shown = std::min<size_t>(data.size(), 4);
+        got.reserve(shown * 2);
+        for (size_t i = 0; i < shown; ++i) {
+            got.push_back(hex[data[i] >> 4]);
+            got.push_back(hex[data[i] & 0x0F]);
+        }
+        return fail("echo: invalid magic; expected ECH2, got " +
+                    (got.empty() ? std::string("<empty>") : got) +
+                    (data.size() < 4 ? " (file shorter than 4 bytes)" : " (hex)"));
+    }
 
     out = Replay{};
     out.version = data[4];
@@ -521,6 +528,7 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
 
     for (uint64_t i = 0; i < count; ++i) {
         uint64_t packed = 0;
+        bool guessed = false;
 
         if (run != 0 && cursor < dct.size()) {
             packed = dct[cursor];
@@ -530,13 +538,16 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
             const uint32_t off = 48 * bucketOf(run) + 8 * (v14 + cls);
             if (counterBit(st, model, off)) {
                 misses = 0;
+                guessed = true;
             } else {
                 ++misses;
-                packed = 0;
             }
         }
 
-        if (packed == 0) {
+        // Zero is a valid packed click (release on channel 0 with zero frame
+        // gap). Do not use the payload value as the dictionary-hit sentinel:
+        // Echo's reference tracks this with an explicit `guessed` boolean.
+        if (!guessed) {
             uint32_t second = 0, last = 0;
             uint64_t lastDelta = 0;
             if (!dct.empty()) {
@@ -770,24 +781,9 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
     out.header.tps = replay.tps;
     out.actions.reserve(replay.actions.size());
 
-    std::array<bool, 6> held{};
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
 
     for (const auto& a : replay.actions) {
-        const std::size_t ch = channelIndex(a.button, a.player2);
-        if (!a.pressed) {
-            if (!held[ch]) {
-                ++droppedRelease;
-                continue;
-            }
-            held[ch] = false;
-        } else {
-            if (held[ch]) {
-                ++droppedDuplicate;
-                continue;
-            }
-            held[ch] = true;
-        }
         // Zero, measured. The hook body has Echo apply inputs after the vanilla
         // processCommands, which read like GDH's RE4 and predicted -1; the game
         // says otherwise, so the measurement wins.
@@ -800,6 +796,13 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
+    // up+down (never deleted - see normalizeActionStream()).
+    skc::NormalizeReport normalized;
+    skc::normalizeActionStream(out.actions, normalized);
+    droppedRelease = normalized.droppedRelease;
+    droppedDuplicate = normalized.rebuiltTaps;
+
     if (out.actions.empty()) return fail("echo: no usable inputs after normalisation");
 
     std::string reason;
@@ -807,7 +810,7 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
 
     skkbot2::log::warn(
         "[ECHO] {} inputs -> {} actions, dropped {} release(s) with no press and "
-        "{} duplicate press(es), frame shift {:+d} (first click {} -> {})",
+        "rebuilt {} collapsed tap(s), frame shift {:+d} (first click {} -> {})",
         replay.actions.size(), out.actions.size(), droppedRelease, droppedDuplicate,
         kFrameShift, replay.actions.front().frame, out.actions.front().frame);
     return true;

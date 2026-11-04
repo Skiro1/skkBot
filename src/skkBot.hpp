@@ -14,6 +14,8 @@
 #include "core/gameplay_layer.hpp"
 #include "core/paths.hpp"
 #include "hacks/autoclicker.hpp"
+#include "hacks/physicsbypass.hpp"
+#include "gui/skkbot_gui.hpp"
 #include "render/renderer.hpp"
 
 #include <Geode/Bindings.hpp>
@@ -35,6 +37,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "core/autosave_recorder.hpp"
 
 using namespace geode::prelude;
 
@@ -271,6 +275,23 @@ public:
     }
 
     std::unordered_map<CheckpointObject*, CheckpointStateBundle> storedRestorePoints;
+    // GD's platformer setup-checkpoint lives behind m_activatedCheckpoint and
+    // is not always the CheckpointObject left at the end of m_checkpointArray.
+    // Keep the exact CheckpointObject made for that activation, like GucciBot's
+    // m_platformerCheckpoints, so resetLevel can make GD restore that object.
+    std::vector<CheckpointObject*> platformerCheckpointObjects;
+    void trackPlatformerCheckpoint(CheckpointObject* checkpoint) {
+        if (!checkpoint) return;
+        for (auto* saved : platformerCheckpointObjects)
+            if (saved == checkpoint) return;
+        checkpoint->retain();
+        platformerCheckpointObjects.push_back(checkpoint);
+    }
+    void clearPlatformerCheckpoints() {
+        for (auto* checkpoint : platformerCheckpointObjects)
+            if (checkpoint) checkpoint->release();
+        platformerCheckpointObjects.clear();
+    }
     std::vector<CheckpointStateBundle> practiceFixQueue;
     int lastTickIndex = 0;
     int respawnTickIndex = -1;
@@ -309,6 +330,8 @@ public:
     size_t playbackAnchorIndex = 0;
     size_t perFramePlaybackIndex = 0;
     bool captureIgnored = false;
+    // True death pauses clean-line capture until GD completes the attempt reset.
+    bool captureDeathPending = false;
     bool levelRestarting = false;
     bool initialRun = false;
     bool pendingPlaybackStart = false;
@@ -331,6 +354,11 @@ public:
     // levelTime, step) - lets record and playback phase grids be compared
     // line by line around the exact death. -1 disables.
     int probeAroundTick = -1;
+    // BUG-102 v3: список центров окон (tick ± 24) из saved-значения
+    // "skc-probe-ticks" (строка "416,516,1237") - несколько расхождений
+    // за один прогон, без переконфигурации между сессиями. Плюс одиночный
+    // легаси "skc-probe-tick" и death-tick из checkpoint_system.
+    std::vector<int> probeAroundTicks;
     // Frame-boundary input semantics (capture truth): GD consumes touches
     // between frames, effective on the FIRST substep of the next frame, and
     // capture stamps the press with that frame's entry label. Dispatching on
@@ -356,18 +384,67 @@ public:
     // dt*tickRate instead of +1 to keep the playback grid locked to the
     // level's game time; this fraction holds the sub-tick remainder.
     double stepPairFrac = 0.0;
-    // Periodic phase-grid visibility (every ~10s of sim time) for logs.
-    int phaseSampleCounter = 0;
+    // Periodic phase-grid visibility was plan-count based; replaced by the
+    // wall-clock step-grid sample window (sessionSampleWallStart/DtSum).
+
     // Sample window per session: reset at session start so a window never
     // spans restarts/pauses (which used to produce bogus negative deltas).
     double sessionSampleLastLevelTime = 0.0;
     long long sessionSampleStepsWindow = 0;
+    // The step-grid sample's wall-clock window: started on the first plan
+    // after a reset, the sample fires every 2.0 s of WALL time and sums the
+    // delivered dt stream (sessionSampleDtSum) so the log can compare
+    // "sim time fed" against "wall time passed" directly.
+    double sessionSampleWallStart = 0.0;
+    double sessionSampleDtSum = 0.0;
+    // BUG-97 instrument: the speedhack value seen in the last sample window.
+    // A dynamic speed change DURING an SKC record is captured here and
+    // reported once per change; the speed track work must make record ==
+    // play under any speed sequence. Reset at session start.
+    double sampleSpdLast = 0.0;
+    // Smoothed measured frame time (seconds per drawn frame), the stall cap's
+    // cadence source when the display pin is not being substituted. Updated
+    // ONLY from non-stall frames: a stall frame's dt is the batch's own
+    // serving time, and feeding it back re-creates BUG-66's self-reinforcing
+    // budget loop (budget from delivered fps).
+    double emaFrameTime = 0.0;
+    // Stall accounting: how often the backlog past the cap was refused and
+    // how much level time that dropped, plus how many scheduler walks never
+    // became plans (custom-timing-off exits) - the first instrumented run
+    // showed 1310 walks against 401 plans and the split was unreadable.
+    long long lockBacklogDrops = 0;
+    double lockBacklogDropped = 0.0;
+    long long sessionSchedWalks = 0;
+    long long sessionVanillaExits = 0;
     // Per-session step-grid audit: total plan calls, total steps planned,
     // how many hit the resume-fade zero-dt window, and the first/last
     // levelTime. Logged in haltExecution as "step-grid epilogue".
     long long sessionPlanCount = 0;
     long long sessionStepSum = 0;
     long long sessionResumeZeroPlans = 0;
+    // Freeze-path audit (the deficit that is INSIDE update): plans whose
+    // update() GD ran on the freeze path - zero physics, zero levelTime, the
+    // whole batch lost. Two gates, read raw at plan time:
+    //   12888 (0x3258) - the pause-family flag; 0 freezes every such frame;
+    //   12964 (0x32A4) - the post-resume grace counter; freeze requires >= 2
+    //     because this update's own getModifiedDelta call decrements it
+    //     before the freeze check sees it.
+    long long batFrozenFlagPlans = 0;
+    long long batFrozenFlagSteps = 0;
+    long long batFreezeCtrPlans = 0;
+    long long batFreezeCtrSteps = 0;
+    // BUG-79 start-window trace (INFO, once per session): the user reports
+    // "the song starts while the level is somehow still waiting" - i.e. the
+    // same pathology BUG-70 measured (1.36 s of frozen frames at attempt
+    // start: scene/audio/triggers alive, physics and levelTime dead). These
+    // fields record WHEN the frozen gate engaged, how many frames it ate,
+    // and the wall time between first freeze and first live physics plan,
+    // so the next run ties the symptom to a number.
+    int startFrozenFrames = 0;      // gate-frozen frames this session
+    bool startFrozenReported = false;  // gate-engage INFO emitted
+    double startFrozenWall = 0.0;   // wall (hot::now) of the first frozen frame
+    bool startLiveReported = false; // first-live-plan INFO emitted
+    bool playbackFirstInputReported = false; // first [PLAY-START] emitted
     double sessionFirstLevelTime = 0.0;
     double sessionLastLevelTime = 0.0;
     bool sessionLevelTimeInit = false;
@@ -400,15 +477,89 @@ public:
     double lockOffCadenceFraction = 1.0;
     long long lockOffCadenceInWindow = 0;
     long long lockWindowFrames = 0;
+    // BUG-95: the substitution constant is the display's ACTUAL cadence -
+    // learned from the window of measured frame dts and snapped to an
+    // integer fps. Same monitor for record and play -> the same snapped
+    // constant, so the step grid repeats across sessions even when
+    // getAnimationInterval lies about it (probed: promised 1/240 while the
+    // V-Sync'd display delivered 1/180, which left the interval-gated
+    // substitution permanently off and the grid undeterministic).
+    //
+    // BUG-95a: the first take (median, re-anchor on any 2% drift) flapped
+    // the anchor 180 <-> 158 <-> 97 fps every few seconds on hitchy frames
+    // and the level audibly sped up and slowed down. Two disciplines on
+    // top of the learn: the window statistic is the 25th percentile (the
+    // fast frame cluster, immune to hitches that drag the median into the
+    // slow cluster), and the anchor moves only after a candidate differs
+    // by >10% across two consecutive windows (hysteresis).
+    float lockLearnedInterval = 0.0f;
+    std::vector<float> lockLearnsWindow;
+    int lockAnchorFps = 0;
+    int lockAnchorPendingFps = 0;
+    int lockAnchorPendingHits = 0;
     double lockDeliveredTotal = 0.0;
     long long lockDeliveredFrames = 0;
     bool lockWarnedSlow = false;
-    long long lockCapHits = 0;
     long long lockZeroFrames = 0;
     double lockDroppedCarry = 0.0;
     double lockMaxDtSkew = 0.0;
     bool lockEverOn = false;
     bool lockLoggedOn = false;
+    // BUG-94 probes: per step-grid sample window, the raw dt the scheduler
+    // hook actually received per drawn frame, and how many entries fell back
+    // to the vanilla path. The 22:48 record sample showed walks and plans in
+    // a split that looked impossible for a per-frame hook - these counters
+    // must split that apart in one run instead of guesses.
+    float sampleRawDtMin = 0.0f;
+    float sampleRawDtMax = 0.0f;
+    double sampleRawDtSum = 0.0;
+    long long  sampleRawFrames = 0;
+    long long  sampleVanillaExits = 0;
+    // BUG-96 probes: the drive stream's dt was caught summing to MORE than
+    // the wall time that actually passed (dtSum 4.1s in a 2.0s wall window -
+    // impossible for an honest wall-fed stream). For every drive we also
+    // store the REAL wall gap since the previous drive; comparing the two
+    // distributions names the phantom drives (dt > wall gap) or proves the
+    // stream honest once and for all.
+    double sampleWallGapSum = 0.0;
+    float  sampleWallGapMin = -1.0f;
+    float  sampleWallGapMax = 0.0f;
+    long long samplePhantomCount = 0;
+    double samplePhantomDtSum = 0.0;
+    // Pacing-deficit stage 2: raw drive frames are HONEST (rawSum == wallGap
+    // sum), but the dt the planner received (dtSum) is ~17ms/2s short. Split
+    // the seam inside one window: how many plans the window carried vs how
+    // many raw frames drove it, and the rawSum itself next to dtSum - the
+    // difference names the exact loss class (undelivered plans, substituted
+    // constant, or per-frame walk count skew).
+    long long samplePlansWindow = 0;
+    // Pacing-deficit stage 3 (RT): the feed passes through three stages
+    // before the planner sees it - raw dt (GD), the DWM-tick smoothing
+    // (refresh_frame_time) and the wall clamp. Each stage can eat time, and
+    // the totals name WHICH one does:
+    //   sampleRawDtSum - what GD reported (already counted per drive)
+    //   sampleDwmSum   - what the display-tick smoothing returned
+    //   sampleClampSum - what the wall clamp let through
+    //   sampleFedSum   - what the planner received (the dtSum the log shows)
+    double sampleDwmSum = 0.0;
+    double sampleClampSum = 0.0;
+    double sampleFedSum = 0.0;
+    // How many drives the window carried (one per drawn frame) and how many
+    // of them the DWM smoothing actually rewrote (a rewritten drive is a
+    // candidate for the loss).
+    long long sampleDrives = 0;
+    long long sampleDwmRewrites = 0;
+    // BUG-96 stage-3 audit: does the tempo-debt feed actually reach the
+    // planner? sampleDebtSum/count = what advanceNormalScheduler fed into
+    // g_extraDelta; sampleWantSum = what the planner ASKED for
+    // (wantedSteps * timestep); sampleFreezeDropped = debt destroyed by the
+    // frozen gate (zeroing the carry on pause-family frames). If feed is
+    // large but want is not, the loss sits between the two.
+    double sampleDebtSum = 0.0;
+    long long sampleDebtCount = 0;
+    double sampleWantSum = 0.0;
+    double sampleFreezeDropped = 0.0;
+    double lastDriveWall = 0.0;
     // Frame number at which lock delta was first seen doing something, so a report
     // can say where in the macro it engaged rather than only that it did.
     int lockFirstPlanFrame = -1;
@@ -420,7 +571,8 @@ public:
     int cbsImmediateCount = 0;
     int cbsQueueNativeCount = 0;
     int cbsWaitCount = 0;
-    // Playback phase-drift meter: |arrived - recorded| at force time.
+    // Vanilla-physics delta measured before the recorded per-frame position is
+    // applied. Diagnostic only; this is not rendered/post-reconcile drift.
     float playDriftMax = 0.0f;
     int playDriftMaxTick = -1;
     int playDriftLastLogTick = -100000;
@@ -498,6 +650,9 @@ public:
     bool cbsPlaybackProcessingQueue = false;
     bool unsavedGuardActive = false;
     bool replayAccuracyEnvironmentActive = false;
+    // SKC owns a separate per-macro accuracy environment. Do not let the
+    // settings UI adopt that temporary runtime mode as the user's preference.
+    bool externalAccuracyEnvironmentActive = false;
     bool savedClickBetweenSteps = false;
     bool savedLayerClickBetweenSteps = false;
     bool hasSavedLayerClickBetweenSteps = false;
@@ -703,7 +858,7 @@ public:
             // but we never write either (our output stays lossless .skc).
             if (extension != ".skk" && extension != ".skc" &&
                 extension != ".gdr2" && extension != ".slc" && extension != ".nhm" && extension != ".xe" &&
-                extension != ".re4" && extension != ".ttrl" && extension != ".ttr3" &&
+                extension != ".re4" && extension != ".ttrl" &&
         extension != ".echo" &&
         extension != ".ast" &&
                 !skk::gbr::looksLikeGbrByExtension(extension)) {
@@ -740,11 +895,16 @@ public:
     void queueRecord(std::string const& name) {
         pendingAction = PendingAction::Record;
         pendingActionName = name;
+        // BUG-80: a fresh PlayLayer can reuse the dead one's heap address;
+        // disarm the [ENTRY-FREEZE] watcher here so the queued entry rearms.
+        skkbot2::entryFreezeReset();
         skkbot2::log::info("RECORD queued for next level entry (name='{}')", name);
     }
     void queuePlayback(std::string const& name) {
         pendingAction = PendingAction::Play;
         pendingActionName = name;
+        // Same disarm reason as queueRecord above.
+        skkbot2::entryFreezeReset();
         skkbot2::log::info("PLAY queued for next level entry (name='{}')", name);
     }
     void clearPendingAction() {
@@ -789,7 +949,16 @@ public:
         }
         PendingAction act = pendingAction;
         std::string name = pendingActionName;
-        clearPendingAction();
+        // Consuming is not cancellation. Clear only the queue fields here;
+        // clearPendingAction() is the user-cancel path and also disarms a
+        // pending start. Reusing it made successful level-entry consumption
+        // indistinguishable from a cancelled PLAY in the log.
+        pendingAction = PendingAction::None;
+        pendingActionName.clear();
+        skkbot2::log::info(
+            "queued action consumed ({}) level='{}' id={} name='{}'",
+            act == PendingAction::Record ? "RECORD" : "PLAY",
+            level->m_levelName.c_str(), level->m_levelID, name);
 
         if (act == PendingAction::Record) {
             skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::Record);
@@ -806,10 +975,34 @@ public:
         }
 
         if (!hasMacroInputs() && !loadMacroFromName(name)) {
+            skkbot2::log::error(
+                "PLAY queue failed: could not load macro '{}' for level='{}' id={}",
+                name, level->m_levelName.c_str(), level->m_levelID);
             return false;
         }
         if (!hasMacroInputs()) {
+            skkbot2::log::error("PLAY queue failed: macro '{}' has no inputs", name);
             return false;
+        }
+        // Queued PLAY can load a macro before PlayLayer::init has populated
+        // m_levelSettings. Older queued recordings therefore may carry the
+        // default classic-mode bit even though they belong to this exact
+        // platformer level. Level identity is the guard: never infer mode from
+        // a different level or silently make cross-level macros compatible.
+        const bool sameLevel = activeSk &&
+            (activeSk->levelId > 0
+                ? activeSk->levelId == static_cast<int32_t>(level->m_levelID)
+                : activeSk->levelName == level->m_levelName.c_str());
+        if (sameLevel) {
+            const bool actualPlatformer = level->isPlatformer();
+            if (activeSk->platformerMode != actualPlatformer) {
+                skkbot2::log::warn(
+                    "PLAY metadata repaired for matching level '{}': platformer {} -> {}",
+                    level->m_levelName.c_str(),
+                    activeSk->platformerMode ? "true" : "false",
+                    actualPlatformer ? "true" : "false");
+                activeSk->platformerMode = actualPlatformer;
+            }
         }
         // Queued from outside the level: the level is already at the start on
         // entry, so skip the initialRun reset when playback begins.
@@ -818,6 +1011,13 @@ public:
         pendingPlaybackStart = true;
         nextBoundaryIndex = 0;
         pendingRngBoundary = {};
+        skkbot2::log::info(
+            "PLAY queued macro armed: name='{}' inputs={} anchors={} frames={} tps={:.3f}",
+            activeSk ? activeSk->name : name,
+            activeSk ? activeSk->inputs.size() : 0,
+            activeSk ? activeSk->anchors.size() : 0,
+            activeSk ? activeSk->perFrames.size() : 0,
+            activeSk ? activeSk->framerate : tickRate);
         return true;
     }
 
@@ -919,6 +1119,9 @@ public:
         // framerate does not already say.
         activeMacro->displayFps =
             skkbot2::fps::captureForStorage(tickRate).toWire();
+        auto const& gui = skkbot2::gui::get();
+        activeMacro->lockDelta = gui.lockDelta && !gui.realTime;
+        activeMacro->realTime = gui.realTime && !gui.lockDelta;
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeMacro->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeMacro->hasPlatformerModeMetadata = true;
@@ -940,6 +1143,9 @@ public:
         }
         activeSk->framerate = tickRate;
         activeSk->displayFps = skkbot2::fps::captureForStorage(tickRate).toWire();
+        auto const& gui = skkbot2::gui::get();
+        activeSk->lockDelta = gui.lockDelta && !gui.realTime;
+        activeSk->realTime = gui.realTime && !gui.lockDelta;
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeSk->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeSk->twoPlayerMode = playLayer->m_levelSettings->m_twoPlayerMode;
@@ -1309,28 +1515,23 @@ public:
     // loaded so the live takeover can arm once the player reaches covered ground.
     void parkPlaybackPending();
 
-    void haltExecution() {
-        if (engineMode == MODE_CAPTURE) {
-            captureVarianceSnapshot();
-            if (activeSk) {
-                skkbot2::log::info("RECORD session ended: main inputs={} anchors={} frames={} | chain links={} | variance slots={}",
-                    activeSk->inputs.size(), activeSk->anchors.size(), activeSk->perFrames.size(),
-                    activeSk->persistenceAttempts.size(), activeSk->varianceOverrides.size());
-            }
-        } else if (engineMode == MODE_EXECUTE && activeSk) {
-            skkbot2::log::info("PLAY session ended: consumed {}/{} inputs, maxDrift {:.2f}px@{}, maxRenderDrift {:.2f}px@{}, "
-                               "slice-skips={}, cbs[imm={},queue={},wait={}]",
-                executeIndex, activeSk->inputs.size(), playDriftMax, playDriftMaxTick,
-                renderDriftMax, renderDriftMaxTick,
-                processSliceSkips, cbsImmediateCount, cbsQueueNativeCount, cbsWaitCount);
-        }
+    // Step-grid and lock-delta session epilogues. Extracted from
+    // haltExecution so SKC's stop path (Bot::stop) prints the SAME audits:
+    // SKC sessions plan ticks through the same machinery and the numbers were
+    // previously lost whenever a run ended outside SKK's own stop funnel.
+    void logTimingEpilogues() {
         // Step-grid session epilogue: audit plan/step/resume counts.
         if (sessionPlanCount > 0) {
             const double ltDelta = sessionLastLevelTime - sessionFirstLevelTime;
-            const long long estTicks = static_cast<long long>(std::round(ltDelta * runtimeTickRate()));
+            // The tick count is the session's ACTUAL served steps, not
+            // ltDelta * runtimeTickRate(): runtimeTickRate is the menu's tick
+            // rate (240 by default), while SKC playback runs at the macro's
+            // tps (e.g. 3414) through the physics bypass - the old estimate
+            // printed ~1813 ticks for what was really 25805 steps.
+            const long long estTicks = static_cast<long long>(sessionStepSum);
             skkbot2::log::info(
                 "step-grid epilogue: plans={} steps={} resumeZero={} | "
-                "levelTime {:.4f} -> {:.4f} (+{:.4f}s ~{} ticks) | plan/tick {:.2f}",
+                "levelTime {:.4f} -> {:.4f} (+{:.4f}s = {} steps) | plan/step {:.2f}",
                 sessionPlanCount, sessionStepSum, sessionResumeZeroPlans,
                 sessionFirstLevelTime, sessionLastLevelTime, ltDelta, estTicks,
                 estTicks > 0 ? static_cast<double>(sessionPlanCount) / static_cast<double>(estTicks) : 0.0);
@@ -1340,25 +1541,55 @@ public:
         // Always on, so unlike the setting it replaced there is no "was it
         // switched off" case to guard - every run produces one of these. The
         // numbers to read are lockMaxDtSkew (how far the wall clock strayed from
-        // the pinned interval, i.e. how much work the substitution did) and the
+        // the smoothed grid, i.e. how much smoothing work was needed) and the
         // steps-per-frame average against the tps/fps ratio it should equal.
+        // Cadence truth lives in the step-grid samples: dtSum/wall is the
+        // real-time fidelity number (100% = the level was fed real time).
+        // (The old "display delivered X fps, Y% of frames late" fields are gone:
+        // they were never updated since the wall-clock rework and always printed
+        // their initial values 0.0 fps / 100% - noise that read as slow motion.)
         if (lockPlanCount > 0) {
             skkbot2::log::info(
                 "lock-delta epilogue: engaged at frame {}, {} frames planned, "
                 "{} steps over {} wanted (avg {:.3f}/frame), worst frame wanted "
-                "{}, {} frames ran nothing, cap hit {} times, display delivered "
-                "{:.1f} fps with {:.1f}% of frames late, measured-dt minus "
+                "{}, {} frames ran nothing, backlog refused {}x ({:.2f}s), walks "
+                "{} (vanilla exits {}), measured-dt minus "
                 "interval summed {:.4f}s, worst single frame {:.4f}s",
                 lockFirstPlanFrame, lockPlanCount, lockStepSum, lockWantedSum,
                 static_cast<double>(lockWantedSum) / static_cast<double>(lockPlanCount),
-                lockMaxWanted, lockZeroFrames, lockCapHits,
-                lockDeliveredTotal > 0.0
-                    ? static_cast<double>(lockDeliveredFrames) / lockDeliveredTotal
-                    : 0.0,
-                lockOffCadenceFraction * 100.0,
+                lockMaxWanted, lockZeroFrames,
+                lockBacklogDrops, lockBacklogDropped,
+                sessionSchedWalks, sessionVanillaExits,
                 lockDroppedCarry, lockMaxDtSkew);
             lockLoggedOn = false;
         }
+    }
+
+    void haltExecution() {
+        // The user's autosave contract (02.11): a rescue snapshot at EVERY
+        // record-off moment, not only when the GUI stop button runs
+        // stopRecording() (level complete, macro swap, editor exit, hotkey
+        // oddities all funnel here without it). Still record-only: the call
+        // is a no-op outside MODE_CAPTURE, and skkSnapshot bumps nothing
+        // when the capture has zero inputs.
+        if (engineMode == MODE_CAPTURE) {
+            ::skkbot2::autosave::flushRecording();
+        }
+        if (engineMode == MODE_CAPTURE) {
+            captureVarianceSnapshot();
+            if (activeSk) {
+                skkbot2::log::info("RECORD session ended: main inputs={} anchors={} frames={} | chain links={} | variance slots={}",
+                    activeSk->inputs.size(), activeSk->anchors.size(), activeSk->perFrames.size(),
+                    activeSk->persistenceAttempts.size(), activeSk->varianceOverrides.size());
+            }
+        } else if (engineMode == MODE_EXECUTE && activeSk) {
+            skkbot2::log::info("PLAY session ended: consumed {}/{} inputs, maxPreReconcileDelta {:.2f}px@{}, maxRenderResidual {:.3f}px@{}, "
+                               "slice-skips={}, cbs[imm={},queue={},wait={}]",
+                executeIndex, activeSk->inputs.size(), playDriftMax, playDriftMaxTick,
+                renderDriftMax, renderDriftMaxTick,
+                processSliceSkips, cbsImmediateCount, cbsQueueNativeCount, cbsWaitCount);
+        }
+        logTimingEpilogues();
         skkbot2::dumpPlayerInputTally("run ended");
         resetPlayDriftMeter();
         resetSessionStepGridStat();
@@ -1429,20 +1660,50 @@ public:
         sessionFirstLevelTime = 0.0;
         sessionLastLevelTime = 0.0;
         sessionLevelTimeInit = false;
-        phaseSampleCounter = 0;
         sessionSampleLastLevelTime = 0.0;
         sessionSampleStepsWindow = 0;
+        sessionSampleWallStart = 0.0;
+        sessionSampleDtSum = 0.0;
+        sampleSpdLast = 0.0;
+        emaFrameTime = 0.0;
+        lockBacklogDrops = 0;
+        lockBacklogDropped = 0.0;
+        sessionSchedWalks = 0;
+        sessionVanillaExits = 0;
+        sampleRawDtMin = 0.0f;
+        sampleRawDtMax = 0.0f;
+        sampleRawDtSum = 0.0;
+        sampleRawFrames = 0;
+        sampleWallGapSum = 0.0;
+        sampleWallGapMin = -1.0f;
+        sampleWallGapMax = 0.0f;
+        samplePhantomCount = 0;
+        samplePhantomDtSum = 0.0;
+        sampleDebtSum = 0.0;
+        sampleDebtCount = 0;
+        sampleWantSum = 0.0;
+        sampleFreezeDropped = 0.0;
+        lastDriveWall = 0.0;
+        sampleVanillaExits = 0;
         lockPlanCount = 0;
         lockWantedSum = 0;
         lockStepSum = 0;
         lockMaxWanted = 0;
+        batFrozenFlagPlans = 0;
+        batFrozenFlagSteps = 0;
+        batFreezeCtrPlans = 0;
+        batFreezeCtrSteps = 0;
+        startFrozenFrames = 0;
+        startFrozenReported = false;
+        startFrozenWall = 0.0;
+        startLiveReported = false;
+        playbackFirstInputReported = false;
         lockOffCadenceFraction = 1.0;
         lockOffCadenceInWindow = 0;
         lockWindowFrames = 0;
         lockDeliveredTotal = 0.0;
         lockDeliveredFrames = 0;
         lockWarnedSlow = false;
-        lockCapHits = 0;
         lockZeroFrames = 0;
         lockDroppedCarry = 0.0;
         lockMaxDtSkew = 0.0;
@@ -1680,7 +1941,7 @@ public:
 // own mode there and the user's live choice is restored by
 // endReplayAccuracyEnvironment(), not by the menu.
 bool syncAccuracyFromGame() {
-    if (replayAccuracyEnvironmentActive) {
+    if (replayAccuracyEnvironmentActive || externalAccuracyEnvironmentActive) {
         return false;
     }
 
@@ -1796,6 +2057,21 @@ bool syncAccuracyFromGame() {
             } else {
                 skkbot2::fps::updateMacro(declaredFps);
             }
+
+            // Timing mode: the USER's GUI toggles drive SKK playback directly
+            // (Echo parity, per the 02.11 BUG-96 stage-5 contract). The macro's
+            // own lockDelta/realTime flags were stamped here on record and are
+            // honoured only as metadata - the advanceNormalScheduler /
+            // applyCustomTickPlan decision words read gui.lockDelta/gui.realTime
+            // for BOTH engines ("SKC and SKK alike"). Re-overwriting the GUI
+            // from the header made any pre-play choice invisible: the mode
+            // always snapped back to whatever the file stored. skcBot still
+            // restores the SKC header's mode (skc_bot.cpp), unchanged.
+            auto& gui = skkbot2::gui::get();
+            skkbot2::log::info(
+                "[SKK] playback timing mode: {} (the GUI toggle is the driver)",
+                gui.realTime && !gui.lockDelta ? "Real Time" : "Lock Delta");
+            dropCarry();
         }
 
         applyRuntimeAccuracyMode(mode, cosEnabled);
@@ -1859,8 +2135,25 @@ bool syncAccuracyFromGame() {
         return gameSpeed * (kBaseTickRate / runtimeTickRate());
     }
 
-    float fixedSimulationDelta() const {
-        return static_cast<float>(1.0 / runtimeTickRate());
+    double fixedSimulationDelta() const {
+        // Nominal period for scheduler/carry accounting. Keep this in double;
+        // the actual GD physics quantum is rounded once by fixedPhysicsDelta.
+        return 1.0 / runtimeTickRate();
+    }
+
+    double fixedPhysicsDelta(double timeWarp = 1.0) const {
+        // GD's per-step physics delta is ultimately a float. Match the
+        // reference's rounding order: calculate (1 / TPS) * timeWarp in
+        // double, round that single-step quantum to float exactly once, then
+        // promote the exact float value back to double for planning and the
+        // step-grid hooks. Rounding 1/TPS first and applying timeWarp later
+        // can differ by one float ULP per step and accumulate over a level.
+        if (!std::isfinite(timeWarp)) {
+            return 0.0;
+        }
+        const double warp = std::clamp(timeWarp, 0.0, 1.0);
+        const float physicsStep = static_cast<float>(fixedSimulationDelta() * warp);
+        return static_cast<double>(physicsStep);
     }
 
     static double wallClockSeconds() {
@@ -2115,6 +2408,26 @@ bool syncAccuracyFromGame() {
             return;
         }
 
+        if (captureDeathPending) {
+            skkbot2::log::debug(
+                "capture drop [death-window]: tick={} button={} p2={} down={}",
+                tick, button, player2, pressed);
+            return;
+        }
+
+        // Never put death-animation input into a macro. In particular,
+        // platformer callbacks can arrive between destroyPlayer and resetLevel.
+        if (auto* layer = PlayLayer::get()) {
+            if ((layer->m_player1 && layer->m_player1->m_isDead) ||
+                (layer->m_player2 && layer->m_player2->m_isDead)) {
+                skkbot2::log::debug(
+                    "capture drop [dead-player]: tick={} button={} p2={} down={} "
+                    "(death chains are not recorded)",
+                    tick, button, player2, pressed);
+                return;
+            }
+        }
+
         if (canUsePersistenceCapture()) {
             activeSk->recordAction(persistenceCaptureAttempt.inputs, tick, button, player2, pressed, offset, cbsTimeOffset);
         } else if (captureStaging) {
@@ -2284,6 +2597,13 @@ bool syncAccuracyFromGame() {
 
     void recordSkAnchor(int tick, PlayerObject* player1, PlayerObject* player2, bool isPlatformer, bool isDual) {
         if (!activeSk) {
+            return;
+        }
+
+        // Per-frame state and anchors are the trajectory stream. A dead frame
+        // is not a legal point on the clean route and must never be serialized.
+        if (captureDeathPending || (player1 && player1->m_isDead) ||
+            (player2 && player2->m_isDead)) {
             return;
         }
 

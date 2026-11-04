@@ -1238,6 +1238,83 @@ void Renderer::audioPump(double levelTime) {
     audioEncodePending();
 }
 
+// A/V drift audit. The audio is pumped along the video timeline by
+// construction, so in a healthy render all four numbers advance together:
+//   video  = pts / fps                    (the container's video clock)
+//   sim    = levelTime - anchor           (what the frames actually show)
+//   audio  = samples written / rate       (the container's audio clock)
+//   mixer  = master DSP clock / rate      (what FMOD actually mixed)
+// mixer - audio is the dropped pre-roll; sim - video is the render clock
+// slipping against the sim (mClockMismatch); audio - video is the desync the
+// viewer would hear. Logging them on a fixed pts grid makes two renders
+// directly diffable.
+void Renderer::logAvSync(GJBaseGameLayer* layer) {
+    if (!m_audioEnabled || !m_audioCtx || mFps <= 0 || mLastPts < 0) {
+        return;
+    }
+    const int64_t step = std::max<int64_t>(1, static_cast<int64_t>(mFps) * 2);
+    if (mLastPts % step != 0 || mLastPts == m_avSyncLogPts) {
+        return;
+    }
+    m_avSyncLogPts = mLastPts;
+    auto& ac = AudioCapture::get();
+    const double videoT = static_cast<double>(mLastPts) / static_cast<double>(mFps);
+    const double simT = layer
+                            ? layer->m_gameState.m_levelTime - m_audioAnchor
+                            : 0.0;
+    const double audioT = ac.producedSeconds();
+    const double mixT = ac.mixerSeconds();
+    const double pre = ac.prerollRemainSeconds();
+    const double drift = audioT - videoT;
+    // Content-speed meter: how much SIM time the frames delivered per unit of
+    // video time since the last grid point. The encoder/queue wall numbers
+    // (stats speed=x.xx) have no relation to this - it is measured in the
+    // content itself. A healthy render holds exactly mSpeed here for the
+    // whole session; a dip or spike is the wobble, with the video time it
+    // happened at, so a user-seen segment can be matched to the log directly.
+    std::string contentNote;
+    double contentSpeed = 0.0;
+    if (m_avSyncHasPrev) {
+        const double dv = static_cast<double>(mLastPts - m_avSyncPrevPts) /
+                          static_cast<double>(mFps);
+        const double ds = simT - m_avSyncPrevSim;
+        if (dv > 0.0) {
+            contentSpeed = ds / dv;
+            const double want = std::max(0.001, mSpeed);
+            if (std::abs(contentSpeed - want) > 0.05 * want) {
+                contentNote = fmt::format(
+                    "  << CONTENT SPEED OFF: want {:.3f}x", want);
+                skkbot2::log::warn(
+                    "[RENDER] av-sync: content speed {:.3f}x over "
+                    "video {:.1f}-{:.1f}s (want {:.3f}x) - the level moved "
+                    "{:+.3f}s of sim time in {:.3f}s of video",
+                    contentSpeed,
+                    static_cast<double>(m_avSyncPrevPts) / mFps, videoT,
+                    want, ds, dv);
+            }
+        }
+    }
+    m_avSyncPrevPts = mLastPts;
+    m_avSyncPrevSim = simT;
+    m_avSyncHasPrev = true;
+    if (m_audioKickUnknown) {
+        contentNote = m_audioKickResolved
+            ? "  << audio kick was UNKNOWN and the deferred restart fired"
+            : "  << audio kick UNKNOWN, deferred restart never fired";
+    }
+    skkbot2::log::info(
+        "[RENDER] av-sync: video={:.3f}s sim={:+.3f}s audio={:.3f}s "
+        "mixer={:.3f}s preroll={:.3f}s drift(audio-video)={:+.3f}s "
+        "drift(sim-video)={:+.3f}s content={:.3f}x{}", videoT, simT, audioT,
+        mixT, pre, drift, simT - videoT, contentSpeed, contentNote);
+    if (std::abs(drift) > 0.25) {
+        skkbot2::log::warn(
+            "[RENDER] av-sync: audio and video drifted apart by {:+.3f}s at "
+            "video {:.3f}s - the written track is NOT aligned with the frames",
+            drift, videoT);
+    }
+}
+
 void Renderer::audioEncodePending() {
     if (!m_audioCtx || !m_audioPkt) {
         return;
@@ -1503,7 +1580,19 @@ bool Renderer::begin(PlayLayer* layer) {
         }
     }
 
-    // v59.7: kick the song from 0 AFTER attach (which clears m_allAudioPaused
+    // v59.7: kick the song from 0 AFTER attach
+    // Meter reset BEFORE the audio-kick detection below: the flags must be
+    // fresh at the moment begin() decides whether the song could start, or
+    // the reset later in this function would erase the evidence (that exact
+    // ordering bug made the 09:26/09:28 renders report kick=clean when the
+    // song was in fact kicked through the unknown path).
+    m_audioKickUnknown = false;
+    m_audioKickResolved = false;
+    m_avSyncHasPrev = false;
+    m_avSyncPrevPts = -1;
+    m_avSyncPrevSim = 0.0;
+    // The kick section follows (v59.7): kick the song from 0 AFTER attach,
+    // which clears m_allAudioPaused
     // and unpauses the master group). FMODAudioEngine::update() re-pauses every
     // channel each frame while m_allAudioPaused==true — attach() is the gate
     // that clears it, so the engine start MUST come after. Force position 0 with
@@ -1535,6 +1624,12 @@ if (pl->m_musicPrepared) {
             // 8-channel mixer, and they get disabled one at a time.
             if (musicId <= 0) {
                 armMusicRestart();
+                // Audio-kick audit (02.11): remember that the song was NOT
+                // started in begin(); the av-sync lines and stop() report
+                // whether the deferred restart ever fired, so a silent start
+                // segment can be told from a late one in the log.
+                m_audioKickUnknown = true;
+                m_audioKickResolved = false;
                 skkbot2::log::warn(
                     "[RENDER] audio kick: musicID unknown - startMusic skipped, "
                     "deferred restart armed");
@@ -1550,6 +1645,8 @@ if (pl->m_musicPrepared) {
         }
     } else {
             armMusicRestart();
+            m_audioKickUnknown = true;
+            m_audioKickResolved = false;
             skkbot2::log::info("[RENDER] audio kick: song not prepared — "
                                "deferred restart armed");
         }
@@ -1582,6 +1679,17 @@ if (pl->m_musicPrepared) {
 
     auto* nEngine = ReplayEngine::get();
     mTps = std::max(1.0, nEngine->runtimeTickRate());
+    // BUG-96 stage 8: the speedhack is MASTER over the video timeline too.
+    // The captured value drives the render clock (driveOneFrame): one video
+    // frame always shows mSpeed x (1/fps) of LEVEL time, so the footage plays
+    // the level at exactly the speedhack rate. Changing the slider mid-render
+    // has no effect until the next render.
+    mSpeed = nEngine ? std::max(0.0, nEngine->gameSpeed) : 1.0;
+    if (mSpeed <= 0.0) {
+        mSpeed = 1.0;
+    }
+    skkbot2::log::info("[RENDER] speed captured: {:.3f}x (clock = tps x speed, "
+                       "independent of Lock Delta / Real Time)", mSpeed);
 
     mCapture.init(mWidth, mHeight);
 
@@ -1596,6 +1704,11 @@ if (pl->m_musicPrepared) {
     m_qClosed = false;
 
     mLastPts = -1;
+    m_audioAnchor = 0.0;
+    m_avSyncLogPts = -1;
+    // NOTE: m_audioKickUnknown/Resolved and m_avSyncPrev* are reset earlier in
+    // begin(), right before the audio-kick detection - resetting them here
+    // would erase the evidence the detection just wrote.
     m_videoPts = 0;          // fresh pts grid per session (see m_videoPts
                              // comment in renderer.hpp)
     mLastFramed = 0;
@@ -1754,6 +1867,17 @@ void Renderer::encodeThreadMain() {
             "[RENDER] Done -> {} ({} frames, {}x{}, {} Mbps)",
             m_lastOutputPath, mEncodedFrames.load(), mWidth, mHeight,
             mBitrateMbps);
+        if (m_audioKickUnknown) {
+            skkbot2::log::warn(
+                "[RENDER] done: audio kick was UNKNOWN at begin "
+                "(musicID not available) and the deferred restart "
+                "{} - expect the song to be {} in the first seconds of "
+                "this file",
+                m_audioKickResolved ? "fired a few frames in"
+                                    : "NEVER fired",
+                m_audioKickResolved ? "late by those frames"
+                                    : "missing / silence");
+        }
     }
     freeEncoder();
     m_encRunning.store(false);
@@ -1979,9 +2103,10 @@ bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
         mTrailerRemain -= 1.0 / mFps;
         m_audioFadeOutRemain -= 1.0 / mFps;
         // The level's own end music (if any) keeps playing at video speed вЂ”
-        // pump to the trailer's video time so the audio tail matches the
+        // pump along the same video timeline so the audio tail matches the
         // last frames.
-        audioPump(static_cast<double>(mLastPts) / mFps);
+        audioPump(m_audioAnchor + static_cast<double>(mLastPts) / mFps);
+        logAvSync(pl);
         return true;
     }
 
@@ -2082,7 +2207,7 @@ bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
 
     // ---- RENDER CLOCK ----
     // One captured frame == exactly `ticksThisFrame` physics ticks, chosen so
-    // that video frame k lands on sim tick round(k * tps / fps).
+    // that video frame k lands on sim tick round(k * tps * speed / fps).
     //
     // The old loop stepped a fixed 1/fps of SCHEDULER time and then asked the
     // game where it had landed (ptsOfFrame(computeRenderFrame())). That is not
@@ -2100,12 +2225,42 @@ bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
     // tick count differs by at most one tick - which is the correct rounding
     // of a non-integer ratio, not a defect.
     const int64_t frameIndex = mLastPts < 0 ? 0 : mLastPts + 1;
+    if (frameIndex == 0) {
+        // Video pts 0 == this level time. begin() restarts the level song from
+        // 0, so everything the mixer produces up to this level time is
+        // pre-roll (dropped inside AudioCapture) and the first encoded block
+        // starts the track where the footage starts.
+        m_audioAnchor = pl->m_gameState.m_levelTime;
+        const double trackPos = musicPositionSeconds();
+        AudioCapture::get().anchorAt(m_audioAnchor,
+                                     trackPos < 0.0 ? 0.0 : trackPos);
+        if (m_audioEnabled && musicRestartPending()) {
+            // The deferred restart is about to run on this drive tick: the
+            // song starts here, a few frames late. Record it so the av-sync
+            // lines can tell a resolved late start from a never-started one.
+            m_audioKickResolved = true;
+            skkbot2::log::warn(
+                "[RENDER] audio: the level song is not prepared at video pts 0 "
+                "- the deferred start will begin the track at position 0 a few "
+                "frames in, so the music will be late by that much (the video "
+                "timeline itself is unaffected)");
+        }
+    }
+    // One video frame shows mSpeed x (1/fps) of LEVEL time: targetTick =
+    // round(k * tps * speed / fps) -> the footage plays the level at exactly
+    // the captured speedhack rate (speed 1 -> the original pace everywhere,
+    // whatever the live timing mode is). The SpeedControlScheduler feed path
+    // contributes NO extra multiplier here (render drives are gated to the
+    // raw asked dt in advanceNormalScheduler), so this is the only place the
+    // speed enters the render.
     const int64_t targetTick = static_cast<int64_t>(std::llround(
-        static_cast<double>(frameIndex) * mTps / static_cast<double>(mFps)));
+        static_cast<double>(frameIndex) * mTps * mSpeed /
+        static_cast<double>(mFps)));
     // A frame never needs more than one frame's worth of ticks; the cap only
     // exists so a nonsense tps/fps ratio cannot freeze the render on frame 0.
-    const int64_t kClockTicksCap =
-        std::max<int64_t>(16, static_cast<int64_t>(std::ceil(mTps / mFps)) + 8);
+    const int64_t kClockTicksCap = std::max<int64_t>(
+        16, static_cast<int64_t>(
+                std::ceil(mTps * mSpeed / static_cast<double>(mFps))) + 8);
     int64_t ticksThisFrame = targetTick - static_cast<int64_t>(mClockTick);
     if (ticksThisFrame < 0) ticksThisFrame = 0;
     if (ticksThisFrame > kClockTicksCap) {
@@ -2174,12 +2329,13 @@ bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
     m_pendingFadeOut = 1.0f;
     m_pendingFrame = true;
 
-    // Advance the audio mixer to the level's game time (pump is a no-op
-    // when the time has not moved: pause, encoder backpressure, respawn
-    // rewind). The FMOD output is NOSOUND_NRT, so the mixer only advances
-    // through this pump вЂ” the audio is generated at the level's own speed
-    // and plays back at exactly 1x in the video.
-    audioPump(pl->m_gameState.m_levelTime);
+    // Advance the audio mixer along the VIDEO timeline (anchor + pts/fps), so
+    // the written audio is exactly as long as the written video by
+    // construction. The pump is a no-op while the encoder is behind
+    // (backpressure) and the mixer never runs ahead. The FMOD output is
+    // NOSOUND_NRT, so the mixer only advances through this pump.
+    audioPump(m_audioAnchor + static_cast<double>(mLastPts) / mFps);
+    logAvSync(pl);
     return true;
 }
 

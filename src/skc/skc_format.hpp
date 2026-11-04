@@ -23,14 +23,30 @@ namespace skk::skc {
 //   [ 1]      uint8    knobs1   holdCodec:2 | deltaKey:2 | holdKey:2 | scale:2
 //   [ 2]      uint8    knobs2   deltaShift:2 | holdShift:2 | budget:2 |
 //                              gapFrom:1 | hasTps:1
-//   [ 3.. 6]  float    tps           present only when hasTps is set
-//   [ 7..10]  float    fps           same block; 0 = follow tps
-//   [11..  ]  payload              range-coded click stream (skc_range.cpp)
+//   [ 3]      uint8    ext      ctx:6 | platformer:1 | reserved:1
+//                              present only when ctx == 0x3F
+//   [ 3/4..]  float    tps      exact float32, then float fps (legacy 8-byte tail)
+//                       OR -0.0f marker, double tps, float fps (16-byte tail)
+//   [ .. ]    payload          range-coded click stream (skc_range.cpp)
 //
-// So three bytes normally, eleven when either rate is not the default. The two
-// floats share one presence bit on purpose: there is no spare bit in the knobs,
-// and a second bit would cost a byte on every file just to record the answer
-// "no" that nearly all of them have to give.
+// So three bytes normally, four for a platformer macro, eleven/twelve when
+// either rate is not the default. The two floats share one presence bit on
+// purpose: there is no spare bit in the knobs, and a second bit would cost a
+// byte on every file just to record the answer "no" that nearly all of them
+// have to give.
+//
+// The platformer flag rides in an escape, not in a new header byte:
+//
+//   - ctx == 0x3F is never a real context count. The encoder's candidates use
+//     0/6/16/24/48, so no .skc written before this flag existed can contain
+//     63. A platformer macro writes ctx = 0x3F and puts the real context count
+//     plus the mode bit in the extra byte. A classic macro is written exactly
+//     as before - byte-identical to every existing .skc - and "no extension"
+//     therefore means "mode unknown", not "classic".
+//   - The cost is one byte, and only on macros that need it. A classic macro
+//     that is played on a platformer level is merely wrong-looking (it will
+//     jump and nothing else); a platformer macro played on a classic level is
+//     the case worth refusing, and that is the one that gets the flag.
 //
 // There is no magic. It was two bytes that every file paid and nothing needed:
 // the loader is reached by extension, not by sniffing, and a file that is not
@@ -130,9 +146,10 @@ struct CostProfile {
     uint64_t holdBucket = 0;
     uint64_t holdOffset = 0;
     uint64_t terminator = 0;
+    uint64_t lzHit = 0;
 
     [[nodiscard]] uint64_t total() const {
-        return kindChanged + kindSymbol + delta + hold + terminator;
+        return kindChanged + kindSymbol + delta + hold + terminator + lzHit;
     }
 };
 
@@ -190,6 +207,13 @@ inline constexpr uint32_t kGapSignBit = 0x8000u;
 
 inline constexpr uint8_t kContextPlain = 0;
 
+// ctx == 0x3F marks the optional extension byte after the knobs. The encoder
+// never chooses 63 as a context count (candidate counts are 0..48), so this is
+// free: no existing file contains it. The extension byte is
+//     realCtx:6 | platformer:1 | reserved:1
+inline constexpr uint8_t kCtxExtension = 0x3Fu;
+inline constexpr uint8_t kExtPlatformer = 0x40u;
+
 inline const char* VariantCodecName(ValueCodec codec) {
     return codec == ValueCodec::Bucket ? "bucket"
            : codec == ValueCodec::Direct32 ? "dir32"
@@ -230,6 +254,7 @@ struct Variant {
     // lists above do not have to grow a column.
     bool mixGap = false;
     bool mixHold = false;
+    bool lzMode = false;
 };
 
 // Every setting the sweep found actually winning, in one list. encode() tries
@@ -254,34 +279,64 @@ struct KnobTable {
     static constexpr uint32_t kBudget[4] = {32u, 64u, 256u, 320u};
 };
 
-// On-disk size: 3 bytes always, plus 4 more when the tps is not the default.
-// Six of the seven real macros run at exactly 240.0, which a float stores
-// exactly, so omitting it there costs nothing in fidelity and saves four bytes
-// on every ordinary macro.
+// On-disk size: 3 bytes always, plus 1 when the platformer extension is
+// present, plus 8 more when the tps is not the default. Six of the seven real
+// macros run at exactly 240.0, which a float stores exactly, so omitting it
+// there costs nothing in fidelity and saves eight bytes on every ordinary
+// macro.
 inline constexpr uint32_t kHeaderFixed = 3;
+// The extension byte that follows the knobs when ctx == kCtxExtension.
+inline constexpr uint32_t kExtBytes = 1;
+// New optional settings byte. It is present only if CBS or COS is enabled, or
+// the click stream uses half-tick units; legacy files never set the marker.
+inline constexpr uint32_t kModeBytes = 1;
+inline constexpr uint8_t kExtHasModes = 0x80u;
+inline constexpr uint8_t kModeCBS = 0x01u;
+inline constexpr uint8_t kModeCOS = 0x02u;
+inline constexpr uint8_t kModeSubticks = 0x04u;
+inline constexpr uint8_t kModePlatformerKnown = 0x08u;
+inline constexpr uint8_t kModeLz = 0x10u;
+inline constexpr uint8_t kModeLockDelta = 0x20u;
+inline constexpr uint8_t kModeRealTime = 0x40u;
+
 // The rate tail. Two floats, both always together: tps, then the display rate
 // the macro was made under (0 = follow TPS). They share one presence bit
 // because there is no spare bit in the knobs to give the second one, and a
 // second bit would cost a whole extra byte on every macro just to say "no" -
 // which is the answer for essentially all of them.
 inline constexpr uint32_t kTpsBytes = 8;
-inline constexpr float kDefaultTps = 240.0f;
+inline constexpr uint32_t kTpsDoubleBytes = 16;
+inline constexpr float kTpsDoubleMarker = -0.0f;
+inline constexpr double kDefaultTps = 240.0;
 
 struct Header {
     uint8_t knobs0 = 0;   // ctx:6 | deltaCodec:2
     uint8_t knobs1 = 0;   // holdCodec:2 | deltaKey:2 | holdKey:2 | scale:2
     uint8_t knobs2 = 0;   // deltaShift:2 | holdShift:2 | budget:2 | gapFrom:1 | hasTps:1
     // In-memory only; the wire format stores them only when the flag says so.
-    float tps = kDefaultTps;
+    double tps = kDefaultTps;
     // Display rate as a WIRE value, not a number: +0.0 means the macro carries
     // no display rate at all (FPS was off while recording), -0.0 means "FPS on,
     // follow TPS", and any n > 0 is a pinned rate. Decode it with
     // skkbot2::fps::MacroDisplayRate::fromWire - never with a comparison, since
     // -0.0 == +0.0. Not stored when neither rate differs from its default.
     float fps = 0.0f;
+    // Present only when the file carried the extension byte. `platformerMode`
+    // is meaningless unless `platformerKnown` is true: an old file (and a
+    // classic macro, which is not extended) cannot say which mode it was
+    // recorded in, and refusing those on a guess would be worse than letting
+    // them play.
+    bool platformerKnown = false;
+    bool platformerMode = false;
+    bool cbsMode = false;
+    bool cosMode = false;
+    bool subtickEncoded = false;
+    bool lzMode = false;
+    bool lockDeltaMode = true;
+    bool realTimeMode = false;
 };
 #pragma pack(pop)
-static_assert(sizeof(Header) == 11, "in-memory Header is packed: 3 + 4 + 4");
+static_assert(sizeof(Header) == 23, "in-memory Header is packed");
 
 // The candidates encode() searches. Each line is a measured winner from
 // tools/skc_sweep.cpp, or the long-standing default.
@@ -292,6 +347,9 @@ struct Action {
     uint8_t button = 1;     // 1 = Jump, 2 = Left, 3 = Right
     bool pressed = false;   // true = push, false = release
     bool player2 = false;   // false = P1, true = P2
+    // True when this transition was observed in GD's CBS half-tick callback.
+    // Ignored unless the macro declares CBS.
+    bool halfTick = false;
 
     bool operator==(const Action& other) const = default;
 };
@@ -308,12 +366,22 @@ struct Click {
     bool player2 = false;
     uint32_t delta = 0;     // frames from the previous click's anchor
     uint32_t hold = 0;      // release - press (kind == Paired only)
-
     bool operator==(const Click& other) const = default;
 };
 
 struct Macro {
     Header header;
+    // Recorded in platformer mode. `platformerKnown` is false for a file that
+    // predates the flag and for formats that do not declare a mode, which is
+    // what keeps playback validation from refusing a macro we cannot classify.
+    // Native recording and every importer that knows the answer set both.
+    bool platformerMode = false;
+    bool platformerKnown = false;
+    bool cbsMode = false;
+    bool cosMode = false;
+    bool subtickEncoded = false;
+    bool lockDeltaMode = true;
+    bool realTimeMode = false;
     std::vector<Action> actions;
 
     [[nodiscard]] double durationSeconds() const {
@@ -337,10 +405,12 @@ struct Macro {
 
 // Pairs presses with their following release per (button, player2) channel and
 // emits clicks sorted by anchor frame. Lossless for any action stream.
-[[nodiscard]] std::vector<Click> actionsToClicks(const std::vector<Action>& actions);
+[[nodiscard]] std::vector<Click> actionsToClicks(const std::vector<Action>& actions,
+                                                 bool subticks = false);
 
 // Inverse of actionsToClicks. Reconstructs absolute frames and sorts.
-[[nodiscard]] std::vector<Action> clicksToActions(const std::vector<Click>& clicks);
+[[nodiscard]] std::vector<Action> clicksToActions(const std::vector<Click>& clicks,
+                                                  bool subticks = false);
 
 // --- validation --------------------------------------------------------------
 //
@@ -359,10 +429,37 @@ struct Macro {
 [[nodiscard]] bool validateActions(const std::vector<Action>& actions,
                                    std::string& outReason);
 
+// What normalizeActionStream() changed on the way in.
+struct NormalizeReport {
+    std::size_t droppedRelease = 0; // release with no press outstanding
+    std::size_t rebuiltTaps = 0;    // duplicate press -> same-frame up + down
+    // First few rebuilt frames, purely for the import log.
+    std::vector<uint32_t> rebuiltAt;
+};
+
+// Normalises a foreign importer's raw edge stream into what validateActions()
+// demands, in place. Two repairs:
+//
+//   - a release with nothing held is dropped (other bots emit a leading
+//     "buttons are up" release, and repeated trailing releases);
+//   - a duplicate press is NOT dropped. A second press on a channel that is
+//     still held is a TAP the source format flattened onto one frame - the
+//     release physically happened but was never stored. Rebuild it as a
+//     zero-length hold on that same frame (release, then press), which is the
+//     shape the AST importer produces and the shape GD's queue has to see.
+//
+// Dropping that press instead is a replayed-input bug, not a cosmetic one:
+// measured on `Windy Road.slc` the single remaining press makes GD apply the
+// jump one physics step earlier (and through a different code path) than the
+// same timeline replayed as up+down, so the run diverges right at the first
+// click. Frames are preserved exactly - nothing is shifted.
+void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report);
+
 // --- codec ------------------------------------------------------------------
 
-// Writes the v4 format: a 12-byte header plus the self-terminating
-// range-coded click stream.
+// Writes the v4 format: the 3-byte knob header (plus the optional platformer
+// extension and rate tail) followed by the self-terminating range-coded click
+// stream.
 [[nodiscard]] std::vector<uint8_t> encode(const Macro& macro);
 
 // Same encoding path as encode(), but also reports what each part of the stream
@@ -384,7 +481,7 @@ struct Macro {
 // needed; a corrupt stream is caught by the click-count ceiling in decodeClicks.
 [[nodiscard]] std::optional<Macro> decode(const uint8_t* data, size_t size);
 
-// GUI preview: reads the 12-byte header without touching the payload.
+// GUI preview: reads the header without touching the payload.
 [[nodiscard]] std::optional<Header> readHeader(const std::filesystem::path& path);
 
 [[nodiscard]] std::optional<Macro> loadFromFile(const std::filesystem::path& path);

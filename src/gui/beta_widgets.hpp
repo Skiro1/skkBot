@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -709,7 +710,9 @@ struct NumberEditState {
     char buf[32] = {};
     bool editing = false;
     bool pendingFocus = false;  // give the InputText keyboard focus on its 1st frame
-    float lastVal = -1e30f;     // last applied value — detects the "change pop"
+    // double, not float: TPS is a double all the way down now, and a float
+    // `lastVal` would make 144.144 look unchanged on the next frame.
+    double lastVal = -1e300;    // last applied value — detects the "change pop"
     float flashStart = -1e30f;  // wall-clock time of the last value change
 };
 
@@ -727,10 +730,34 @@ inline float fontAscentPx(ImFont* font, float size) {
     return size * 0.8f;
 }
 
+// Build a printf pattern with only as many decimals as the value actually
+// needs: 240 -> "%.0f", 240.5 -> "%.1f", 360.25 -> "%.2f", 144.144 -> "%.3f".
+// The fixed "%.0f" TPS field used to hide every fractional value, and a fixed
+// "%.3f" would turn every ordinary integer TPS into "240.000". This is used by
+// both GUIs; the beta field re-seeds its edit buffer with it every idle frame.
+inline void formatNumberPattern(char* out, size_t size, double value,
+                                int maxDecimals = 6) {
+    int decimals = 0;
+    double scaled = value;
+    while (decimals < maxDecimals &&
+           std::abs(scaled - std::round(scaled)) > 1e-9) {
+        scaled *= 10.0;
+        ++decimals;
+    }
+    std::snprintf(out, size, "%%.%df", decimals);
+}
+
+// `Real` is float for the ordinary fields (speed, percentages, bitrate) and
+// double for TPS / FPS. Keeping the old float signature would have quantised a
+// typed 144.144 to 144.143997 before it ever reached the engine.
+template <typename Real>
 inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
-                        float& value, float min, float max, const char* suffix,
+                        Real& value, Real min, Real max, const char* suffix,
                         const char* fmt, bool enabled,
-                        float wheelStep = 0.0f) {
+                        Real wheelStep = Real(0),
+                        Real fineWheelStep = Real(0)) {
+    static_assert(std::is_floating_point_v<Real>,
+                  "numberField only handles floating-point values");
     const float k = uiScale();
     const ImVec2 size(width, 34.0f * k);
     const ImGuiID key = ImGui::GetID(id);
@@ -738,7 +765,10 @@ inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
     if (!enabled) edit.editing = false;
     // Keep the edit buffer synced to the live value while idle, so entering
     // edit mode always starts from the current formatted value.
-    if (!edit.editing) std::snprintf(edit.buf, sizeof(edit.buf), fmt, value);
+    if (!edit.editing) {
+        std::snprintf(edit.buf, sizeof(edit.buf), fmt,
+                      static_cast<double>(value));
+    }
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     // Box + border (amber while hovered or typing): drawn in BOTH modes, the
@@ -791,12 +821,15 @@ inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
         // invalid/escaped edit simply parses back to the old value.
         if (ImGui::IsItemDeactivated()) {
             edit.editing = false;
-            const float old = value;
+            const Real old = value;
             char* end = nullptr;
-            const float parsed = std::strtof(edit.buf, &end);
+            // strtod, not strtof: the TPS/FPS fields are double and must keep
+            // every typed digit (144.144, not 144.143997).
+            const double parsed = std::strtod(edit.buf, &end);
             if (end != edit.buf && end && *end == '\0') {
-                value = std::clamp(parsed, min, max);
-                changed = std::abs(value - old) > 1e-6f;
+                value = std::clamp(static_cast<Real>(parsed), min, max);
+                changed = std::abs(static_cast<double>(value) -
+                                   static_cast<double>(old)) > 1e-9;
             }
         }
         if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
@@ -810,7 +843,12 @@ inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
         // scrub a value — but hovering the value itself still adjusts it.
         if (hovered && ImGui::GetIO().MouseWheel != 0.0f) {
             const float w = ImGui::GetIO().MouseWheel;
-            const float step = wheelStep > 0.0f ? wheelStep : (max - min) * 0.02f;
+            // Shift is the fine-adjust modifier: a TPS field steps 0.25 per
+            // notch normally and 0.001 with Shift held, so 240.5 and 360.25 are
+            // two/one notches away and 144.144 is reachable without typing.
+            Real step = (ImGui::GetIO().KeyShift && fineWheelStep > Real(0))
+                ? fineWheelStep
+                : (wheelStep > Real(0) ? wheelStep : (max - min) * Real(0.02));
             value = std::clamp(value + (w > 0.0f ? step : -step), min, max);
             ImGui::GetIO().MouseWheel = 0.0f;
             changed = true;
@@ -860,8 +898,8 @@ inline bool numberField(ImFont* font, const char* id, ImVec2 pos, float width,
     // Every value change (wheel step or committed edit) fires a short accent
     // pop around the field: a concentric ring that flashes in and fades out.
     // Renewed on every change, so scrubbing with the wheel pulses in rhythm.
-    if (std::abs(value - edit.lastVal) > 1e-6f) {
-        edit.lastVal = value;
+    if (std::abs(static_cast<double>(value) - edit.lastVal) > 1e-9) {
+        edit.lastVal = static_cast<double>(value);
         edit.flashStart = static_cast<float>(ImGui::GetTime());
     }
     const float age = static_cast<float>(ImGui::GetTime()) - edit.flashStart;

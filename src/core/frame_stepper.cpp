@@ -331,8 +331,8 @@ bool FrameStepper::updateScheduler(cocos2d::CCScheduler* scheduler, float dt) {
     //
     // The step size must match what PLAYBACK advances for the same tick, and
     // both playback paths already fold in the level's time warp:
-    //   physicsbypass.cpp:500-501  timestep = clamp(m_timeWarp, 0, 1) * fixedDelta
-    //   physicsbypass.cpp:780-781  same, in the getModifiedDelta hook
+    //   physicsbypass.cpp            fixedPhysicsDelta(timeWarp), rounded once
+    //                                 to the float quantum GD integrates
     //   GDH replay.cpp:291         timestep = min(m_timeWarp, 1.0) * fixed_dt
     // Using a bare fixedSimulationDelta() here skipped the warp factor, so on a
     // slowed-down level (timeWarp < 1) a manual step advanced more game time than
@@ -342,12 +342,11 @@ bool FrameStepper::updateScheduler(cocos2d::CCScheduler* scheduler, float dt) {
     auto* engine = ReplayEngine::get();
     float stepDt = dt;
     if (engine) {
-        float warped = engine->fixedSimulationDelta();
+        float warped = static_cast<float>(engine->fixedPhysicsDelta());
         if (auto* pl2 = PlayLayer::get()) {
             const double warp =
                 std::clamp(static_cast<double>(pl2->m_gameState.m_timeWarp), 0.0, 1.0);
-            const float scaled =
-                static_cast<float>(warp * static_cast<double>(engine->fixedSimulationDelta()));
+            const float scaled = static_cast<float>(engine->fixedPhysicsDelta(warp));
             if (scaled > 0.0f && std::isfinite(scaled)) {
                 warped = scaled;
             }
