@@ -443,9 +443,7 @@ void Renderer::prepareFfmpegDropIn() {
            "  avdevice-63.dll\n\n"
            "You can download them automatically in the RENDER tab (press DOWNLOAD FFMPEG),\n"
            "or download dll.zip manually and extract the files directly here.\n\n"
-           "Download mirrors:\n"
-           "  - Codeberg: https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip\n"
-           "  - GitHub:   https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip\n\n"
+           "Download mirror:\n"           "  - GitHub: https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip\n\n"
            "After placing the files, click RELOAD FFMPEG in the RENDER tab.\n";
 }
 

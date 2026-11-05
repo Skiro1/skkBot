@@ -25,9 +25,9 @@ that replaces the cocos frontend of the old skkBot.
   MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–200 Mbps, audio AAC/MP3/Opus/Vorbis/
   FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**.
   FFmpeg DLLs are kept outside the .geode file to minimize size. The bot can automatically test
-  mirror download speed (GitHub vs Codeberg), download and install the required DLLs to
+  mirror download speed (GitHub), download and install the required DLLs to
   `geode/mods/skiro1.skk-bot/ffmpeg/` on the fly.
-  Manual links: [Codeberg dll.zip](https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip), [GitHub dll.zip](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip).
+  Manual link: [GitHub dll.zip](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip).
 - **Modern ImGui GUI**: intuitive modern interface with tab navigation (Record,
   Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
 - **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,

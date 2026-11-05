@@ -98,8 +98,7 @@ public:
 private:
     FFmpegDownloader() {
         m_mirrors = {
-            { "Codeberg", "https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip" },
-            { "GitHub",   "https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip" }
+            { "GitHub", "https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip" }
         };
     }
 
@@ -215,7 +214,9 @@ private:
         m_statusMessage = "Extracting FFmpeg DLLs...";
         skkbot2::log::info("[FFMPEG-DL] Download finished ({} bytes), writing to disk", dlRes.data().size());
 
-        auto saveRes = dlRes.into(zipPath);
+        // Geode v6: file-API принимают asp::fs::PathView (UTF-8 строка) —
+        // конвертируем через наш мост.
+        auto saveRes = dlRes.into(skk::pathToUtf8(zipPath));
         if (!saveRes) {
             m_lastError = "Failed to save dll.zip: " + saveRes.unwrapErr();
             m_state.store(State::Failed);
@@ -226,7 +227,8 @@ private:
         }
 
         // Unzip into ffmpegDir
-        auto unzipRes = geode::utils::file::Unzip::intoDir(zipPath, ffmpegDir, true /* deleteZipAfter */);
+        auto unzipRes = geode::utils::file::Unzip::intoDir(
+            skk::pathToUtf8(zipPath), skk::pathToUtf8(ffmpegDir), true /* deleteZipAfter */);
         if (!unzipRes) {
             m_lastError = "Unzip failed: " + unzipRes.unwrapErr();
             m_state.store(State::Failed);

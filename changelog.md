@@ -53,7 +53,7 @@ Major feature update introducing the ultra-compressed SKC format, universal thir
   - Added Safe Mode toggle to guard against accidental inputs and unintended state mutations.
 - **Dynamic FFmpeg Downloader**:
   - FFmpeg binaries are no longer packed inside the `.geode` file (slimming package size down from hundreds of MBs to ~3 MB).
-  - Built-in mirror speed benchmark automatically tests and downloads the required libraries from GitHub or Codeberg on demand.
+  - Built-in mirror speed benchmark automatically tests and downloads the required libraries from GitHub on demand.
 - **SKK Format Updated (SKK3)**:
   - Added target display FPS field to `.skk` metadata alongside TPS and physics state bundles.
 

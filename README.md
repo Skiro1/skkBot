@@ -29,7 +29,7 @@ renderer using bundled FFmpeg — no extra downloads needed.
   libx265, AV1, VP9/VP8, MPEG-4, ProRes, MJPEG, ...); resolution presets (720p–8K),
   1–240 FPS, bitrate 5–200 Mbps, fade in/out.
   *FFmpeg DLLs are not bloated inside the .geode file*; the mod can automatically benchmark
-  mirror speeds (GitHub vs Codeberg) and download/unpack them directly into `geode/mods/skiro1.skk-bot/ffmpeg/` on demand.
+  mirror speeds (GitHub) and download/unpack them directly into `geode/mods/skiro1.skk-bot/ffmpeg/` on demand.
 - **Audio recording**: AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC3, E-AC3 (as available in the
   FFmpeg build); **level audio is captured from block 0**
 - **Modern ImGui GUI**: intuitive modern interface enabled by default with tab
@@ -41,16 +41,16 @@ renderer using bundled FFmpeg — no extra downloads needed.
 
 ## Installation
 1. Install [Geode](https://geode-sdk.org)
-2. Download `skiro1.skk-bot2.geode` from [Releases](https://codeberg.org/Skiro1/skkBot/releases)
+2. Download `skiro1.skk-bot2.geode` from [Releases](https://github.com/Skiro1/skkBot/releases)
 3. Place it in `GeometryDash\geode\mods`
 4. Launch Geometry Dash
 5. **Video Rendering (FFmpeg)**:
-   - When opening the **Render** tab for the first time, click **DOWNLOAD FFMPEG**. The mod automatically compares download speeds between mirrors (GitHub vs Codeberg), selects the faster one, and unpacks the 7 required DLLs into:
+   - When opening the **Render** tab for the first time, click **DOWNLOAD FFMPEG**. The mod automatically compares download speeds between mirrors (GitHub), selects the faster one, and unpacks the 7 required DLLs into:
      `%localappdata%\GeometryDash\geode\mods\skiro1.skk-bot\ffmpeg\`
    - If automatic download fails, you can download `dll.zip` or `dll.rar` manually from:
-     - [Codeberg Release (dll.zip)](https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.zip)
      - [GitHub Release (dll.zip)](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip)
-     - [Codeberg Release (dll.rar)](https://codeberg.org/Skiro1/skkBot/releases/download/ffmpeg/dll.rar)
+     - [GitHub Release (dll.zip)](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip)
+     - [GitHub Release (dll.rar)](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.rar)
      - [GitHub Release (dll.rar)](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.rar)
      and extract the 7 DLL files directly into the `ffmpeg` folder, then click **RELOAD FFMPEG**.
 
@@ -91,8 +91,8 @@ Geode SDK). `CMakeLists.txt` is included; a release `.geode` package is produced
 Geode build setup.
 
 ## Links
-- [Codeberg](https://codeberg.org/Skiro1/skkBot)
-- [Issues](https://codeberg.org/Skiro1/skkBot/issues)
+- [GitHub](https://github.com/Skiro1/skkBot)
+- [Issues](https://github.com/Skiro1/skkBot/issues)
 
 ## Acknowledgements
 
