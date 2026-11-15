@@ -31,6 +31,8 @@ set(SKKBOT2_SOURCES
     src/format/echo/echo.cpp
     src/format/ast/ast.cpp
     src/core/checkpoint_handler.cpp
+    src/core/memtrack.cpp
+    src/core/memtrack_alloc.cpp
     src/core/replay_engine.cpp
     src/core/step_trace.cpp
     src/core/checkpoint_system.cpp
@@ -39,6 +41,7 @@ set(SKKBOT2_SOURCES
     src/core/practice_fix_bridge.cpp
     src/core/gd_option_tracer.cpp
     src/core/frame_stepper.cpp
+    src/core/step_profiler.cpp
     src/core/playback_fps.cpp
     src/core/keybinds.cpp
     src/core/autosave_recorder.cpp
@@ -53,6 +56,7 @@ set(SKKBOT2_SOURCES
     src/hacks/music_speed.cpp
     src/hacks/layout_mode.cpp
     src/hacks/safe_mode.cpp
+    src/hacks/auto_checkpoint_tps.cpp
     src/trajectory/show_trajectory.cpp
     src/physics/step_grid_hooks.cpp
     src/physics/near_movers.cpp
@@ -67,6 +71,7 @@ set(SKKBOT2_SOURCES
     src/skc/skc_hooks.cpp
     src/skc/skc_dash_determinism.cpp
     src/skc/skc_range.cpp
+    src/skc/skc_rng.cpp
 )
 
 if (WIN32)
@@ -250,7 +255,7 @@ set(HAS_IMGUI ON CACHE BOOL "Use vendored imgui from libs/imgui" FORCE)
 CPMAddPackage(
     NAME gd-imgui-cocos
     GITHUB_REPOSITORY matcool/gd-imgui-cocos
-    GIT_TAG b93f08ccef778a53ebba09b20c347f6a63980119
+    GIT_TAG 934958c68b1f050a8976d893584fa71368c1df1f
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${gd-imgui-cocos_SOURCE_DIR}/src)
 
@@ -288,7 +293,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE MOD_VERSION="${CMAKE_PROJECT_
 
 if (WIN32)
     CPMAddPackage("gh:cursey/safetyhook#2f28386")
-    target_link_libraries(${PROJECT_NAME} ${SKKBOT2_LINK_LIBRARIES} Crypt32 Advapi32 dwmapi safetyhook ${SKKBOT2_WAMR})
+    target_link_libraries(${PROJECT_NAME} ${SKKBOT2_LINK_LIBRARIES} Crypt32 Advapi32 dwmapi winmm safetyhook ${SKKBOT2_WAMR})
 
     # Always emit a PDB for the DLL. Geode's crash reports only carry raw
     # offsets (skiro1.skk-bot.dll + 0x...), which are unresolvable without a
@@ -296,7 +301,13 @@ if (WIN32)
     # trace nobody could attribute. The PDB is written next to the binary; put
     # it in the .geode zip so the loader can find it next to the DLL.
     target_compile_options(${PROJECT_NAME} PRIVATE /Zi /FS)
+    # C1060 (не хватает кучи компилятора) на гигантских TU (step_trace,
+    # replay_engine) с PCH из SDK v6: /Zm расширяет лимит кучи cl.exe.
+    target_compile_options(${PROJECT_NAME} PRIVATE /Zm250)
     target_link_options(${PROJECT_NAME} PRIVATE /DEBUG)
+    # MAP-файл для офлайн-мапинга RVA сэмпл-профилировщика (Step Profiler):
+    # отчёт даёт RVA внутри skiro1.skk-bot.dll, по MAP находим функцию.
+    target_link_options(${PROJECT_NAME} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/skkBot2.map")
     set_property(TARGET ${PROJECT_NAME}
                  PROPERTY PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/Release")
 elseif (APPLE)

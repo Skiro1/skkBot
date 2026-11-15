@@ -50,35 +50,32 @@ namespace ReplayStorage {
             name.pop_back();
         }
 
-        for (char& c : name) {
-            if (c == ':' || c == '*' || c == '?' || c == '/' || c == '\\' || c == '|' || c == '<' || c == '>' || c == '"') {
-                c = '_';
+        size_t write = 0;
+        for (size_t read = 0; read < name.size(); ++read) {
+            unsigned char ch = static_cast<unsigned char>(name[read]);
+            if (ch < 0x20 || ch == 0x7F) {
+                continue;
             }
+            if (ch == ':' || ch == '*' || ch == '?' || ch == '/' || ch == '\\' ||
+                ch == '|' || ch == '<' || ch == '>' || ch == '"') {
+                ch = '_';
+            }
+            name[write++] = static_cast<char>(ch);
+        }
+        name.resize(write);
+
+        constexpr size_t kMaxNameBytes = 120;
+        if (name.size() > kMaxNameBytes) {
+            size_t cut = kMaxNameBytes;
+            while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0u) == 0x80u) {
+                --cut;
+            }
+            name.resize(cut);
         }
 
         return name;
     }
 
-    // Does this directory already hold a macro called `stem` IN THIS FORMAT?
-    //
-    // THE RULE, and it is one rule for both engines (пользователь, 19.10.2026):
-    // a collision is an EXACT match of name AND extension.
-    //
-    //   * .skc saved where awd.skc already exists  -> collision -> awd_1.skc
-    //   * .skc saved where only awd.skk exists     -> NOT a collision -> awd.skc
-    //
-    // The library is keyed by name AND format and lists DF2.skk and DF2.skc as
-    // two separate rows (see the loadMacro comment in beta_actions.hpp: "both
-    // DF2.skk and DF2.skc can exist"), so a save must resolve collisions the
-    // same way. This used to compare stems only, and an awd.txt in the folder
-    // made every save come out as awd_1 - a name the user never typed and no
-    // list row points at.
-    //
-    // There is deliberately NO "except the macro itself, overwrite in place"
-    // escape hatch. It was here for the SKK path (persistedName) and it made
-    // the outcome depend on invisible state: the same request could overwrite
-    // or could append a number, and which one happened depended on whether the
-    // macro had been loaded from disk. If it says -1 it means -1, every time.
     inline bool replayFileExists(
         std::filesystem::path const& directory,
         std::string_view stem,
@@ -124,10 +121,6 @@ namespace ReplayStorage {
             return baseName;
         }
 
-        // _n+1: walk up from 1 until a name free IN THIS FORMAT appears. The
-        // walk restarts at 1 on every save instead of remembering a high-water
-        // mark, because deleting awd_1.skc should hand that name back - and
-        // because no counter can exist that could disagree with the disk.
         for (int suffix = 1;; ++suffix) {
             std::string candidate = baseName + "_" + std::to_string(suffix);
             if (!replayFileExists(directory, candidate, extension)) {
@@ -245,9 +238,6 @@ struct PlayerEnvironmentState {
     int stateDartSlide = 0;
     int stateFlipGravity = 0;
     int stateForce = 0;
-    // Flip-tween time bases (GDH checkpointData captures these too): the
-    // gravity-flip and spider-flip animations interpolate against them, so a
-    // tween in flight at a sync point replays mirrored unless restored.
     double lastFlipTime = 0.0;
     double lastSpiderFlipTime = 0.0;
     bool dualContext = false;
@@ -265,8 +255,8 @@ struct AnchorRngState {
     uintptr_t fastRandState = 0;
     bool locked = false;
     uint32_t seed = 0;
-    uint64_t shakeState = 0;      // GD+0x6C2EE0 (shake camera LCG)
-    uint64_t teleportState = 0;   // GD+0x6C2EF8 (teleport portal LCG)
+    uint64_t shakeState = 0;
+    uint64_t teleportState = 0;
 };
 
 struct PlaybackAnchor {
@@ -292,9 +282,6 @@ struct CheckpointStateBundle {
     AnchorRngState rng;
     uint8_t player1LatchMask = 0;
     uint8_t player2LatchMask = 0;
-    // Session variance table (m_varianceValues) snapshot: non-zero slots at
-    // checkpoint time. Restoring rewinds the whole table to that state so
-    // offset-variance objects rebuild identically after a checkpoint load.
     std::vector<std::pair<uint16_t, float>> variance;
     struct TimedAutoclickerPlayerState {
         bool holding = false;
@@ -304,27 +291,11 @@ struct CheckpointStateBundle {
     bool timedAutoclickerActive = false;
     TimedAutoclickerPlayerState timedAutoclicker[2];
 
-    // --- Practice-fix extended fields (P1) ---
-    // Full player state for practice checkpoint restore (silicate/GDH pattern)
     bool hasFullState = false;
 
-    // The COMPLETE per-player snapshot. fullP1/fullP2 below are the REDUCED set
-    // that round-trips through the SKK3 wire format; this struct carries every
-    // field the physics actually reads back — notably m_shipRotation /
-    // m_rotationSpeed (the ship's flight angle), m_fallStartY, m_unkAngle1 and
-    // the full flag/colour/wave-trail state. Without the flight angle, a
-    // practice respawn on the ship restarts the character LEVEL instead of
-    // banked, so the trajectory diverges and the moment has to be redone from
-    // scratch (BUG-13). Only populated on the live capture path (the wire
-    // format cannot hold it yet); hasFullPlayer gates its use.
     FullPlayerCheckpoint fullPlayer1;
     FullPlayerCheckpoint fullPlayer2;
     bool hasFullPlayer = false;
-    // P2's full snapshot is only stored when a dual/2p context actually
-    // provides m_player2 at capture time (see CheckpointStateManager::store).
-    // FullPlayerCheckpoint's colour fields default to {0,0,0}, so applying an
-    // uncaptured (default-constructed) fullPlayer2 to a player that later
-    // exists paints it COMPLETELY BLACK (BUG-18). Gate the P2 apply on this.
     bool hasFullPlayer2 = false;
     struct FullP1 {
         float p_x = 0.f, p_y = 0.f;
@@ -424,21 +395,16 @@ struct CheckpointStateBundle {
         bool holdingLeft = false;
     } fullP2;
 
-    // RNG state
     uint64_t seedState = 0;
     uint64_t shakeRandomState = 0;
     uint64_t teleportRandomState = 0;
 
-    // Broken objects (unique IDs)
     std::vector<GameObject*> brokenObjects;
 
-    // EMS persistent items
     std::vector<std::pair<int, int>> persistentItems;
 
-    // Click release state (GDH pattern, 6 bools: 3 per player)
     std::array<bool, 6> clickReleased = { true, true, true, true, true, true };
 
-    // GJBaseGameLayer / PlayLayer physics & collision state (Deep Practice Fix)
     GameObject* player1CollisionBlock = nullptr;
     GameObject* player2CollisionBlock = nullptr;
     double extraDelta = 0.0;
@@ -446,7 +412,16 @@ struct CheckpointStateBundle {
     int unk32ec = 0;
     int currentStep = 0;
     float unk3380 = 0.f;
-    gd::unordered_map<int, GameObjectPhysics> gameObjectPhysics;
+    skk::GameObjectPhysicsSnapshotMap gameObjectPhysics;
+
+    float timeWarp = 1.0f;
+    float queuedTimeWarp = 0.0f;
+    float timeWarpRelated = 0.0f;
+    float timeModRelated = 0.0f;
+    bool timeModRelated2 = false;
+    bool gravityRelated = false;
+    double attemptTime = 0.0;
+    bool hasLayerState = false;
 };
 
 struct MacroAction : gdr::Input {
@@ -491,11 +466,6 @@ public:
     bool recordedFromStartPos = false;
     bool platformerMode = false;
     bool hasPlatformerModeMetadata = false;
-    // Display rate this sequence was recorded under; 0 = follow `framerate`.
-    // Written to the .gdr extension only when it differs, same rule and same
-    // reason as the SKK3 header: a macro that ran at its own tick rate has
-    // nothing to add, and a file that records the answer "no" every time is a
-    // file nobody reads.
     double displayFps = 0.0;
     bool lockDelta = true;
     bool realTime = false;
@@ -570,18 +540,15 @@ public:
         }
 
         std::string const extension = useJson ? ".gdr.json" : ".gdr";
-        // Resolved AFTER `extension` exists, because the uniqueness check is
-        // per-format: a GDR save must not be renamed because an awd.skk is
-        // sitting next to it.
         pending.name = ReplayStorage::makeUniqueReplayName(pending.name, extension);
         pending.persistedName = pending.name;
-        auto outputPath = dir / (pending.name + extension);
+        auto outputPath = dir / skk::stringToPath(pending.name + extension);
         auto bytes = pending.exportData(useJson);
         if (bytes.empty()) {
             skkbot2::log::error("Could not serialize replay '{}'", skk::pathToUtf8(outputPath));
             return false;
         }
-        auto writeResult = utils::file::writeBinarySafe(outputPath, bytes);
+        auto writeResult = utils::file::writeBinarySafe(skk::pathToUtf8(outputPath), bytes);
         if (!writeResult) {
             skkbot2::log::error("Could not write replay file '{}': {}",
                 skk::pathToUtf8(outputPath), writeResult.unwrapErr());
@@ -593,12 +560,6 @@ public:
     }
 
     void truncateAfter(int tick) {
-        // Remove inputs at >= tick (inclusive) — same rationale as
-        // SkMacro::truncateAfter: closeSeamHoldEdges + syncPhysicalHolds will
-        // re-add the proper seam release/press at `tick`.  Keeping them caused
-        // inputs to accumulate by +2 per death loop (BUG: inputs never decrease
-        // on respawn).  Anchors use > tick (exclusive) to preserve the boundary
-        // anchor for captureResealBoundaryFrame (BUG-06 seam seal).
         auto inputIt = std::lower_bound(inputs.begin(), inputs.end(), tick,
             [](MacroAction const& action, int t) { return static_cast<int>(action.frame) < t; });
         inputs.erase(inputIt, inputs.end());

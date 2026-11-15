@@ -1,24 +1,8 @@
-// Wave Trail Fix — a self-contained, always-on, visual-only rework of the dart
-// (wave) trail. Combines two reference mods into one feature:
-//
-//   drag-fix  (geode-wave-trail-drag-fix, nytelytee):
-//     Vanilla GD only adds streak points from PlayerObject::postCollision, so
-//     the trail breaks whenever the player moves vertically without colliding
-//     (noclip, spider rings/pads, teleports, mid-air mode swaps). We rebuild
-//     the points from PlayerObject::updateRotation instead — it runs every
-//     step regardless of collisions, so the trail is complete and straight.
-//
-//   draw-fix  (geode-wave-trail-draw-fix, nytelytee):
-//     Replaces HardStreak::updateStroke with a miter-joined band renderer that
-//     supports sub-parts: a colored core plus a white outline. Optional color
-//     override and per-part opacity.
-//
-// The feature is visual only: it never touches player physics, input, or the
-// engine's replay state. Works in PlayLayer and in the LevelEditor playtest,
-// independent of record / play / noclip.
+﻿
 
 #include <Geode/Geode.hpp>
 #include "../core/hotpath.hpp"
+#include "../skc/skc_bot.hpp"
 #include "../trajectory/trajectory.hpp"
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -27,13 +11,12 @@
 
 #include "skkBot.hpp"
 
+#include <chrono>
+
 using namespace geode::prelude;
 
 namespace skk::wavetrail {
 
-// ---------------------------------------------------------------------------
-// Settings access (kept on ReplayEngine so both GUI shells stay in sync).
-// ---------------------------------------------------------------------------
 static bool fixEnabled() {
     auto* engine = ReplayEngine::get();
     return engine && engine->waveTrailFix;
@@ -49,19 +32,59 @@ static bool drawEnabled() {
     return engine && engine->waveTrailFix && engine->waveTrailDrawFix;
 }
 
-// HardStreak is only meaningful on the level layer; LevelEditorLayer inherits
-// GJBaseGameLayer and the editor playtest uses the same PlayerObject, so the
-// drag fix applies there too. The draw fix applies everywhere the streak is
-// drawn.
 static bool trailContextActive() {
     return GJBaseGameLayer::get() != nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Sub-part configuration for the draw fix. A part is one band of the trail,
-// described as an offset range [-1..1] relative to the streak's half-width,
-// with one or more colored sub-parts (weights).
-// ---------------------------------------------------------------------------
+struct WtCounters {
+    uint64_t dragAdds = 0;
+    uint64_t dragSteps = 0;
+    uint64_t skipZero = 0;
+    uint64_t skipJump = 0;
+    uint64_t placeSuppressed = 0;
+    std::chrono::steady_clock::time_point lastPrint{};
+    bool timerArmed = false;
+};
+static WtCounters g_wt;
+
+static void wtResetCounters() { g_wt = {}; }
+
+static const char* wtModeLabel() {
+    auto& skcBot = skk::skc::Bot::get();
+    if (skcBot.isRecording()) return "SKC-record";
+    if (skcBot.isPlaying()) return "SKC-play";
+    auto* engine = ReplayEngine::get();
+    if (engine && engine->engineMode == MODE_CAPTURE) return "SKK-record";
+    if (engine && engine->engineMode == MODE_EXECUTE) return "SKK-play";
+    return "vanilla";
+}
+
+static void wtLogSession() {
+    wtResetCounters();
+    skkbot2::log::info(
+        "[WT] session: mode={} fix={} drag={} draw={} context={}",
+        wtModeLabel(), fixEnabled() ? 1 : 0, dragEnabled() ? 1 : 0,
+        drawEnabled() ? 1 : 0, trailContextActive() ? "level" : "no-layer");
+}
+
+static void wtMaybePrintStats() {
+    if (!g_wt.timerArmed) {
+        g_wt.lastPrint = std::chrono::steady_clock::now();
+        g_wt.timerArmed = true;
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_wt.lastPrint < std::chrono::seconds(10)) return;
+    g_wt.lastPrint = now;
+    if (g_wt.dragSteps == 0 && g_wt.dragAdds == 0 && g_wt.placeSuppressed == 0)
+        return;
+    skkbot2::log::info(
+        "[WT] stats 10s: mode={} dartSteps={} dragAdds={} skipZero={} "
+        "skipJump={} placeSuppressed={}",
+        wtModeLabel(), g_wt.dragSteps, g_wt.dragAdds, g_wt.skipZero,
+        g_wt.skipJump, g_wt.placeSuppressed);
+}
+
 struct Subpart {
     std::optional<ccColor3B> color;
     float weight = 1.0f;
@@ -80,9 +103,6 @@ struct Part {
     std::vector<Subpart> subparts;
 };
 
-// ---------------------------------------------------------------------------
-// Geometry helpers (ported from draw-fix utilities).
-// ---------------------------------------------------------------------------
 static std::optional<CCPoint> lineSegmentIntersection(CCPoint s1a, CCPoint s1b,
                                                       CCPoint s2a, CCPoint s2b) {
     if (s1a == s1b || s2a == s2b) return std::nullopt;
@@ -100,30 +120,34 @@ static std::optional<CCPoint> lineSegmentIntersection(CCPoint s1a, CCPoint s1b,
     return s1a + d1 * t1;
 }
 
-// Offset a point by distance along the miter of the two adjacent segments.
 static CCPoint offsetPoint(std::optional<CCPoint> prev, CCPoint cur,
                            std::optional<CCPoint> next, float distance) {
     if (!prev) {
-        const CCPoint normal = (cur - *next).getPerp().normalize();
+        const CCPoint delta = cur - *next;
+        if (delta.getLength() <= 0.0001f) return cur;
+        const CCPoint normal = delta.getPerp().normalize();
         return cur + normal * distance;
     }
     if (!next) {
-        const CCPoint normal = (cur - *prev).getRPerp().normalize();
+        const CCPoint delta = cur - *prev;
+        if (delta.getLength() <= 0.0001f) return cur;
+        const CCPoint normal = delta.getRPerp().normalize();
         return cur + normal * distance;
     }
-    const CCPoint n1 = (cur - *prev).getRPerp().normalize();
-    const CCPoint n2 = (cur - *next).getPerp().normalize();
-    const CCPoint bisector = (n1 + n2).normalize();
+    const CCPoint delta1 = cur - *prev;
+    const CCPoint delta2 = cur - *next;
+    if (delta1.getLength() <= 0.0001f || delta2.getLength() <= 0.0001f) return cur;
+    const CCPoint n1 = delta1.getRPerp().normalize();
+    const CCPoint n2 = delta2.getPerp().normalize();
+    const CCPoint bisectorRaw = n1 + n2;
+    if (bisectorRaw.getLength() <= 0.0001f) {
+        return cur + n1 * distance;
+    }
+    const CCPoint bisector = bisectorRaw.normalize();
     const float length = distance / std::sqrt(0.5f + 0.5f * n1.dot(n2));
     return cur + bisector * length;
 }
 
-// Offset a whole path, returning the offset points and a per-segment label
-// (true = offset segment runs the same direction as its source segment).
-// Zero-allocation: output vectors are caller-owned scratch (cleared, capacity
-// reused between calls) - this is the same shape Echo uses with its static
-// g_path/g_bands buffers, instead of rebuilding fresh std::vectors on every
-// updateStroke call (that churn was the bulk of our 166us/call).
 static void createOffset(const std::vector<CCPoint>& path, float offset,
                          float extensionLength,
                          std::vector<CCPoint>& points, std::vector<bool>& labels) {
@@ -138,32 +162,37 @@ static void createOffset(const std::vector<CCPoint>& path, float offset,
         if (i != 0) previousPoint = path[i - 1];
         if (i != path.size() - 1) nextPoint = path[i + 1];
 
-        // Extend the end caps slightly to hide artifacts, but never push the
-        // trail visibly past the player.
         if (!previousPoint) {
-            currentPoint -= (*nextPoint - currentPoint).normalize() * extensionLength;
+            const CCPoint delta = *nextPoint - currentPoint;
+            if (delta.getLength() > 0.0001f)
+                currentPoint -= delta.normalize() * extensionLength;
         } else if (!nextPoint) {
             const float length = previousPoint->getDistance(currentPoint);
-            currentPoint += (currentPoint - *previousPoint).normalize() *
-                            ((length > extensionLength + 5.0f) ? -5.0f
-                                                               : extensionLength - length);
+            const CCPoint delta = currentPoint - *previousPoint;
+            if (delta.getLength() > 0.0001f)
+                currentPoint += delta.normalize() *
+                                ((length > extensionLength + 5.0f) ? -5.0f
+                                                                   : extensionLength - length);
         }
 
         const CCPoint point = offsetPoint(previousPoint, currentPoint, nextPoint, offset);
         points.push_back(point);
         if (!previousPoint) continue;
-        const CCPoint actualDirection = (currentPoint - *previousPoint).normalize();
+        const CCPoint deltaDir = currentPoint - *previousPoint;
+        const CCPoint actualDirection =
+            deltaDir.getLength() > 0.0001f ? deltaDir.normalize() : CCPoint{1.0f, 0.0f};
         CCPoint trailDirection = point - points[points.size() - 2];
         if (trailDirection.isZero()) {
             labels.push_back(true);
             continue;
         }
-        trailDirection = trailDirection.normalize();
+        const float trailLen = trailDirection.getLength();
+        if (trailLen > 0.0001f)
+            trailDirection = trailDirection / trailLen;
         labels.push_back(actualDirection.dot(trailDirection) < -1.0f + 0.000001f ? false : true);
     }
 }
 
-// Remove self-intersections introduced by the offset on U-turns.
 static void fixPoints(std::vector<CCPoint>& path, float offset,
                       std::vector<CCPoint>& points, std::vector<bool>& labels,
                       std::vector<CCPoint>& otherPoints) {
@@ -231,10 +260,6 @@ static void fixPoints(std::vector<CCPoint>& path, float offset,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trail configuration. The default draws the player-colored core plus a white
-// outline only while the streak is non-solid (the vanilla "hollow" look).
-// ---------------------------------------------------------------------------
 static std::vector<Part> buildConfiguration() {
     auto* engine = ReplayEngine::get();
     std::vector<Part> config;
@@ -266,25 +291,14 @@ static std::vector<Part> buildConfiguration() {
     return config;
 }
 
-} // namespace skk::wavetrail
+}
 
-// ---------------------------------------------------------------------------
-// DRAW FIX — HardStreak::updateStroke override.
-// ---------------------------------------------------------------------------
 class $modify(WTSHardStreak, HardStreak) {
     struct Fields {
         std::vector<skk::wavetrail::Part> configuration;
-        // Zero-allocation scratch, reused between calls. Two nodes in dual mode
-        // each get their own Fields, so no interleave hazard.
         std::vector<CCPoint> trailPath;
         std::vector<CCPoint> firstPts, lastPts, prevPts, nextPts;
         std::vector<bool> firstLbl, lastLbl, prevLbl, nextLbl;
-        // Mesh-identity snapshot: the vertex buffer is persistent while the
-        // node lives, so when nothing that feeds the geometry changed since
-        // the last build, the whole O(N) rebuild can be skipped - the GPU
-        // still redraws the stored mesh every frame. This is what keeps
-        // repeated activateStreak -> resumeStroke calls (vanilla fires one per
-        // ring activation, ~2000+/s in spam) from re-tessellating the trail.
         bool meshValid = false;
         bool sDrawStreak = false;
         bool sSolid = false;
@@ -293,15 +307,12 @@ class $modify(WTSHardStreak, HardStreak) {
         float sPulse = -1.0f;
         float sOpacity = -1.0f;
         ccColor3B sColor{0, 0, 0};
-        CCPoint sPosition; // trail node position is an input too (SKC moves it)
+        CCPoint sPosition;
         size_t sCount = 0;
         CCPoint sCurrent;
         bool haveSnapshot = false;
     };
 
-    // CCDrawNode::drawTriangle is not exported in this SDK build, so the
-    // vertices are pushed into the shared buffer directly (same approach as
-    // the reference draw-fix mod).
     void drawTriangle(CCPoint const& p1, CCPoint const& p2, CCPoint const& p3,
                       ccColor4B color) {
         if (m_nBufferCount + 3u >= m_uBufferCapacity) {
@@ -322,13 +333,6 @@ class $modify(WTSHardStreak, HardStreak) {
             return;
         }
 
-        // Mesh-identity check. Vanilla fires updateStroke per ring activation
-        // (activateStreak -> resumeStroke -> updateStroke(0), ~2000+/s in
-        // spam). The data feeding the geometry rarely changes between calls,
-        // and the vertex buffer is persistent while the node lives, so an
-        // unchanged snapshot means the stored mesh is already correct: skip
-        // the whole O(N) rebuild. The GPU still redraws the stored mesh every
-        // frame, so visuals are untouched.
         const ccColor3B colorNow = getColor();
         if (m_fields->meshValid && m_fields->sDrawStreak == m_drawStreak
             && m_fields->sCount == m_pointArray->count()
@@ -342,14 +346,11 @@ class $modify(WTSHardStreak, HardStreak) {
             return;
         }
 
-        // Unlike vanilla (which returns without touching the buffer when
-        // !m_drawStreak), the previous code always cleared first so a stopped
-        // streak's leftover mesh dies on the next call - keep that behaviour.
         this->clear();
 
-        if (!m_drawStreak) return;
-        if (m_pointArray->count() == 0) return;
-        if (getOpacity() == 0) return;
+        if (!m_drawStreak || m_pointArray->count() == 0 || getOpacity() == 0) {
+            return;
+        }
 
         const CCPoint position = getPosition();
 
@@ -396,7 +397,7 @@ class $modify(WTSHardStreak, HardStreak) {
 
             skk::wavetrail::createOffset(trailPath, firstOffset, relativeFactor, firstPts, m_fields->firstLbl);
             skk::wavetrail::createOffset(trailPath, lastOffset, relativeFactor, lastPts, m_fields->lastLbl);
-            prevPts = firstPts;  // copy moves into spare capacity; no fresh allocs
+            prevPts = firstPts;
             prevLbl = m_fields->firstLbl;
 
             skk::wavetrail::fixPoints(trailPath, firstOffset, prevPts, prevLbl, lastPts);
@@ -431,7 +432,7 @@ class $modify(WTSHardStreak, HardStreak) {
                     }
                 }
 
-                prevPts = nextPts;   // copy-assign reuses capacity, no allocs
+                prevPts = nextPts;
                 prevLbl = m_fields->nextLbl;
 
                 if (i == part.subparts.size()) break;
@@ -439,8 +440,6 @@ class $modify(WTSHardStreak, HardStreak) {
             }
         }
 
-        // Successful build: record the geometry snapshot so repeated calls
-        // (multiple ring activations in one frame, vanilla-style) skip.
         m_fields->meshValid = true;
         m_fields->haveSnapshot = true;
         m_fields->sDrawStreak = m_drawStreak;
@@ -456,14 +455,7 @@ class $modify(WTSHardStreak, HardStreak) {
     }
 
 };
-// Note: HardStreak::reset() is win-inline and cannot be hooked. Its snapshot
-// invalidation happens naturally: reset empties m_pointArray, so the stored
-// count no longer matches and the next updateStroke rebuilds (never restoring
-// meshValid for an empty array, whose early-return path is always cheap).
 
-// ---------------------------------------------------------------------------
-// DRAG FIX — rebuild streak points from updateRotation.
-// ---------------------------------------------------------------------------
 class $modify(WTSPlayerObject, PlayerObject) {
     struct Fields {
         bool gotHereFromUpdate = false;
@@ -489,20 +481,29 @@ class $modify(WTSPlayerObject, PlayerObject) {
         PlayerObject::resetObject();
     }
 
+    void resetStreak() {
+        PlayerObject::resetStreak();
+    }
+
     bool preSlopeCollision(float p0, GameObject* p1) {
         const bool value = PlayerObject::preSlopeCollision(p0, p1);
         if (!value) m_fields->collidedSlope = p1;
         return value;
     }
 
+    void updateJump(float dt) {
+        PlayerObject::updateJump(dt);
+    }
+
+    void setYVelocity(double velocity, int type) {
+        PlayerObject::setYVelocity(velocity, type);
+    }
+
 void update(float deltaFactor) {
-          // Never run wave trail tracking on trajectory ghosts
           if (skk::trajectory::isSimulating()) {
               PlayerObject::update(deltaFactor);
               return;
           }
-          // Counts only, no clock read: this fires once per PlayerObject per
-          // tick, so a timer here would cost more than it measures.
           skkbot2::hot::Timed skkbot2Count(skkbot2::hot::WtsPlayerUpdate);
           m_fields->currentPos = getRealPosition();
         m_fields->gotHereFromUpdate = true;
@@ -522,10 +523,11 @@ void update(float deltaFactor) {
             return;
         }
         m_fields->gotHereFromUpdate = false;
+        ++skk::wavetrail::g_wt.dragSteps;
+        skk::wavetrail::wtMaybePrintStats();
 
-        // Skip the level editor's build mode — during a playtest the editor
-        // layer is live, so the drag fix runs there too. m_playbackMode is
-        // PlaybackMode::Playing (nonzero) while playtesting.
+        const CCPoint pos = getRealPosition();
+
         if (LevelEditorLayer::get()) {
             const bool playtesting =
                 m_gameLayer && static_cast<int>(m_gameLayer->m_playbackMode) != 0;
@@ -594,8 +596,31 @@ void update(float deltaFactor) {
             return;
         }
 
-        const CCPoint currentVector = (nextPosition - currentPosition).normalize();
-        const CCPoint previousVector = (currentPosition - previousPosition).normalize();
+        const CCPoint currentDelta = nextPosition - currentPosition;
+        const CCPoint previousDelta = currentPosition - previousPosition;
+        const float currentLen = currentDelta.getLength();
+        const float previousLen = previousDelta.getLength();
+        if (currentLen <= 0.0001f || previousLen <= 0.0001f) {
+            ++skk::wavetrail::g_wt.skipZero;
+            skkbot2::log::warn("[WT] zero-delta: cL={:.6f} pL={:.6f} pos=({:.2f},{:.2f})", currentLen, previousLen,
+                currentPosition.x, currentPosition.y);
+            skkbot2::log::warn("[WT] zero-delta: prev=({:.2f},{:.2f}) next=({:.2f},{:.2f})",
+                previousPosition.x, previousPosition.y, nextPosition.x, nextPosition.y);
+            skkbot2::Logger::get().flush();
+            m_fields->previousPos = currentPosition;
+            return;
+        }
+        if (currentLen > 150.0f || previousLen > 150.0f) {
+            ++skk::wavetrail::g_wt.skipJump;
+            skkbot2::log::warn("[WT] jump-guard: cL={:.1f} pL={:.1f} pos=({:.2f},{:.2f}) prev=({:.2f},{:.2f})",
+                currentLen, previousLen, currentPosition.x, currentPosition.y,
+                previousPosition.x, previousPosition.y);
+            skkbot2::Logger::get().flush();
+            m_fields->previousPos = currentPosition;
+            return;
+        }
+        const CCPoint currentVector = currentDelta / currentLen;
+        const CCPoint previousVector = previousDelta / previousLen;
         const float crossProductMagnitude = std::abs(currentVector.cross(previousVector));
 
         const float errorMargin = 0.004f / std::max(m_fields->deltaFactor, 0.0001f);
@@ -621,9 +646,20 @@ void update(float deltaFactor) {
                 std::swap(nextPosition.x, nextPosition.y);
                 std::swap(currentPosition.x, currentPosition.y);
             }
+            const float dx = nextPositionNoCollision.x - currentPosition.x;
+            if (std::fabs(dx) <= 0.0001f) {
+                skkbot2::log::warn(
+                    "[WT] dx-zero guard: dx={:.6f} pos=({:.2f},{:.2f}) nextNoCol=({:.2f},{:.2f})",
+                    dx, currentPosition.x, currentPosition.y,
+                    nextPositionNoCollision.x, nextPositionNoCollision.y);
+                skkbot2::Logger::get().flush();
+                addWaveTrailPoint(currentPosition);
+                m_fields->previousPos = currentPosition;
+                m_fields->transitionToCollision = true;
+                return;
+            }
             const float intercept =
-                (nextPositionNoCollision.y - currentPosition.y) /
-                (nextPositionNoCollision.x - currentPosition.x);
+                (nextPositionNoCollision.y - currentPosition.y) / dx;
             float desiredValue =
                 (nextPosition.y - currentPosition.y + intercept * currentPosition.x) / intercept;
             if ((desiredValue < currentPosition.x && !m_isGoingLeft) ||
@@ -648,25 +684,50 @@ void update(float deltaFactor) {
         }
     }
 
-    // Add a point, dropping the previous one if the three are (almost) colinear.
     inline void addWaveTrailPoint(CCPoint point) {
         if (!m_waveTrail || !m_waveTrail->m_pointArray) return;
-        const unsigned objectCount = static_cast<unsigned>(m_waveTrail->m_pointArray->count());
+        ++skk::wavetrail::g_wt.dragAdds;
+        if (std::isnan(point.x) || std::isnan(point.y) ||
+            std::isinf(point.x) || std::isinf(point.y)) {
+            skkbot2::log::warn("[WT] addP: NaN/inf point=({:.2f},{:.2f}) — skipped",
+                point.x, point.y);
+            skkbot2::Logger::get().flush();
+            return;
+        }
+        unsigned objectCount = static_cast<unsigned>(m_waveTrail->m_pointArray->count());
+        const unsigned kMaxTrailPoints = 2048u;
+        while (objectCount >= kMaxTrailPoints) {
+            m_waveTrail->m_pointArray->removeObjectAtIndex(0);
+            --objectCount;
+        }
         if (objectCount >= 3) {
             auto* arr = m_waveTrail->m_pointArray;
             const CCPoint point0 =
                 static_cast<PointNode*>(arr->objectAtIndex(objectCount - 2))->m_point;
             const CCPoint point1 =
                 static_cast<PointNode*>(arr->objectAtIndex(objectCount - 1))->m_point;
-            const CCPoint vector01 = (point1 - point0).normalize();
-            const CCPoint vector12 = (point - point1).normalize();
+            const CCPoint delta01 = point1 - point0;
+            const CCPoint delta12 = point - point1;
+            const float len01 = delta01.getLength();
+            const float len12 = delta12.getLength();
+            if (len01 <= 0.0001f || len12 <= 0.0001f) {
+                m_waveTrail->addPoint(point);
+                return;
+            }
+            const CCPoint vector01 = delta01 / len01;
+            const CCPoint vector12 = delta12 / len12;
             const float cpm = std::abs(vector12.cross(vector01));
-            if (cpm <= 0.001f) arr->removeObjectAtIndex(objectCount - 1);
+            if (cpm <= 0.001f) {
+                if (auto* last =
+                        static_cast<PointNode*>(arr->objectAtIndex(objectCount - 1))) {
+                    last->m_point = point;
+                }
+                return;
+            }
         }
         m_waveTrail->addPoint(point);
     }
 
-    // Spider orb.
     bool pushButton(PlayerButton button) {
         if (skk::trajectory::isSimulating()) {
             return PlayerObject::pushButton(button);
@@ -704,7 +765,6 @@ void update(float deltaFactor) {
         return PlayerObject::pushButton(button);
     }
 
-    // Spider pad.
     void spiderTestJump(bool p0) {
         if (!skk::wavetrail::dragEnabled() || !m_isDart || !m_gameLayer ||
             LevelEditorLayer::get() || m_fields->justTeleported) {
@@ -721,9 +781,12 @@ void update(float deltaFactor) {
         PlayerObject::doReversePlayer(state);
     }
 
-    void placeStreakPoint() {
-        if (skk::wavetrail::dragEnabled() && m_isDart && m_gameLayer) return;
-        PlayerObject::placeStreakPoint();
+    void placeStreakPoint(cocos2d::CCPoint pos) {
+        if (skk::wavetrail::dragEnabled() && m_isDart && m_gameLayer) {
+            ++skk::wavetrail::g_wt.placeSuppressed;
+            return;
+        }
+        PlayerObject::placeStreakPoint(pos);
     }
 
     void toggleVisibility(bool state) {
@@ -736,6 +799,16 @@ void update(float deltaFactor) {
 };
 
 class $modify(WTSPlayLayer, PlayLayer) {
+    bool init(GJGameLevel* level, bool useEditorLayer) {
+        const bool ok = PlayLayer::init(level, useEditorLayer);
+        if (ok) skk::wavetrail::wtLogSession();
+        return ok;
+    }
+
+    void checkForEnd() {
+        PlayLayer::checkForEnd();
+    }
+
     void playEndAnimationToPos(CCPoint pos) {
         if (skk::wavetrail::dragEnabled()) {
             if (m_player1 && m_player1->m_isDart) {
@@ -750,6 +823,10 @@ class $modify(WTSPlayLayer, PlayLayer) {
 };
 
 class $modify(WTSBaseGameLayer, GJBaseGameLayer) {
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+    }
+
     void teleportPlayer(TeleportPortalObject* portal, PlayerObject* player) {
         GJBaseGameLayer::teleportPlayer(portal, player);
         if (!skk::wavetrail::dragEnabled()) return;
@@ -762,24 +839,14 @@ class $modify(WTSBaseGameLayer, GJBaseGameLayer) {
 
     void toggleDualMode(GameObject* portal, bool state, PlayerObject* playerTouchingPortal,
                         bool p4) {
-        // Both players must be real objects we hooked: the backup below
-        // dereferences m_player2 through WTSPlayerObject, and after GD's swap
-        // m_player1 may have been detached. A dual-level trigger that calls in
-        // with a null playerTouchingPortal while m_player2 is still null used to
-        // slip past the guard and crash on the null m_player2.
         if (!skk::wavetrail::dragEnabled() || !state || !playerTouchingPortal
             || !m_player1 || !m_player2 || playerTouchingPortal != m_player2) {
             GJBaseGameLayer::toggleDualMode(portal, state, playerTouchingPortal, p4);
             return;
         }
-        // Player 2 becomes player 1 after the original executes, so carry the
-        // drag-fix state across the swap.
         WTSPlayerObject::Fields fieldsBackup =
             *static_cast<WTSPlayerObject*>(m_player2)->m_fields.operator->();
         GJBaseGameLayer::toggleDualMode(portal, state, playerTouchingPortal, p4);
-        // Only carry the state over if the swap actually happened. If GD took an
-        // early-out (dual already active), m_player1 is still the ORIGINAL P1 and
-        // the copy below would silently overwrite P1's trail state with P2's.
         if (m_player1 && m_player1 != playerTouchingPortal) {
             *static_cast<WTSPlayerObject*>(m_player1)->m_fields.operator->() = fieldsBackup;
         }

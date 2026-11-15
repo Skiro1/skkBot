@@ -20,7 +20,34 @@ static constexpr uint32_t kKnownFlags =
     FlagLosslessVerified | FlagFromStartPos | FlagPlatformer | FlagTwoPlayer |
     FlagRngLocked | FlagHasAnchors | FlagHasCheckpoints | FlagHasPersistence |
     FlagHasTpsEvents | FlagMacroConverted | FlagCompressed | FlagHasPerFrame | FlagHasVariance |
-    FlagStepClock | FlagHasPracticeFix | FlagHasRngBoundaries;
+    FlagStepClock | FlagHasPracticeFix | FlagHasRngBoundaries | FlagHasCrc32;
+
+static uint32_t crc32c(uint8_t const* data, size_t size) {
+    static std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t {};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t crc = i;
+            for (int bit = 0; bit < 8; ++bit) {
+                crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+            }
+            t[i] = crc;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static uint32_t crc32c(std::vector<uint8_t> const& bytes) {
+    return crc32c(bytes.data(), bytes.size());
+}
+
+static size_t saneReserve(uint64_t count, size_t cap) {
+    return static_cast<size_t>(std::min<uint64_t>(count, cap));
+}
 
 struct ReadContext;
 
@@ -68,10 +95,6 @@ static bool validTps(double value) {
     return std::isfinite(value) && value > 0.0 && value <= 1000000.0;
 }
 
-// ─── Wire v5 density helpers (CML V7-style) ──────────────────────────────
-// Byte LEB128 varints, zigzag signed integers, XOR-masked strings and a
-// tick-anchored microsecond/picosecond delta timestamp stream. All are
-// lossless for the values the format actually carries.
 
 static void writeVarint(std::vector<uint8_t>& out, uint64_t value) {
     while (value >= 0x80) {
@@ -111,7 +134,6 @@ static int64_t readZigzag(ReadContext& ctx) {
     return static_cast<int64_t>(value >> 1) ^ -static_cast<int64_t>(value & 1u);
 }
 
-// CML V7 string mask: byte[i] ^ (61*i + 17*(i>>1) − 89) mod 256.
 static uint8_t xorMask(size_t i) {
     int64_t raw = 61ll * static_cast<int64_t>(i) + 17ll * static_cast<int64_t>(i >> 1) - 89;
     return static_cast<uint8_t>(raw & 0xFF);
@@ -140,10 +162,6 @@ static std::string readXorString(ReadContext& ctx) {
     return value;
 }
 
-// Delta timestamp stream: per record writes a zigzag frame-delta anchored to
-// the macro TPS grid plus a picosecond residue for sub-frame offsets. Grid
-// timestamps round-trip bit-exactly; off-grid (CBS) values keep picosecond
-// resolution, far below the float stepOffset quantisation of the recorder.
 struct TimeStream {
     double tps = 240.0;
     double unit = 1.0 / 240.0;
@@ -169,9 +187,6 @@ struct TimeStream {
         prevTick = tick;
     }
 
-    // Try to encode `time` as an RLE repeat of the previous record's cycle
-    // (autoclicker: constant frame delta, constant residue). Advances prevTick
-    // so a run of repeats chains correctly. Caller decides button/flags.
     bool tryRepeat(double time) {
         int64_t tick = static_cast<int64_t>(std::llround(time * tps));
         int64_t delta = tick - prevTick;
@@ -198,8 +213,6 @@ struct TimeStream {
         return static_cast<double>(tick) * unit + static_cast<double>(residuePs) / 1e12;
     }
 
-    // RLE hold-repeat: reuse the previous record's frame/residue delta (the
-    // autoclicker cycle). prevTick advances; deltas stay identical for the run.
     double readRepeat(ReadContext& ctx) const {
         int64_t tick = prevTick + lastTickDelta;
         const_cast<TimeStream*>(this)->prevTick = tick;
@@ -207,8 +220,6 @@ struct TimeStream {
     }
 };
 
-// Bit-delta encoder for float/double columns: stores XOR of consecutive raw
-// bit patterns as a zigzag varint. Fully lossless (XOR is its own inverse).
 struct BitDeltaStream_u32 {
     uint32_t prev = 0;
     void write(std::vector<uint8_t>& out, float value) {
@@ -362,7 +373,6 @@ static void writePlayerState(std::vector<uint8_t>& payload, PlayerStateBundle co
     writeLE<int32_t>(payload, state.environment.stateDartSlide);
     writeLE<int32_t>(payload, state.environment.stateFlipGravity);
     writeLE<int32_t>(payload, state.environment.stateForce);
-    // Wire v3+: flip-tween time bases appended (see PlayerEnvironmentState).
     writeLE<double>(payload, state.environment.lastFlipTime);
     writeLE<double>(payload, state.environment.lastSpiderFlipTime);
 }
@@ -477,7 +487,6 @@ static void writeAnchor(std::vector<uint8_t>& payload, Anchor const& anchor, Tim
         writeLE<uint64_t>(payload, static_cast<uint64_t>(anchor.state.rng.fastRandState));
     }
     writeLE<uint8_t>(payload, anchor.state.rng.locked ? 1 : 0);
-    // r0: bit 0 = hasTripleRng (shake/teleport data follows after seed)
     uint8_t r0 = 0;
     if (anchor.state.rng.shakeState != 0 || anchor.state.rng.teleportState != 0) {
         r0 |= 1 << 0;
@@ -486,7 +495,6 @@ static void writeAnchor(std::vector<uint8_t>& payload, Anchor const& anchor, Tim
     writeLE<uint8_t>(payload, 0);
     writeLE<uint8_t>(payload, 0);
     writeLE<uint32_t>(payload, anchor.state.rng.seed);
-    // Triple RNG data (optional, indicated by r0 bit 0).
     if ((r0 & (1 << 0)) != 0) {
         writeLE<uint64_t>(payload, anchor.state.rng.shakeState);
         writeLE<uint64_t>(payload, anchor.state.rng.teleportState);
@@ -530,12 +538,10 @@ static Anchor readAnchor(ReadContext& ctx, TimeStream& time, std::string* error)
         if (error && error->empty()) *error = "invalid SKK3 anchor";
         return anchor;
     }
-    // Triple RNG data (optional, indicated by r0 bit 0). Old files have r0=0.
     if ((r0 & (1 << 0)) != 0) {
         anchor.state.rng.shakeState = readLE<uint64_t>(ctx);
         anchor.state.rng.teleportState = readLE<uint64_t>(ctx);
     }
-    // Validate reserved bytes: r1/r2 must be 0, r0 flags must be recognized.
     if (r1 != 0 || r2 != 0 || (r0 & ~0x01u) != 0) {
         ctx.failed = true;
         if (error && error->empty()) *error = "invalid SKK3 anchor";
@@ -558,7 +564,7 @@ static std::vector<Anchor> readAnchorsSection(ReadContext& ctx, double baseTps, 
     if (ctx.failed || !checkCountFits(ctx, count, 2, error, "anchor")) return anchors;
     TimeStream time;
     time.reset(validTps(baseTps) ? baseTps : 240.0);
-    anchors.reserve(static_cast<size_t>(count));
+    anchors.reserve(saneReserve(count, 1'000'000));
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         Anchor anchor = readAnchor(ctx, time, error);
         if (!ctx.failed) {
@@ -603,7 +609,6 @@ static PerFrame readPerFrame(ReadContext& ctx, TimeStream& time,
     frame.p1y = p1xy.read(ctx);
     frame.p1vy = p1vy.read(ctx);
     frame.p1vyb = p1vy.read(ctx);
-    // p1 visual tail sits between p1 physics and p2 block in the binary layout
     frame.p1rot = p1rot.read(ctx);
     frame.p1vis = readLE<uint8_t>(ctx);
     frame.p1RingId = static_cast<int32_t>(readZigzag(ctx));
@@ -637,21 +642,10 @@ static PerFrame readPerFrame(ReadContext& ctx, TimeStream& time,
     return frame;
 }
 
-// ─── Per-frame section v4 (wire 7, layout 4) ───────────────────────────────
-// Density model: every column becomes a *first difference* of a fixed-point
-// integer (positions x1/256 px, velocities /16384, rotation /1024, exact ints
-// for vis/ring-id; time keeps the tick+picosecond deltas), then whole records
-// whose 17-element difference vector repeats are coalesced into a run-length
-// block. Holds/gravity/autoclickers have constant per-frame deltas -> one tiny
-// head + a run counter covers thousands of frames. Fixed-point math is integer
-// exact, so round-trip is deterministic and drift-free; reconstructed pins lie
-// within 0.5/scale of the captured floats (< 0.002 px, invisible).
 static constexpr double kPerFrameScaleXy = 256.0;
 static constexpr double kPerFrameScaleVy = 16384.0;
 static constexpr double kPerFrameScaleRot = 1024.0;
 
-// Deltas per column: 0 tick, 1 residue-ps, 2 flags, 3..9 p1 (x,y,vy,vyb,rot,vis,ring),
-// 10..16 p2 (same 7).
 static constexpr int kPerFrameDeltaCount = 17;
 
 static int64_t perFrameQuant(double value, double scale) {
@@ -659,7 +653,7 @@ static int64_t perFrameQuant(double value, double scale) {
 }
 
 static void writePerFrameSectionV3(std::vector<uint8_t>& out, std::vector<PerFrame> const& frames, double baseTps) {
-    writeLE<uint8_t>(out, 3); // v3: rotation + vis flags + dash-ring IDs
+    writeLE<uint8_t>(out, 3);
     writeVarint(out, static_cast<uint64_t>(frames.size()));
     TimeStream time;
     time.reset(baseTps);
@@ -673,7 +667,7 @@ static void writePerFrameSectionV3(std::vector<uint8_t>& out, std::vector<PerFra
 static void writePerFrameSection(std::vector<uint8_t>& out, std::vector<PerFrame> const& frames, double baseTps) {
     double tps = validTps(baseTps) ? baseTps : 240.0;
     double unit = 1.0 / tps;
-    writeLE<uint8_t>(out, 4); // v4: fixed-point first-diff + record-run RLE
+    writeLE<uint8_t>(out, 4);
     writeVarint(out, static_cast<uint64_t>(frames.size()));
 
     int64_t prevTick = 0, prevResPs = 0, prevFlags = 0;
@@ -763,10 +757,10 @@ static std::vector<PerFrame> readPerFrameSectionV4(ReadContext& ctx, double base
     double tps = validTps(baseTps) ? baseTps : 240.0;
     double unit = 1.0 / tps;
     uint64_t count = readVarint(ctx);
-    if (ctx.failed || !checkCountFits(ctx, count, 1, error, "per-frame")) return {};
+    if (ctx.failed || !checkCountFits(ctx, count, 11, error, "per-frame")) return {};
 
     std::vector<PerFrame> frames;
-    frames.reserve(static_cast<size_t>(count));
+    frames.reserve(saneReserve(count, 1'000'000));
     uint64_t nextIndex = 0;
     int64_t prevTick = 0, prevResPs = 0;
     int64_t prevQ[14] = { 0 };
@@ -877,7 +871,7 @@ static std::vector<PerFrame> readPerFrameSection(ReadContext& ctx, double baseTp
         time.reset(validTps(baseTps) ? baseTps : 240.0);
         BitDeltaStream_u32 p1xy, p1rot, p2xy, p2rot;
         BitDeltaStream_u64 p1vy, p2vy;
-        frames.reserve(static_cast<size_t>(count));
+        frames.reserve(saneReserve(count, 1'000'000));
         for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
             PerFrame frame = readPerFrame(ctx, time, p1xy, p1rot, p1vy, p2xy, p2rot, p2vy);
             if (!ctx.failed) {
@@ -929,7 +923,7 @@ static std::vector<VarianceEntry> readVarianceSection(ReadContext& ctx, std::str
     uint64_t count = readVarint(ctx);
     if (ctx.failed || !checkCountFits(ctx, count, 2, error, "variance")) return entries;
     BitDeltaStream_u32 value;
-    entries.reserve(static_cast<size_t>(count));
+    entries.reserve(saneReserve(count, 4'096));
     uint16_t lastIndex = 0;
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         VarianceEntry entry;
@@ -937,8 +931,6 @@ static std::vector<VarianceEntry> readVarianceSection(ReadContext& ctx, std::str
         entry.value = value.read(ctx);
         if (ctx.failed) break;
         int64_t cumulative = static_cast<int64_t>(lastIndex) + indexDelta;
-        // Indices must be strictly ascending, in range of the 2000-slot array,
-        // and values finite (0 is meaningless but harmless; reject for hygiene).
         if (cumulative <= static_cast<int64_t>(lastIndex) && index > 0) {
             ctx.failed = true;
             if (error) *error = "invalid SKK3 variance entry";
@@ -954,7 +946,6 @@ static std::vector<VarianceEntry> readVarianceSection(ReadContext& ctx, std::str
         lastIndex = entry.index;
         entries.push_back(entry);
     }
-    // Trailing setup-seed + persistent-items block (mandatory in wire v4).
     setupSeed = readVarint(ctx);
     uint64_t itemCount = readVarint(ctx);
     if (!ctx.failed && !checkCountFits(ctx, itemCount, 2, error, "persistent items")) return entries;
@@ -978,8 +969,6 @@ static void writePersistenceSection(std::vector<uint8_t>& out, std::vector<Attem
     for (auto const& attempt : attempts) {
         deathTime.write(out, attempt.deathTimeSeconds);
         writeLE<uint8_t>(out, attempt.deathPlayer2 ? 1 : 0);
-        // Reserved slot 1 doubles as "attempt carries a per-frame sub-block"
-        // (written after the anchors). 0 keeps old readers fully compatible.
         writeLE<uint8_t>(out, attempt.perFrames.empty() ? 0 : 1);
         writeLE<uint8_t>(out, 0);
         writeLE<uint8_t>(out, 0);
@@ -1002,7 +991,7 @@ static std::vector<Attempt> readPersistenceSection(ReadContext& ctx, double fram
     double baseTps = validTps(framerateHint) ? framerateHint : 240.0;
     TimeStream deathTime;
     deathTime.reset(baseTps);
-    attempts.reserve(static_cast<size_t>(count));
+    attempts.reserve(saneReserve(count, 1'000'000));
 
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         Attempt attempt;
@@ -1102,7 +1091,6 @@ static void writeInputsSection(std::vector<uint8_t>& out, std::vector<Input> con
         bool sameButton = prev && input.button == prev->button &&
             input.player2 == prev->player2;
         if (swiftFree && sameButton && time.tryRepeat(input.timeSeconds)) {
-            // RLE repeat: same button/player2, same cycle delta, pressed in flags.
             writeLE<uint8_t>(out, 0);
             writeLE<uint8_t>(out, input.pressed ? 2 : 0);
             continue;
@@ -1180,13 +1168,12 @@ static std::vector<Input> readInputsSection(ReadContext& ctx, double framerateHi
 
     TimeStream time;
     time.reset(validTps(framerateHint) ? framerateHint : 240.0);
-    inputs.reserve(static_cast<size_t>(count));
+    inputs.reserve(saneReserve(count, 4'000'000));
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         Input input;
         uint8_t button = readLE<uint8_t>(ctx);
         uint8_t flags = readLE<uint8_t>(ctx);
         if (button == 0) {
-            // RLE repeat: same button/player2/cycle as previous record.
             if ((flags & ~0x02u) != 0 || inputs.empty()) {
                 if (error) *error = "unknown input repeat flag bits";
                 ctx.failed = true;
@@ -1262,7 +1249,7 @@ static std::vector<TpsEvent> readTpsEventsSection(ReadContext& ctx, double baseT
     TimeStream time;
     time.reset(validTps(baseTps) ? baseTps : 240.0);
     BitDeltaStream_u64 tps;
-    events.reserve(static_cast<size_t>(count));
+    events.reserve(saneReserve(count, 4'000'000));
 
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         TpsEvent event;
@@ -1289,7 +1276,7 @@ static std::vector<Checkpoint> readCheckpointsSection(ReadContext& ctx, double b
     if (ctx.failed || !checkCountFits(ctx, count, 2, error, "checkpoint")) return checkpoints;
     TimeStream time;
     time.reset(validTps(baseTps) ? baseTps : 240.0);
-    checkpoints.reserve(static_cast<size_t>(count));
+    checkpoints.reserve(saneReserve(count, 4'000'000));
 
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         Checkpoint checkpoint;
@@ -1336,7 +1323,6 @@ static void writePracticeFixSection(std::vector<uint8_t>& out, std::vector<Pract
             if (cp.clickReleased[i]) clickMask |= static_cast<uint8_t>(1u << i);
         }
         writeLE<uint8_t>(out, clickMask);
-        // Full P1 state
         writeLE<float>(out, cp.p1_x); writeLE<float>(out, cp.p1_y); writeLE<float>(out, cp.p1_rotation);
         writeLE<double>(out, cp.p1_yVelocity); writeLE<double>(out, cp.p1_fallSpeed);
         writeLE<double>(out, cp.p1_platformerXVelocity); writeLE<double>(out, cp.p1_groundYVelocity);
@@ -1366,7 +1352,6 @@ static void writePracticeFixSection(std::vector<uint8_t>& out, std::vector<Pract
         if (cp.p1_holdingRight) p1Hold |= 1u;
         if (cp.p1_holdingLeft) p1Hold |= 2u;
         writeLE<uint8_t>(out, p1Hold);
-        // Full P2 state
         writeLE<float>(out, cp.p2_x); writeLE<float>(out, cp.p2_y); writeLE<float>(out, cp.p2_rotation);
         writeLE<double>(out, cp.p2_yVelocity); writeLE<double>(out, cp.p2_fallSpeed);
         writeLE<double>(out, cp.p2_platformerXVelocity); writeLE<double>(out, cp.p2_groundYVelocity);
@@ -1403,7 +1388,7 @@ static std::vector<PracticeFixCheckpoint> readPracticeFixSection(ReadContext& ct
     std::vector<PracticeFixCheckpoint> checkpoints;
     uint64_t count = readVarint(ctx);
     if (ctx.failed || !checkCountFits(ctx, count, 2, error, "practice-fix checkpoint")) return checkpoints;
-    checkpoints.reserve(static_cast<size_t>(count));
+    checkpoints.reserve(saneReserve(count, 4'000'000));
 
     for (uint64_t index = 0; index < count && !ctx.failed; ++index) {
         PracticeFixCheckpoint cp;
@@ -1438,7 +1423,6 @@ static std::vector<PracticeFixCheckpoint> readPracticeFixSection(ReadContext& ct
         for (int i = 0; i < 6; ++i) {
             cp.clickReleased[i] = (clickMask & static_cast<uint8_t>(1u << i)) != 0;
         }
-        // Full P1 state
         cp.p1_x = readLE<float>(ctx); cp.p1_y = readLE<float>(ctx); cp.p1_rotation = readLE<float>(ctx);
         cp.p1_yVelocity = readLE<double>(ctx); cp.p1_fallSpeed = readLE<double>(ctx);
         cp.p1_platformerXVelocity = readLE<double>(ctx); cp.p1_groundYVelocity = readLE<double>(ctx);
@@ -1467,7 +1451,6 @@ static std::vector<PracticeFixCheckpoint> readPracticeFixSection(ReadContext& ct
         uint8_t p1Hold = readLE<uint8_t>(ctx);
         cp.p1_holdingRight = (p1Hold & 1u) != 0;
         cp.p1_holdingLeft = (p1Hold & 2u) != 0;
-        // Full P2 state
         cp.p2_x = readLE<float>(ctx); cp.p2_y = readLE<float>(ctx); cp.p2_rotation = readLE<float>(ctx);
         cp.p2_yVelocity = readLE<double>(ctx); cp.p2_fallSpeed = readLE<double>(ctx);
         cp.p2_platformerXVelocity = readLE<double>(ctx); cp.p2_groundYVelocity = readLE<double>(ctx);
@@ -1507,7 +1490,7 @@ static std::vector<Macro::RngBoundary> readRngBoundariesSection(ReadContext& ctx
     std::vector<Macro::RngBoundary> boundaries;
     uint64_t count = readVarint(ctx);
     if (count > 1'000'000) { if (error) *error = "rng-boundary count too high"; ctx.failed = true; return {}; }
-    boundaries.reserve(static_cast<size_t>(count));
+    boundaries.reserve(saneReserve(count, 1'000'000));
     for (uint64_t i = 0; i < count && !ctx.failed; ++i) {
         Macro::RngBoundary boundary;
         boundary.tick = static_cast<int32_t>(readZigzag(ctx));
@@ -1521,6 +1504,11 @@ static std::vector<Macro::RngBoundary> readRngBoundariesSection(ReadContext& ctx
 }
 
 static bool isKnownSection(uint8_t kind) {
+    return kind >= static_cast<uint8_t>(SectionKind::Inputs) &&
+        kind <= static_cast<uint8_t>(SectionKind::Crc32);
+}
+
+static bool isDataSection(uint8_t kind) {
     return kind >= static_cast<uint8_t>(SectionKind::Inputs) &&
         kind <= static_cast<uint8_t>(SectionKind::RngBoundaries);
 }
@@ -1536,6 +1524,7 @@ static bool sectionFlagPresent(uint32_t flags, uint8_t kind) {
         case SectionKind::Variance: return (flags & FlagHasVariance) != 0;
         case SectionKind::PracticeFix: return (flags & FlagHasPracticeFix) != 0;
         case SectionKind::RngBoundaries: return (flags & FlagHasRngBoundaries) != 0;
+        case SectionKind::Crc32: return (flags & FlagHasCrc32) != 0;
     }
     return false;
 }
@@ -1564,6 +1553,7 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
     writeLE<uint16_t>(output, kWireVersion);
     writeLE<uint16_t>(output, 0);
     uint32_t flags = buildFlags(macro, options);
+    flags |= FlagHasCrc32;
     writeLE<uint32_t>(output, flags);
     size_t headerLenPosition = output.size();
     writeLE<uint32_t>(output, 0);
@@ -1580,33 +1570,15 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
     writeLE<uint32_t>(output, macro.rngSeed);
     writeLE<uint8_t>(output, static_cast<uint8_t>(sanitizeAccuracyMode(static_cast<int>(macro.accuracyMode))));
     writeLE<double>(output, macro.duration);
-    // The header is a sequence of optional fields, each read only if the bytes
-    // are there. Appending the display rate is therefore backward compatible
-    // with no version bump: an old file simply stops early and means "follow
-    // the tick rate", which is what it always meant.
-    //
-    // THREE states now, and only one of them is "do not write the field":
-    //   +0.0  no display rate was captured - the bytes are omitted
-    //   -0.0  captured with FPS on at exactly the tick rate -> "follow tps"
-    //    n>0  captured with FPS on at n != tps -> pinned
-    // Minus zero compares equal to plus zero everywhere, so it has to be tested
-    // with signbit and not with `== 0.0`. It survives the raw double write
-    // below, which is the only reason it can be used as a marker at all.
     const double rateTps = validTps(macro.framerateHint) ? macro.framerateHint : 240.0;
     const bool followTps =
         macro.displayFps == 0.0 && std::signbit(macro.displayFps);
     const bool pinned = macro.displayFps > 0.0 && std::isfinite(macro.displayFps) &&
         std::abs(macro.displayFps - rateTps) > 1e-3;
-    // A POSITIVE number equal to the tick rate is normalised to the marker here,
-    // not dropped. Dropping it would turn "FPS on, follow tps" into "no FPS
-    // information at all", which is a different instruction on playback - and a
-    // writer that stores the same statement two ways is how two sources of
-    // truth start.
     const bool equalsTps = macro.displayFps > 0.0 && std::isfinite(macro.displayFps) && !pinned;
     if (followTps || pinned || equalsTps) {
         writeLE<double>(output, equalsTps ? std::copysign(0.0, -1.0) : macro.displayFps);
     }
-    // Timing mode: 0 = Lock Delta, 1 = Real Time (omitted for default lock delta to keep plain header identical)
     if (macro.realTime) {
         writeLE<uint8_t>(output, 1u);
     }
@@ -1669,6 +1641,50 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
             writeVarianceSection(sectionPayload, macro.variance, macro.setupRngSeed, macro.persistentItems);
         });
     }
+
+    uint64_t crcRecordCount = static_cast<uint64_t>(entries.size()) + 1;
+    std::vector<uint8_t> crcCountBuf;
+    writeVarint(crcCountBuf, crcRecordCount);
+    uint64_t crcSectionSize =
+        static_cast<uint64_t>(crcCountBuf.size()) + crcRecordCount * 5;
+
+    SectionEntry crcEntry;
+    crcEntry.kind = static_cast<uint8_t>(SectionKind::Crc32);
+    crcEntry.offset = static_cast<uint64_t>(payload.size());
+    crcEntry.size = crcSectionSize;
+
+    std::vector<uint8_t> tableBytes;
+    writeLE<uint16_t>(tableBytes, static_cast<uint16_t>(entries.size() + 1));
+    for (auto const& entry : entries) {
+        writeLE<uint8_t>(tableBytes, entry.kind);
+        writeLE<uint8_t>(tableBytes, 0);
+        writeLE<uint8_t>(tableBytes, 0);
+        writeLE<uint8_t>(tableBytes, 0);
+        writeLE<uint64_t>(tableBytes, entry.offset);
+        writeLE<uint64_t>(tableBytes, entry.size);
+    }
+    writeLE<uint8_t>(tableBytes, crcEntry.kind);
+    writeLE<uint8_t>(tableBytes, 0);
+    writeLE<uint8_t>(tableBytes, 0);
+    writeLE<uint8_t>(tableBytes, 0);
+    writeLE<uint64_t>(tableBytes, crcEntry.offset);
+    writeLE<uint64_t>(tableBytes, crcEntry.size);
+
+    std::vector<uint8_t> crcPayload;
+    writeVarint(crcPayload, crcRecordCount);
+    for (auto const& entry : entries) {
+        uint32_t crc = crc32c(payload.data() + static_cast<size_t>(entry.offset),
+                              static_cast<size_t>(entry.size));
+        crcPayload.push_back(entry.kind);
+        writeLE<uint32_t>(crcPayload, crc);
+    }
+    crcPayload.push_back(kCrcKindTable);
+    writeLE<uint32_t>(crcPayload, crc32c(tableBytes));
+    if (crcPayload.size() != static_cast<size_t>(crcSectionSize)) {
+        return {};
+    }
+    payload.insert(payload.end(), crcPayload.begin(), crcPayload.end());
+    entries.push_back(crcEntry);
 
     writeLE<uint16_t>(output, static_cast<uint16_t>(entries.size()));
     for (auto const& entry : entries) {
@@ -1754,11 +1770,6 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
     }
     if (metadataCtx.remaining() >= sizeof(double)) {
         macro.displayFps = readLE<double>(metadataCtx);
-        // Three states live in this one double: -0.0 = "captured with FPS on at
-        // exactly the tick rate", +n = pinned, and the field being ABSENT = the
-        // macro carries no display rate at all. -0.0 passes the range check
-        // because it compares equal to zero; do not "simplify" this to
-        // `<= 0.0`, which would reject the middle state.
         if (!std::isfinite(macro.displayFps) ||
             (macro.displayFps != 0.0 && (macro.displayFps < 1.0 || macro.displayFps > 1'000'000.0))) {
             return fail("invalid SKK3 display fps");
@@ -1779,7 +1790,7 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
     if (tableCtx.failed) return fail("truncated SKK3 section table");
     std::vector<SectionEntry> entries;
     entries.reserve(sectionCount);
-    bool seenKnown[10] = {false};
+    bool seenKnown[12] = {false};
     for (uint16_t index = 0; index < sectionCount && !tableCtx.failed; ++index) {
         SectionEntry entry;
         entry.kind = readLE<uint8_t>(tableCtx);
@@ -1852,6 +1863,55 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
         uint64_t entryEnd = entry.offset + entry.size;
         if (entryEnd > static_cast<uint64_t>(payloadSize)) return fail("SKK3 section range outside payload");
         previousEnd = entryEnd;
+    }
+
+    size_t tableEnd = tableCtx.position;
+    if ((flags & FlagHasCrc32) != 0) {
+        auto crcEntryOpt = findSection(entries, SectionKind::Crc32);
+        if (!crcEntryOpt) return fail("missing flagged SKK3 crc section");
+        ReadContext crcCtx {
+            *payloadBytes,
+            payloadBase + static_cast<size_t>(crcEntryOpt->offset),
+            payloadBase + static_cast<size_t>(crcEntryOpt->offset) + static_cast<size_t>(crcEntryOpt->size)
+        };
+        uint64_t recordCount = readVarint(crcCtx);
+        if (crcCtx.failed || recordCount > entries.size() + 1) {
+            return fail("invalid SKK3 crc section");
+        }
+        bool covered[12] = {false};
+        bool tableCovered = false;
+        for (uint64_t i = 0; i < recordCount && !crcCtx.failed; ++i) {
+            uint8_t kind = readLE<uint8_t>(crcCtx);
+            uint32_t stored = readLE<uint32_t>(crcCtx);
+            if (crcCtx.failed) break;
+            uint32_t actual = 0;
+            if (kind == kCrcKindTable) {
+                actual = crc32c(data.data() + headerLen, tableEnd - headerLen);
+                tableCovered = true;
+            } else if (isDataSection(kind)) {
+                auto entryIt = std::find_if(entries.begin(), entries.end(),
+                    [kind](SectionEntry const& e) { return e.kind == kind; });
+                if (entryIt == entries.end()) {
+                    return fail("SKK3 crc record for a missing section");
+                }
+                actual = crc32c(
+                    payloadBytes->data() + payloadBase + static_cast<size_t>(entryIt->offset),
+                    static_cast<size_t>(entryIt->size));
+                covered[kind] = true;
+            } else {
+                return fail("unknown SKK3 crc record kind");
+            }
+            if (stored != actual) return fail("SKK3 section CRC mismatch");
+        }
+        if (crcCtx.failed || crcCtx.position != crcCtx.end) {
+            return fail("invalid SKK3 crc section");
+        }
+        for (auto const& entry : entries) {
+            if (isDataSection(entry.kind) && !covered[entry.kind]) {
+                return fail("SKK3 section missing crc record");
+            }
+        }
+        if (!tableCovered) return fail("SKK3 section table missing crc record");
     }
 
     double baseTps = validTps(macro.framerateHint) ? macro.framerateHint : 240.0;
@@ -2446,28 +2506,10 @@ SkMacro toSkMacro(Macro const& macro) {
     return result;
 }
 
-// The header self-test. Its subject is one specific promise, and it is the
-// reason the display rate was added as an OPTIONAL trailing field rather than a
-// version bump: a .skk written before the field existed has to keep loading.
-//
-// The proof is structural rather than a stored old fixture. There is no legacy
-// file to compare against, because there has never been one - kWireVersion has
-// always been an exact-match check, so every pre-existing .skk on disk was
-// written by the immediately previous build. What that build wrote is exactly
-// what THIS build writes when displayFps is 0: the field is omitted, not
-// zero-filled. So "encode with no display rate" IS the old shape, byte for
-// byte, and comparing the two headers measures the compatibility claim instead
-// of asserting it.
-//
-// What this must NOT become: a size-based guess that accepts either header
-// length. A reader that sniffs 4-vs-8 bytes is a reader that will one day read
-// one format as the other, and the whole reason this field is optional is that
-// the old shape is the ONLY thing the reader has to recognise - as itself.
 HeaderSelfTestResult selfTestHeader() {
     HeaderSelfTestResult result;
 
     auto headerLenOf = [](std::vector<uint8_t> const& bytes) -> size_t {
-        // Written at a fixed offset: magic(4) version(2) reserved(2) flags(4).
         if (bytes.size() < kHeaderSize) return 0;
         return static_cast<size_t>(bytes[12]) |
                (static_cast<size_t>(bytes[13]) << 8) |
@@ -2480,8 +2522,6 @@ HeaderSelfTestResult selfTestHeader() {
     base.levelName = "selftest";
     base.framerateHint = 240.0;
     base.duration = 1.5;
-    // A couple of inputs, so the payload is not empty and a length comparison
-    // cannot pass by both sides failing to write anything at all.
     for (int i = 0; i < 8; ++i) {
         Input in;
         in.timeSeconds = static_cast<double>(i * 12) / 240.0;
@@ -2491,10 +2531,6 @@ HeaderSelfTestResult selfTestHeader() {
         base.inputs.push_back(in);
     }
 
-    // Case 1: no display rate. This is the old shape, and it must still be a
-    // valid file that decodes with the field at its "the macro carries no
-    // display rate" default (+0.0) rather than at whatever the bytes happened
-    // to contain.
     Macro plain = base;
     plain.displayFps = 0.0;
     const auto plainBytes = serialize(plain);
@@ -2517,9 +2553,6 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
-    // SKK3 stores framerateHint as float64. This regression check ensures the
-    // non-float32-exact example survives the actual header serializer exactly,
-    // not merely as a nearby tick rate.
     Macro fractionalTps = base;
     fractionalTps.framerateHint = 144.144;
     const auto fractionalTpsBytes = serialize(fractionalTps);
@@ -2529,8 +2562,6 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
-    // Case 2: a real display rate. The header must grow by exactly one field
-    // and nothing else, and the value has to come back.
     const size_t plainHeader = headerLenOf(plainBytes);
     Macro pinned = base;
     pinned.displayFps = 60.0;
@@ -2551,7 +2582,6 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
-    // Case 2b: real time timing mode. Header grows by 1 byte.
     Macro rtMacro = base;
     rtMacro.realTime = true;
     rtMacro.lockDelta = false;
@@ -2567,10 +2597,6 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
-    // Case 3: a value equal to the tick rate is stored, but AS THE MARKER. A
-    // file carrying 240 would be one number with two homes; a file carrying
-    // nothing would say "FPS was off", which is not what was recorded. -0.0 is
-    // the third option and the only correct one.
     Macro equalRate = base;
     equalRate.displayFps = 240.0;
     const auto equalBytes = serialize(equalRate);
@@ -2586,9 +2612,6 @@ HeaderSelfTestResult selfTestHeader() {
         return result;
     }
 
-    // Case 4: the marker written directly. Same rule as case 3, but through the
-    // other door - captureForStorage produces -0.0 itself, so the writer must
-    // pass it through rather than trusting every caller to hand it 240.
     Macro marker = base;
     marker.displayFps = -0.0;
     const auto markerBytes = serialize(marker);
@@ -2612,6 +2635,98 @@ HeaderSelfTestResult selfTestHeader() {
 
     result.ok = true;
     result.oldShapeHeaderBytes = plainHeader;
+    return result;
+}
+
+CrcSelfTestResult selfTestCrc() {
+    CrcSelfTestResult result;
+
+    Macro base;
+    base.levelId = 777;
+    base.levelName = "crctest";
+    base.framerateHint = 240.0;
+    base.duration = 1.0;
+    for (int i = 0; i < 16; ++i) {
+        Input in;
+        in.timeSeconds = static_cast<double>(i * 7) / 240.0;
+        in.button = 1;
+        in.pressed = (i % 2) == 0;
+        base.inputs.push_back(in);
+    }
+
+    std::string error;
+    const auto bytes = serialize(base, WriteOptions{ false });
+    if (bytes.empty()) {
+        result.detail = "serialize refused the crc self-test macro";
+        return result;
+    }
+    const uint32_t writtenFlags =
+        static_cast<uint32_t>(bytes[8]) |
+        (static_cast<uint32_t>(bytes[9]) << 8) |
+        (static_cast<uint32_t>(bytes[10]) << 16) |
+        (static_cast<uint32_t>(bytes[11]) << 24);
+    if (!(writtenFlags & FlagHasCrc32)) {
+        result.detail = "serialize did not set FlagHasCrc32";
+        return result;
+    }
+    auto clean = deserialize(bytes, &error);
+    if (!clean) {
+        result.detail = "clean crc file did not decode: " + error;
+        return result;
+    }
+    if (clean->inputs.size() != base.inputs.size()) {
+        result.detail = "clean crc file lost inputs";
+        return result;
+    }
+
+    auto corruptAndTry = [&](size_t at, std::string const& what, bool needCrcVerdict) -> bool {
+        std::vector<uint8_t> broken = bytes;
+        broken[at] ^= 0x5Au;
+        std::string err;
+        auto back = deserialize(broken, &err);
+        if (back) {
+            result.detail = what + " corruption was accepted";
+            return false;
+        }
+        if (needCrcVerdict && err.find("CRC") == std::string::npos) {
+            result.detail = what + " corruption rejected without a CRC verdict: " + err;
+            return false;
+        }
+        return true;
+    };
+
+    uint32_t headerLen = static_cast<uint32_t>(bytes[12]) |
+        (static_cast<uint32_t>(bytes[13]) << 8) |
+        (static_cast<uint32_t>(bytes[14]) << 16) |
+        (static_cast<uint32_t>(bytes[15]) << 24);
+    size_t tablePos = headerLen;
+    size_t inputsRecord = tablePos + 2;
+    if (bytes[inputsRecord] != static_cast<uint8_t>(SectionKind::Inputs)) {
+        result.detail = "section table layout drifted; fix the test offsets";
+        return result;
+    }
+    uint64_t inputsOffset = 0;
+    for (int i = 0; i < 8; ++i) {
+        inputsOffset |= static_cast<uint64_t>(bytes[inputsRecord + 4 + i]) << (8 * i);
+    }
+    const size_t tableRecordCount = static_cast<size_t>(bytes[tablePos]) |
+        (static_cast<size_t>(bytes[tablePos + 1]) << 8);
+    constexpr size_t kTableRecordSize = 20;
+    const size_t payloadStart = tablePos + 2 + tableRecordCount * kTableRecordSize;
+    if (!corruptAndTry(payloadStart + static_cast<size_t>(inputsOffset) + 4,
+                       "inputs section", true)) {
+        return result;
+    }
+    size_t lastKind = tablePos + 2 + static_cast<size_t>(tableRecordCount - 1) * kTableRecordSize;
+    if (bytes[lastKind] != static_cast<uint8_t>(SectionKind::Crc32)) {
+        result.detail = "crc section is not the last table record; fix the test offsets";
+        return result;
+    }
+    if (!corruptAndTry(lastKind + 1, "section table", false)) {
+        return result;
+    }
+
+    result.ok = true;
     return result;
 }
 
@@ -2642,9 +2757,6 @@ PerFrameSelfTestResult selfTestPerFrameCodec() {
         frames.push_back(frame);
     };
 
-    // Synthetic macro: long constant-velocity hold (ship), gravity segment with
-    // constant per-frame vy delta, a tap/spike burst with noisy pins, an
-    // autoclicker leg with repeating frame deltas, and a player-2 section.
     size_t index = 0;
     constexpr double fps = 240.0;
     auto emit = [&](double x, double y, double vy, double rot, bool legTap) {
@@ -2657,21 +2769,18 @@ PerFrameSelfTestResult selfTestPerFrameCodec() {
             static_cast<uint8_t>((index >> 1) & 1u), 0);
         ++index;
     };
-    // 1) 2000-frame straight ship hold (constant deltas -> one giant run).
     double vx = 0.39, yHoriz = 100.0, rot = 0.0, vy = -0.55;
     for (int k = 0; k < 2000; ++k) {
         double x = 50.0 + static_cast<double>(k) * vx;
         double y = yHoriz + static_cast<double>(k) * 0.21;
         emit(x, y, vy, rot, false);
     }
-    // 2) 500-frame gravity arc (vy per-frame delta constant -> run continues).
     for (int k = 0; k < 500; ++k) {
         vy += 0.009;
         double x = 50.0 + 2000.0 * vx + static_cast<double>(k) * vx * 1.35;
         double y = yHoriz + 2000.0 * 0.21 + static_cast<double>(k) * 2.1 + static_cast<double>(k) * (0.0);
         emit(x, y, vy, rot, false);
     }
-    // 3) 300-frame spike burst (noisy, breaks runs every few frames).
     unsigned int seed = 0x5EED;
     for (int k = 0; k < 300; ++k) {
         seed = seed * 1664525u + 1013904223u;
@@ -2685,7 +2794,6 @@ PerFrameSelfTestResult selfTestPerFrameCodec() {
         double y = yHoriz + 2000.0 * 0.21 + 500.0 * 2.1 + static_cast<double>(k) * (2.3 + jy);
         emit(x, y, vy, rot + jvy * 0.002f, (k % 29) < 2);
     }
-    // 4) 700-frame autoclicker leg: identical time+xy+vy deltas per cycle.
     double baseX = 50.0 + (2000.0 + 500.0) * vx + 300.0 * vx * 1.5 + 700.0 * vx * 1.2;
     double baseY = 100.0 + 2000.0 * 0.21 + 500.0 * 2.1 + 300.0 * 2.3 + 700.0 * 2.2;
     for (int k = 0; k < 700; ++k) {
@@ -2716,7 +2824,6 @@ PerFrameSelfTestResult selfTestPerFrameCodec() {
         return result;
     }
 
-    // Field tolerance = half the fixed-point quantum (rounding bound).
     auto closeEnough = [](double a, double b, double tol) {
         return std::fabs(a - b) <= tol;
     };
@@ -2826,7 +2933,6 @@ PerFrameSelfTestResult selfTestPerFrameCodec() {
         }
     }
 
-    // Determinism: re-encoding the decoded section must reproduce v4 byte-exact.
     std::vector<uint8_t> v4Again;
     writePerFrameSection(v4Again, decoded, 240.0);
     if (v4Again.size() != v4.size()) {

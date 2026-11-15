@@ -12,16 +12,6 @@ class SkMacro;
 
 namespace skk::skk3 {
 
-// v6: dense wire — CML V7-style encoding with RLE hold repeats. XOR-masked
-// header strings, byte-LEB128 varints, zigzag integers, delta timestamps
-// (TimeStream with tick anchor + picosecond residue) and bit-delta coordinate
-// streams. Input records lead with the button byte; button==0 marks an RLE
-// repeat of the previous record's cycle. v5 payload layout is no longer
-// readable.
-// 7: per-frame section layout v4 - fixed-point first-difference columns with
-//     record-level run-length blocks (positions x1/256px, velocities /16384,
-//     rotation /1024; integer-exact, deterministic round-trip, 5-15x smaller
-//     before the outer zstd pass). Old v6 files (layout 3) still load.
 inline constexpr uint16_t kWireVersion = 7;
 inline constexpr uint64_t kNativeSourceFormatId = 0x00000000FFFF0003ull;
 
@@ -39,11 +29,10 @@ enum Flags : uint32_t {
     FlagCompressed = 1u << 10,
     FlagHasPerFrame = 1u << 11,
     FlagHasVariance = 1u << 12,
-    // v4: tick labels are GD physics-step pairs (m_currentStep cadence), not
-    // floor(levelTime*TPS). Files without this bit keep the legacy time grid.
     FlagStepClock = 1u << 13,
     FlagHasPracticeFix = 1u << 14,
     FlagHasRngBoundaries = 1u << 15,
+    FlagHasCrc32 = 1u << 16,
 };
 
 enum class SectionKind : uint8_t {
@@ -56,7 +45,10 @@ enum class SectionKind : uint8_t {
     Variance = 7,
     PracticeFix = 8,
     RngBoundaries = 9,
+    Crc32 = 10,
 };
+
+inline constexpr uint8_t kCrcKindTable = 0xFF;
 
 struct Input {
     double timeSeconds = 0.0;
@@ -89,7 +81,6 @@ struct PracticeFixCheckpoint {
     std::vector<std::pair<int32_t, int32_t>> persistentItems;
     std::vector<std::pair<uint16_t, float>> variance;
     bool clickReleased[6] = { true, true, true, true, true, true };
-    // Full P1 state
     float p1_x = 0.f, p1_y = 0.f, p1_rotation = 0.f;
     double p1_yVelocity = 0.0, p1_fallSpeed = 0.0;
     double p1_platformerXVelocity = 0.0, p1_groundYVelocity = 0.0;
@@ -116,7 +107,6 @@ struct PracticeFixCheckpoint {
     int32_t p1_stateOnGround = 0, p1_stateForce = 0, p1_reverseRelated = 0;
     uint64_t p1_flags1 = 0, p1_flags2 = 0;
     bool p1_holdingRight = false, p1_holdingLeft = false;
-    // Full P2 state
     float p2_x = 0.f, p2_y = 0.f, p2_rotation = 0.f;
     double p2_yVelocity = 0.0, p2_fallSpeed = 0.0;
     double p2_platformerXVelocity = 0.0, p2_groundYVelocity = 0.0;
@@ -150,11 +140,6 @@ struct Anchor {
     PlaybackAnchor state;
 };
 
-// v2 — per-frame reliability layer (position + velocity every frame).
-// Records x/y + vertical velocity (and pre-slope velocity) each frame as a
-// safety net on top of the sparse semantic anchors. Restores position AND
-// velocity together on playback — the velocity fix is always applied, no
-// toggle (avoids the GDH pitfall of forcing position without velocity -> jumps).
 struct PerFrame {
     double timeSeconds = 0.0;
     float p1x = 0.f;
@@ -174,7 +159,6 @@ struct PerFrame {
     int32_t p2RingId = 0;
 };
 
-// GD variance-slot snapshot entry (GJBaseGameLayer::m_varianceValues).
 struct VarianceEntry {
     uint16_t index = 0;
     float value = 0.f;
@@ -196,8 +180,6 @@ struct Macro {
     std::string levelName;
     std::string author;
     double framerateHint = 240.0;
-    // Display rate the macro was recorded under; 0 = follow framerateHint. The
-    // only rate that reaches the wire file, and only when it differs.
     double displayFps = 0.0;
     bool lockDelta = true;
     bool realTime = false;
@@ -224,14 +206,12 @@ struct Macro {
     std::vector<VarianceEntry> variance;
     uint64_t setupRngSeed = 0;
     std::vector<std::pair<int32_t, int32_t>> persistentItems;
-    // Practice-restart boundary reseeds (tick, progress, live triple) - same as
-    // the legacy SkRngBoundary, mirrored for every splice point.
     struct RngBoundary {
         int32_t tick = 0;
         int32_t progress = 0;
-        uint64_t primary = 0;   // live GD+0x6C2E90 at the boundary frame
-        uint64_t shake = 0;     // live GD+0x6C2EE0 at the boundary frame
-        uint64_t teleport = 0;  // live GD+0x6C2EF8 at the boundary frame
+        uint64_t primary = 0;
+        uint64_t shake = 0;
+        uint64_t teleport = 0;
     };
     std::vector<RngBoundary> rngBoundaries;
 };
@@ -246,17 +226,11 @@ double maxSourceTps(Macro const& macro);
 Macro fromSkMacro(SkMacro const& macro);
 SkMacro toSkMacro(Macro const& macro);
 
-// Runtime self-check for the per-frame v4 codec: round-trips a synthetic
-// macro (holds/gravity/autoclicker/p2/taps) through the section writer+reader
-// and reports byte-stability + the v3-vs-v4 size ratio.
 struct PerFrameSelfTestResult {
     bool ok = false;
     uint64_t frames = 0;
     size_t v3Bytes = 0;
     size_t v4Bytes = 0;
-    // BUG-06/SELFTEST diagnostics: which stage failed and the first
-    // diverging detail, so a failing round-trip pinpoints the root cause
-    // instead of a bare 'ok=false'.
     enum class Stage {
         None,
         ReadFailed,
@@ -268,19 +242,21 @@ struct PerFrameSelfTestResult {
     int64_t failIdx = -1;
     uint32_t expected = 0;
     uint32_t decoded = 0;
-    std::string failDetail; // which field diverged, or rewrite byte count
+    std::string failDetail;
 };
 PerFrameSelfTestResult selfTestPerFrameCodec();
 
-// The header self-test: proves that a file written WITHOUT the display rate -
-// which is byte for byte what the previous build wrote, since the field is
-// omitted rather than zero-filled - still decodes, and that a file WITH one
-// grows its header by exactly that field and nothing else.
 struct HeaderSelfTestResult {
     bool ok = false;
     size_t oldShapeHeaderBytes = 0;
     std::string detail;
 };
 HeaderSelfTestResult selfTestHeader();
+
+struct CrcSelfTestResult {
+    bool ok = false;
+    std::string detail;
+};
+CrcSelfTestResult selfTestCrc();
 
 }

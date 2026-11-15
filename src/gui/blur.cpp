@@ -4,6 +4,7 @@
 
 #include "gui/blur.hpp"
 #include "core/hotpath.hpp"
+#include "logger/logger.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 
@@ -37,19 +38,14 @@ GLuint g_snapshot = 0;
 int    g_snapW    = 0;
 int    g_snapH    = 0;
 bool   g_failed   = false;
-// True once the snapshot has been taken for the current frame. The capture is a
-// full-screen copy, so it is deferred until a blur region actually asks for the
-// pixels - see captureSnapshot() for why that is still a pristine frame.
 bool   g_snapDirty = true;
-// Whether g_snapshot has storage yet. glCopyTexImage2D allocates it as a side
-// effect, glCopyTexSubImage2D does not - and reallocating every frame is the
-// expensive variant.
 bool   g_snapStorage = false;
 
-// Device tilt (parallax input), -1..1. Fed from CMMotionManager on Apple
-// platforms, stays zero elsewhere (and on desktop).
 float g_parX = 0.f;
 float g_parY = 0.f;
+
+bool g_debugTint = false;
+float g_debugRoundBias = 0.0f;
 
 #if defined(__APPLE__)
 #include <objc/message.h>
@@ -87,14 +83,14 @@ void pollParallax() {
     g_parX = std::clamp((float)(roll / 1.2), -1.0f, 1.0f);
     g_parY = std::clamp((float)(pitch / 1.2), -1.0f, 1.0f);
 }
-} // anonymous namespace
+}
 #else
 namespace {
 void pollParallax() {
     g_parX = 0.f;
     g_parY = 0.f;
 }
-} // anonymous namespace
+}
 #endif
 
 struct BlurProgram {
@@ -110,13 +106,17 @@ struct BlurProgram {
     GLint locNoise       = -1;
     GLint locFresnel     = -1;
     GLint locChroma      = -1;
-    GLint locSpecular    = -1;
     GLint locLens        = -1;
     GLint locParallax    = -1;
     GLint locGloss       = -1;
     GLint locLiquid      = -1;
     GLint locSheen       = -1;
     GLint locTime        = -1;
+    GLint locSnap        = -1;
+    GLint locSnapUV0     = -1;
+    GLint locSnapUVS     = -1;
+    GLint locReplace     = -1;
+    GLint locDebug       = -1;
 };
 
 BlurProgram g_down;
@@ -163,10 +163,14 @@ const char* kUpsampleShader =
     "uniform float u_noise;\n"
     "uniform float u_fresnel;\n"
     "uniform float u_chroma;\n"
-    "uniform float u_specular;\n"
     "uniform float u_lens;\n"
     "uniform vec2 u_parallax;\n"
     "uniform float u_gloss;\n"
+    "uniform sampler2D u_snap;\n"
+    "uniform vec2 u_snapUV0;\n"
+    "uniform vec2 u_snapUVS;\n"
+    "uniform float u_replace;\n"
+    "uniform float u_debug;\n"
     "uniform float u_liquid;\n"
     "uniform float u_sheen;\n"
     "uniform float u_time;\n"
@@ -193,11 +197,6 @@ const char* kUpsampleShader =
     "    float d = hash21(i + vec2(1.0, 1.0));\n"
     "    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n"
     "}\n"
-    //  Liquid field: low-frequency billowed noise (feTurbulence fractalNoise,
-    //  baseFrequency 0.01 -> a couple of large slow-cresting blobs over the
-    //  panel), two octaves so the crests carry a finer ripple. This single
-    //  field drives BOTH the wave displacement of the sampled backdrop and a
-    //  top-left-light specular sheen (feDisplacementMap + feSpecularLighting).
     "float liquidField(vec2 uv, float t) {\n"
     "    vec2 p = uv * 2.2 + vec2(t * 0.040, t * 0.023);\n"
     "    float n = vnoise(p);\n"
@@ -211,9 +210,7 @@ const char* kUpsampleShader =
     "    float mask = 1.0;\n"
     "    float edge = 0.0;\n"
     "    vec2 inwardDir = vec2(0.0);\n"
-    //  Liquid field (feTurbulence): two independently-seeded low-freq noise
-    //  values drive the X and Y wave displacement (feDisplacementMap uses the
-    //  R/G channels), a third pair of samples feed the specular sheen gradient.
+    "    vec3 rimCol = vec3(0.0);\n"
     "    float liqX = 0.5;\n"
     "    float liqY = 0.5;\n"
     "    float liqDx = 0.5;\n"
@@ -228,16 +225,11 @@ const char* kUpsampleShader =
     "    if (u_mask > 0.5) {\n"
     "        float d = sdfDist(v_uv);\n"
     "        mask = 1.0 - smoothstep(-1.0, 1.0, d);\n"
-    //  Edge-focused glass (hyprglass / iOS): refraction lives in a thin band
-    //  right at the rim with a Gaussian falloff — Snell's law bends most at the
-    //  glancing angles (the exact boundary) and the bend dies out quickly toward
-    //  the panel centre, so the middle of the glass stays flat and clean.
-    //  The dome lens is only a faint interior magnifier, also fading at the rim.
+    "        float bordPx = min(min(v_uv.x, 1.0 - v_uv.x) * u_size.x,\n"
+    "                             min(v_uv.y, 1.0 - v_uv.y) * u_size.y);\n"
+    "        mask *= smoothstep(0.0, 6.0, bordPx);\n"
     "        float bezel = max(u_refractBand, 1.0);\n"
     "        edge = exp(-pow(abs(d) / bezel, 2.0));\n"
-    //  Fresnel: reflection grows toward the glancing rim (Schlick, glass/air
-    //  f0 ~ 0.04), so transmission collapses at the very edge — the Snell
-    //  shimmer must die there too, peaking instead just inside the rim.
     "        float fresnelR = 0.04 + 0.96 * pow(edge, 5.0);\n"
     "        float transmit = 1.0 - fresnelR;\n"
     "        vec2 toCentrePx = (vec2(0.5) - v_uv) * u_size;\n"
@@ -254,9 +246,6 @@ const char* kUpsampleShader =
     "        }\n"
     "        sampleUV = v_uv + baseOffset + domeUV;\n"
     "        sampleUV += u_parallax * (2.0 + 22.0 * edge) / u_size;\n"
-    //  Liquid wave displacement (feDisplacementMap scale 150): the backdrop is
-    //  pushed along the noise crests — subtle in the clean centre, full ripple
-    //  near the rim (where the glass is thickest, like a lens slab).
     "        vec2 liqWave = (vec2(liqX, liqY) - 0.5) * mix(0.30, 1.0, edge);\n"
     "        sampleUV += liqWave * u_liquid / u_size;\n"
     "    }\n"
@@ -270,55 +259,68 @@ const char* kUpsampleShader =
     "    sum += texture2D(u_tex, sampleUV + vec2(-u_halfpixel.x, -u_halfpixel.y)) * 2.0;\n"
     "    vec3 col = (sum / 12.0).rgb;\n"
     "    if (u_mask > 0.5) {\n"
-    //  Colour fidelity: the glass body must read as the same backdrop, only
-    //  slightly altered — a "psychophysical" check of Цветопередача. The HDR
-    //  recolor is therefore scaled by `edge`: an honest, near-identical centre
-    //  and a ramp up to the strong tint only at the rim, where the refraction/
-    //  Fresnel/chroma make the edge itself a "glass object".
+    "        // Rim dark-leak fix (user report 08.11: dark fringe hugging the\n"
+    "        // rounded boundary): the inward refraction/parallax/liquid sample\n"
+    "        // displacement is strongest at the rim, so shards of the dark\n"
+    "        // panel colour bleed along the rounded edge - the dark fringe in\n"
+    "        // the corners. Within ~6 px of the silhouette, fade the displaced\n"
+    "        // colour into the UNdisplaced blurred sample (the same Kawase\n"
+    "        // taps taken at v_uv instead of sampleUV).\n"
+    "        float rimD = sdfDist(v_uv);\n"
+    "        if (rimD > -14.0) {\n"
+    "            vec4 psum = texture2D(u_tex, v_uv + vec2(-u_halfpixel.x * 2.0, 0.0));\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(-u_halfpixel.x, u_halfpixel.y)) * 2.0;\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(0.0, u_halfpixel.y * 2.0));\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(u_halfpixel.x, u_halfpixel.y)) * 2.0;\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(u_halfpixel.x * 2.0, 0.0));\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(u_halfpixel.x, -u_halfpixel.y)) * 2.0;\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(0.0, -u_halfpixel.y * 2.0));\n"
+    "            psum += texture2D(u_tex, v_uv + vec2(-u_halfpixel.x, -u_halfpixel.y)) * 2.0;\n"
+    "            rimCol = (psum / 12.0).rgb;\n"
+    "            col = mix(rimCol, col, clamp((-rimD - 1.0) / 5.0, 0.0, 1.0));\n"
+    "        }\n"
     "        float hdrBoost = mix(0.35, 1.0, edge);\n"
     "        col = pow(max(col, vec3(0.0)), vec3(1.0 - 0.10 * hdrBoost));\n"
     "        float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
-    "        col = mix(vec3(luma), col, vec3(1.0 + 0.35 * hdrBoost));\n"
+    "        col = mix(vec3(luma), col, vec3(1.0 + 0.50 * hdrBoost));\n"
     "        col = clamp(col * (1.0 + 0.22 * hdrBoost) + vec3(0.03 * hdrBoost), 0.0, 1.0);\n"
-    //  Chromatic aberration at the rim: red and blue refract on a slightly wider
-    //  path than green, mimicking dispersion of the curved glass edge.
     "        if (u_chroma > 0.001) {\n"
     "            vec2 chroma = inwardDir * edge * u_chroma * 10.0 / u_size;\n"
     "            float cw = u_chroma * edge;\n"
     "            col.r = mix(col.r, texture2D(u_tex, sampleUV + chroma).r, cw);\n"
     "            col.b = mix(col.b, texture2D(u_tex, sampleUV - chroma).b, cw);\n"
     "        }\n"
-    //  Fresnel reflection (Отражение): reflectance R = f0 + (1-f0)·(1-cosθ)^5
-    //  climbs toward glancing angles, so the rim stops transmitting and reads
-    //  as a soft neutral mirror streak instead of a coloured glow.
     "        float reflectR = 0.04 + 0.96 * pow(edge, 5.0);\n"
-    "        float mirror = reflectR * u_fresnel * 0.22;\n"
+    "        float mirror = reflectR * u_fresnel * 0.12;\n"
     "        vec3 reflectCol = vec3(dot(col, vec3(0.2126, 0.7152, 0.0722))) * 0.5 + vec3(0.10);\n"
     "        col = mix(col, reflectCol, mirror);\n"
-    //  Tyndall effect (Эффект Тиндаля): Rayleigh volume-scattering of the
-    //  colloid body — milky frosted haze deepest in the middle of the glass,
-    //  slightly cool because short wavelengths scatter hardest. Rim stays clear.
     "        float frost = u_gloss * (1.0 - edge) * 0.08;\n"
     "        col = mix(col, vec3(0.90, 0.92, 0.97), frost);\n"
-    //  Refractometry + spectroscopy (Beer–Lambert): n = n0 + a·C, but the
-    //  absorption I = I0·exp(−ε·C·l) grows with the chord length, so the rim
-    //  of the slab is a little deeper and tinted.
-    "        col *= exp(-0.035 * (1.0 + edge * 1.4));\n"
-//  Pseudo-random dithering: breaks up banding on the HDR gradients.
+    "        col *= exp(-0.008 * edge * 1.4);\n"
     "        col += (randNoise(gl_FragCoord.xy * 1e-3) - 0.5) * u_noise;\n"
-    //  Liquid specular sheen (feSpecularLighting): a soft white glint that
-    //  slides over the crests of the liquid field, lit from above-left like the
-    //  macOS point light (x=-200, y=-200, z=300). Applies to the whole pane,
-    //  slightly stronger at the rim where the surface curves.
     "        vec3 liqN = normalize(vec3(-(liqDx - liqX) * 14.0, -(liqDy - liqY) * 14.0, 1.0));\n"
     "        vec3 liqL = normalize(vec3(-0.35, -0.35, 0.87));\n"
     "        vec3 liqH = normalize(liqL + vec3(0.0, 0.0, 1.0));\n"
     "        float liqSpec = pow(max(dot(liqN, liqH), 0.0), 48.0);\n"
     "        col += vec3(1.0) * liqSpec * u_sheen * mix(0.55, 1.0, edge);\n"
-    "        col *= 1.0 - (pow(v_uv.y, 2.0) * edge * edge * 0.09);\n"
-    "        col = clamp(col, 0.0, 1.0);\n"
+    "        col *= 1.0 - (pow(v_uv.y, 2.0) * edge * edge * 0.03);\n"
+    "        float rf2 = clamp((-rimD - 0.5) / 8.0, 0.0, 1.0);\n"
+    "        col = mix(rimCol, col, rf2);\n"
+        "        col = clamp(col, 0.0, 1.0);\n"
     "    }\n"
-    "    gl_FragColor = vec4(col, u_alpha * mask);\n"
+    "    if (u_replace > 0.5) {\n"
+    "        vec3 snapCol = texture2D(u_snap, u_snapUV0 + v_uv * u_snapUVS).rgb;\n"
+    "        vec3 finalCol = mix(snapCol, col, mask);\n"
+    "        gl_FragColor = vec4(finalCol, u_alpha);\n"
+    "    } else {\n"
+    "        gl_FragColor = vec4(col, u_alpha * mask);\n"
+    "    }\n"
+    "    if (u_debug > 0.5) {\n"
+    "        vec3 dcol = texture2D(u_snap, u_snapUV0 + v_uv * u_snapUVS).rgb;\n"
+    "        if (mask > 0.9) dcol = vec3(0.05, 1.0, 0.15);\n"
+    "        else if (mask > 0.05) dcol = vec3(1.0, 0.0, 1.0);\n"
+    "        gl_FragColor = vec4(dcol, 1.0);\n"
+    "    }\n"
     "}\n";
 
 bool compileProgram(BlurProgram& out, const char* fragSrc, bool isUpsample) {
@@ -350,13 +352,17 @@ bool compileProgram(BlurProgram& out, const char* fragSrc, bool isUpsample) {
         out.locNoise       = glGetUniformLocation(handle, "u_noise");
         out.locFresnel     = glGetUniformLocation(handle, "u_fresnel");
         out.locChroma      = glGetUniformLocation(handle, "u_chroma");
-        out.locSpecular    = glGetUniformLocation(handle, "u_specular");
-        out.locLens        = glGetUniformLocation(handle, "u_lens");
+            out.locLens        = glGetUniformLocation(handle, "u_lens");
         out.locParallax    = glGetUniformLocation(handle, "u_parallax");
         out.locGloss       = glGetUniformLocation(handle, "u_gloss");
         out.locLiquid      = glGetUniformLocation(handle, "u_liquid");
         out.locSheen       = glGetUniformLocation(handle, "u_sheen");
         out.locTime        = glGetUniformLocation(handle, "u_time");
+        out.locSnap        = glGetUniformLocation(handle, "u_snap");
+        out.locSnapUV0     = glGetUniformLocation(handle, "u_snapUV0");
+        out.locSnapUVS     = glGetUniformLocation(handle, "u_snapUVS");
+        out.locReplace     = glGetUniformLocation(handle, "u_replace");
+        out.locDebug       = glGetUniformLocation(handle, "u_debug");
     }
 
     return true;
@@ -402,25 +408,9 @@ bool ensureTexture() {
     return true;
 }
 
-// Grab the whole freshly-rendered game frame into g_snapshot.
-//
-// This is a full-screen copy - at 2560x1440 GL_RGB that is 11 MB moved per
-// call - and it used to run on EVERY frame from newFrame(), including while the
-// menu was closed and nothing was blurred. That is pure waste, and on a weak GPU
-// a per-frame full-screen texture reallocation is exactly the kind of thing that
-// shows up as "the game is heavier with skkBot2 loaded than with a light bot".
-//
-// So the copy is deferred to the first blur region of the frame, which is still
-// correct: ImGui does not execute draw commands as they are submitted. The
-// commands are recorded during gui.draw() and run later in RenderDrawData, still
-// before swapBuffers, so the backbuffer at that moment is the untouched game
-// frame - the same argument the old call site made, just evaluated later.
 void captureSnapshot() {
     g_snapDirty = false;
     if (!g_snapshot) return;
-    // Once per frame at most, and only when something is actually blurred - but
-    // a full-screen copy is exactly the kind of cost that has to be measured
-    // rather than assumed, so it is timed here.
     skkbot2::hot::Timed skkbot2Timing(skkbot2::hot::BlurSnap);
 
     GLint viewport[4] = { 0, 0, 0, 0 };
@@ -433,9 +423,6 @@ void captureSnapshot() {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
 
     glBindTexture(GL_TEXTURE_2D, g_snapshot);
-    // SubImage when the size is unchanged: no storage reallocation. CopyImage
-    // only has to run when the window was resized (or on the very first frame),
-    // and it is the call that gives the texture its storage.
     if (g_snapStorage && fbW == g_snapW && fbH == g_snapH) {
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, fbW, fbH);
     } else {
@@ -454,7 +441,6 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
     const size_t index = (size_t)(intptr_t)cmd->UserCallbackData;
     if (index >= g_regions.size()) return;
 
-    // First region of the frame: take the snapshot now, not back in newFrame().
     if (g_snapDirty) captureSnapshot();
 
     if (!ensurePrograms() || !ensureTexture()) return;
@@ -493,15 +479,21 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
     GLint previousProgram = 0;
     GLint previousArray   = 0;
     GLint previousVao     = 0;
-    GLint previousBlendSrc = GL_SRC_ALPHA;
-    GLint previousBlendDst = GL_ONE_MINUS_SRC_ALPHA;
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousBlendSrcRGB   = GL_SRC_ALPHA;
+    GLint previousBlendDstRGB   = GL_ONE_MINUS_SRC_ALPHA;
+    GLint previousBlendSrcAlpha = GL_SRC_ALPHA;
+    GLint previousBlendDstAlpha = GL_ONE_MINUS_SRC_ALPHA;
 
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
     glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previousArray);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previousVao);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &previousBlendSrc);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &previousBlendDst);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &previousBlendSrcRGB);
+    glGetIntegerv(GL_BLEND_DST_RGB, &previousBlendDstRGB);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &previousBlendSrcAlpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &previousBlendDstAlpha);
 
     const GLboolean previousScissor = glIsEnabled(GL_SCISSOR_TEST);
 
@@ -562,12 +554,6 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     };
 
-    // Source the Kawase chain from the per-frame pristine snapshot instead of
-    // the live backbuffer. The snapshot was taken at the very start of the
-    // imgui frame, before any GL geometry was emitted, so the content under the
-    // glass is always this frame's real game pixels — never our own window,
-    // never a partially-updated mid-render buffer, no matter how fast the
-    // window is being dragged. Sample the sub-rect via UVs into the snapshot.
     const bool useSnap = g_snapshot && g_snapW == fbW && g_snapH == fbH;
 
     const float snX = (float)px0 / (float)fbW;
@@ -582,17 +568,31 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
     };
 
     int levels = 1 + (int)(region.radius * 0.5f);
-    levels = std::clamp(levels, 1, 3);
+    levels = std::clamp(levels, 1, 6);
     while (levels > 1 && (std::min(pw, ph) >> levels) < 8)
         levels--;
+
+    {
+        static double sLastCornerLog = 0.0;
+        const double nowS = ImGui::GetTime();
+        if (nowS - sLastCornerLog > 1.0) {
+            sLastCornerLog = nowS;
+            skkbot2::log::info(
+                "[BLURC] region#{} rect=({:.1f},{:.1f})-({:.1f},{:.1f}) r={:.1f} "
+                "rPx={:.1f} alpha={:.2f} radius={:.1f} pw={} ph={} scale={:.2f} "
+                "fb={}x{} snap={}x{} usedSnap={}",
+                index, region.x0, region.y0, region.x1, region.y1,
+                region.rounding, region.rounding * scaleX, region.alpha,
+                region.radius, pw, ph, scaleX, fbW, fbH, g_snapW, g_snapH,
+                (g_snapshot && g_snapW == fbW && g_snapH == fbH) ? 1 : 0);
+        }
+    }
 
     int curW = pw;
     int curH = ph;
 
     glBlendFunc(GL_ONE, GL_ZERO);
 
-    // Bind the snapshot for the first (base) downsample: the shader samples at
-    // v_uv, and the region quad maps 1:1 to the snapshot's sub-rect.
     const auto bindBase = [&] {
         glBindTexture(GL_TEXTURE_2D, g_snapshot);
         g_down.program->use();
@@ -601,8 +601,6 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
             glUniform2f(g_down.locHalfpixel, 0.5f / (float)fbW, 0.5f / (float)fbH);
     };
 
-    // Snap (viewport) mismatch fallback: copy the region straight from the
-    // live backbuffer, as the pre-snapshot versions did.
     if (!useSnap) {
         glBindTexture(GL_TEXTURE_2D, g_texture);
         glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, px0, py0, pw, ph, 0);
@@ -640,7 +638,10 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         if (g_up.locHalfpixel >= 0)
             glUniform2f(g_up.locHalfpixel, 0.5f / (float)curW, 0.5f / (float)curH);
         if (g_up.locAlpha >= 0) glUniform1f(g_up.locAlpha, last ? region.alpha : 1.f);
-        if (g_up.locRound >= 0) glUniform1f(g_up.locRound, region.rounding * scaleX);
+        if (g_up.locDebug >= 0) glUniform1f(g_up.locDebug, g_debugTint ? 1.f : 0.f);
+        if (g_up.locRound >= 0)
+            glUniform1f(g_up.locRound,
+                        (region.rounding + g_debugRoundBias) * scaleX);
         if (g_up.locSize  >= 0) glUniform2f(g_up.locSize, (float)pw, (float)ph);
         if (g_up.locMask  >= 0) glUniform1f(g_up.locMask, last ? 1.f : 0.f);
         if (g_up.locRefract >= 0) glUniform1f(g_up.locRefract, 1.0f);
@@ -649,15 +650,27 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         if (g_up.locNoise >= 0) glUniform1f(g_up.locNoise, 0.06f);
         if (g_up.locFresnel >= 0) glUniform1f(g_up.locFresnel, 1.0f);
         if (g_up.locChroma >= 0) glUniform1f(g_up.locChroma, 1.0f);
-        if (g_up.locSpecular >= 0) glUniform1f(g_up.locSpecular, 2.5f);
         if (g_up.locLens >= 0) glUniform1f(g_up.locLens, 1.6f);
         if (g_up.locParallax >= 0) glUniform2f(g_up.locParallax, g_parX, g_parY);
         if (g_up.locGloss >= 0) glUniform1f(g_up.locGloss, 1.0f);
         if (g_up.locLiquid >= 0) glUniform1f(g_up.locLiquid, 8.0f);
         if (g_up.locSheen >= 0) glUniform1f(g_up.locSheen, 0.10f);
-        if (g_up.locTime >= 0) glUniform1f(g_up.locTime, std::fmod(static_cast<double>(ImGui::GetTime()), 100.0));
+        if (g_up.locTime >= 0) glUniform1f(g_up.locTime, std::fmod(static_cast<float>(ImGui::GetTime()), 100.0f));
 
-        glBlendFunc(last ? GL_SRC_ALPHA : GL_ONE, last ? GL_ONE_MINUS_SRC_ALPHA : GL_ZERO);
+        const bool useReplace = last && g_snapshot != 0;
+        if (useReplace) {
+            if (g_up.locSnap >= 0) glUniform1i(g_up.locSnap, 1);
+            if (g_up.locSnapUV0 >= 0) glUniform2f(g_up.locSnapUV0, snX, snY);
+            if (g_up.locSnapUVS >= 0) glUniform2f(g_up.locSnapUVS, snW, snH);
+            if (g_up.locReplace >= 0) glUniform1f(g_up.locReplace, 1.0f);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, g_snapshot);
+            glActiveTexture(GL_TEXTURE0);
+            glBlendFunc(GL_ONE, GL_ZERO);
+        } else {
+            if (g_up.locReplace >= 0) glUniform1f(g_up.locReplace, 0.0f);
+            glBlendFunc(last ? GL_SRC_ALPHA : GL_ONE, last ? GL_ONE_MINUS_SRC_ALPHA : GL_ZERO);
+        }
 
         drawRect(nextW, nextH);
 
@@ -668,27 +681,28 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         curH = nextH;
     }
 
+    glActiveTexture(previousActiveTexture);
     glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)previousArray);
     glBindVertexArray((GLuint)previousVao);
     glUseProgram((GLuint)previousProgram);
 
-    glBlendFunc((GLenum)previousBlendSrc, (GLenum)previousBlendDst);
+    glBlendFuncSeparate(static_cast<GLenum>(previousBlendSrcRGB),
+                        static_cast<GLenum>(previousBlendDstRGB),
+                        static_cast<GLenum>(previousBlendSrcAlpha),
+                        static_cast<GLenum>(previousBlendDstAlpha));
 
     if (previousScissor)
         glEnable(GL_SCISSOR_TEST);
 }
 
-} // anonymous namespace
+}
 
 namespace skkbot2::gui::blur {
 
 void newFrame() {
     pollParallax();
     g_regions.clear();
-    // Mark this frame's pixels as not captured yet, and copy nothing here. If
-    // no region ends up blurred this frame, no copy happens at all - which is
-    // the normal case, since the menu is closed almost all the time.
     g_snapDirty = true;
     if (!g_failed) {
         if (!ensurePrograms() || !ensureTexture()) return;
@@ -697,6 +711,14 @@ void newFrame() {
 
 bool available() {
     return !g_failed;
+}
+
+void setDebugTint(bool on) {
+    g_debugTint = on;
+}
+
+void setDebugRoundBias(float biasPx) {
+    g_debugRoundBias = biasPx;
 }
 
 void submit(ImDrawList* list, ImVec2 min, ImVec2 max, float rounding, float radius, float alpha) {
@@ -709,4 +731,4 @@ void submit(ImDrawList* list, ImVec2 min, ImVec2 max, float rounding, float radi
     list->AddCallback(renderRegion, (void*)(intptr_t)(g_regions.size() - 1));
 }
 
-} // namespace skkbot2::gui::blur
+}

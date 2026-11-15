@@ -2,11 +2,6 @@
 
 #include <vector>
 
-// Stub replacement for the removed skkBot autoclicker module.
-// The replay engine / checkpoint system reference the Autoclicker singleton and
-// its player-hold bookkeeping. The native-imGui skkBot2 port ships no
-// autoclicker, so every operation is a no-op but the public surface the engine
-// touches is preserved so the engine compiles unchanged.
 
 struct TimedAutoclickerAction {
     float offset = 0.0f;

@@ -43,7 +43,6 @@ public:
         return instance;
     }
 
-    // Checks whether all 7 required FFmpeg DLLs exist in the target ffmpeg/ folder.
     static bool areDllsPresent() {
         const auto dir = skkbot2::paths::ffmpeg();
         std::error_code ec;
@@ -105,7 +104,6 @@ private:
     void runWorker() {
         m_cancelled.store(false);
 
-        // 1. Measure speed / latency for mirrors
         std::string chosenUrl = m_mirrors[0].url;
         std::string chosenName = m_mirrors[0].name;
         double bestSpeed = -1.0;
@@ -121,8 +119,7 @@ private:
 
             auto t0 = std::chrono::steady_clock::now();
             auto req = geode::utils::web::WebRequest();
-            req.timeout(std::chrono::seconds(7));
-            // Read first 512 KB to test real transfer rate
+            req.timeout(asp::time::Duration::fromSecs(7));
             req.downloadRange({0, 524287});
             auto res = req.getSync(mirror.url);
             auto t1 = std::chrono::steady_clock::now();
@@ -156,7 +153,7 @@ private:
         const auto zipPath = ffmpegDir / "dll.zip";
 
         auto dlReq = geode::utils::web::WebRequest();
-        dlReq.timeout(std::chrono::seconds(180));
+        dlReq.timeout(asp::time::Duration::fromSecs(180));
         dlReq.onProgress([this](geode::utils::web::WebProgress const& p) {
             if (p.downloadTotal() > 0) {
                 float pct = static_cast<float>(p.downloaded()) / static_cast<float>(p.downloadTotal());
@@ -173,7 +170,6 @@ private:
         }
 
         if (!dlRes.ok() || dlRes.data().empty()) {
-            // Fallback to the other mirror if the chosen one failed during full download
             std::string fallbackUrl;
             std::string fallbackName;
             for (const auto& m : m_mirrors) {
@@ -190,7 +186,7 @@ private:
                                    dlRes.code(), fallbackName);
                 m_activeMirrorName = fallbackName;
                 auto fbReq = geode::utils::web::WebRequest();
-                fbReq.timeout(std::chrono::seconds(180));
+                fbReq.timeout(asp::time::Duration::fromSecs(180));
                 fbReq.onProgress([this](geode::utils::web::WebProgress const& p) {
                     if (p.downloadTotal() > 0) {
                         float pct = static_cast<float>(p.downloaded()) / static_cast<float>(p.downloadTotal());
@@ -214,8 +210,6 @@ private:
         m_statusMessage = "Extracting FFmpeg DLLs...";
         skkbot2::log::info("[FFMPEG-DL] Download finished ({} bytes), writing to disk", dlRes.data().size());
 
-        // Geode v6: file-API принимают asp::fs::PathView (UTF-8 строка) —
-        // конвертируем через наш мост.
         auto saveRes = dlRes.into(skk::pathToUtf8(zipPath));
         if (!saveRes) {
             m_lastError = "Failed to save dll.zip: " + saveRes.unwrapErr();
@@ -226,9 +220,8 @@ private:
             return;
         }
 
-        // Unzip into ffmpegDir
         auto unzipRes = geode::utils::file::Unzip::intoDir(
-            skk::pathToUtf8(zipPath), skk::pathToUtf8(ffmpegDir), true /* deleteZipAfter */);
+            skk::pathToUtf8(zipPath), skk::pathToUtf8(ffmpegDir), true );
         if (!unzipRes) {
             m_lastError = "Unzip failed: " + unzipRes.unwrapErr();
             m_state.store(State::Failed);
@@ -238,7 +231,6 @@ private:
             return;
         }
 
-        // Verify that the DLLs actually arrived
         if (!areDllsPresent()) {
             m_lastError = "Archive unpacked but some DLLs are missing";
             m_state.store(State::Failed);
@@ -269,5 +261,5 @@ private:
     std::function<void(bool success)> m_onComplete;
 };
 
-} // namespace render
-} // namespace skkbot2
+}
+}

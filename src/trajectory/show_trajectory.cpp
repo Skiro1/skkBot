@@ -1,128 +1,4 @@
 #include "physics/near_movers.hpp"
-// Trajectory overlay - "hold / release" prediction lines.
-//
-// STATUS: NOT COMPILED YET. This file is a starting point copied from GDH
-// (`D:\SKKVPN\GEODE_MODS\GDBOTS\GDH-main\src\hacks\level\show_trajectory.cpp`,
-// 487 lines) and adapted to this codebase so the work can continue later.
-// It is deliberately absent from CMakeLists.txt (`SKKBOT2_SOURCES`): the menu
-// row was removed on purpose, so nothing here is allowed to run. To turn it on
-// later: add the source to SKKBOT2_SOURCES, expose `Settings::enabled` in the
-// GUI, and fix the accuracy (see the TODO list at the bottom).
-//
-// The timing/render/FPS/TPS/Speed/Frame-Stepper integration was audited on
-// 24.10.2026 and is already written into the hooks below - see the TIMING block
-// further down before changing where `runSimulation` is called from.
-//
-// What GDH does (and what this port keeps 1:1):
-//   * two hidden dummy PlayerObjects per PlayLayer, created in `init`;
-//   * per frame, from `GJBaseGameLayer::updateCamera`, copy the real player's
-//     state into a dummy, then step it forward with `PlayerObject::update` +
-//     `GJBaseGameLayer::checkCollisions` for `iterations` steps;
-//   * one dummy holds Jump, the other releases it -> two lines, "jump" colour
-//     and "normal" colour;
-//   * every world-mutating callback (death, triggers, rings, gravity flips,
-//     shine effects, wave streak points, dash effects) is suppressed while the
-//     simulation runs, so the trace is visual only.
-//
-// Adapted from GDH:
-//   Config::get().get<T>("level.show_trajectory::...")  -> `Settings` below
-//   GUI_HACK_CREATE / hack.addHookPtr / setCustomWindow*  -> dropped (no menu)
-//   GDH::PracticeFix::copyPlayerState                     -> local copyPlayerState
-//   GDH::Utils::hexToColor4F                              -> local parseHexColor
-//   `invisible.tps` setting                               -> Settings::tps
-//
-// ---------------------------------------------------------------------------
-// TIMING: WHY THIS IS NOT GDH'S `updateCamera` HOOK ANY MORE (audit 24.10.2026)
-// ---------------------------------------------------------------------------
-// GDH recomputes the trace from `GJBaseGameLayer::updateCamera`. That was
-// correct in GDH's own timing model, where `GJBaseGameLayer::update` is called
-// once per drawn frame and runs its own internal substep loop. skkBot's timing
-// model is different, and the difference is exactly a factor of tps/fps:
-//
-//   CCScheduler::update(rawDt)                      <- SpeedControlScheduler hook
-//     schedulerCarry += rawDt * gameSpeed           (physicsbypass.cpp:619)
-//     while (carry >= 1/tps && batches < stepCap)   (physicsbypass.cpp:621-635)
-//         CCScheduler::update(1/tps)                <- ONE BATCH
-//           PlayLayer::update(1/tps)
-//             GJBaseGameLayer::update(1/tps)        <- PhysicsControlLayer hook
-//               applyCustomTickPlan(dt = 1/tps)     (physicsbypass.cpp:700)
-//                 steps = floor(extraDelta / (warp/tps))   -> 1 in steady state
-//                 StepGridEnforcement(steps, warp/tps)
-//                 GJBaseGameLayer::update(steps * warp/tps)
-//                   physics loop: `steps` x processCommands
-//                   updateCamera(totalDelta)        <- GDH's hook lives HERE
-//
-// So in skkBot `updateCamera` runs once per PHYSICS TICK, not once per drawn
-// frame: at 240 tps / 60 fps that is 4x per frame, at 1000 tps / 60 fps it is
-// ~16x. Each call costs 2 hypotheses x `iterations` x (2 players in dual) dummy
-// steps with `checkCollisions` - 600 dummy steps per call with the defaults -
-// which lands on the same thread that has to keep the macro's step budget
-// (`fps::stepCap`) fed. That is not a cosmetic cost: a missed budget drops
-// carry, and dropped carry is a macro that plays slow.
-//
-// THE FIX (what this file does now): run the trace from a `CCScheduler::update`
-// hook at `Priority::Early`, AFTER the base call. `Priority::Early` is -1000 and
-// `SpeedControlScheduler` is Normal (0), so this hook is first in the chain and
-// its `CCScheduler::update(dt)` call runs the whole rest of the chain - every
-// physics batch of the frame - and then returns. One recompute per drawn frame,
-// after the last step, before `CCDirector` visits the scene. A `Late` hook would
-// never fire at all: `advanceNormalScheduler` calls `scheduler->CCScheduler::
-// update(step)` QUALIFIED (physicsbypass.cpp:632), which bypasses every later
-// hook in the chain.
-//
-// What each subsystem does to the trace, measured, not assumed:
-//
-//   * TPS (ReplayEngine::runtimeTickRate) - sets the per-step dt, so it MUST
-//     reach the dummy. The dummy has to be advanced by the same delta the real
-//     player was, which is `getModifiedDelta` = clamp(warp,0,1) * 1/tps
-//     (physicsbypass.cpp:1176-1186). `PlayerObject::update` sees exactly that
-//     value, so `g_dtStep` is read from there - with NO division by timeWarp.
-//     GDH divides by `m_timeWarp`; under a time-warp trigger that makes the
-//     dummy advance at 1/tps while the real player advances at warp/tps, i.e.
-//     the prediction is 1/warp times too long. Speed portals / dash orbs are
-//     not affected (they are per-player, not per-tick).
-//   * Speed (ReplayEngine::gameSpeed) - multiplies `rawDt` before the planner
-//     (`speedDelta`, physicsbypass.cpp:445), so it changes HOW MANY steps a
-//     frame runs, never how long one step is. The trace's dt and its per-step
-//     physics are therefore untouched; only the recompute rate would move, and
-//     the scheduler hook pins that to the drawn frame anyway.
-//   * FPS (fps::sync / fps::stepCap / lock delta) - same story: a scheduling
-//     decision (physicsbypass.cpp:521-667). It changes steps per frame and the
-//     carry, not the step length. One trace per frame regardless of the pin.
-//   * Frame Stepper - `FrameStepper::updateScheduler` calls
-//     `scheduler->cocos2d::CCScheduler::update(stepDt)` QUALIFIED
-//     (frame_stepper.cpp:391/401), so the physics step bypasses the hook chain
-//     but the OUTER `CCScheduler::update` still reaches this file's hook once
-//     per game frame. The trace is recomputed after the step, at display rate,
-//     which is what makes the line move while the game is frozen. It never
-//     recomputes more than once per frame, so holding the step key cannot
-//     multiply the cost.
-//   * Render (Renderer::drive) - `stepOne` is `m_pScheduler->update(ticks/tps)`
-//     (render_hooks.cpp:235-237), i.e. the same hook, once per captured frame.
-//     But the draw node is a child of the scene, so an enabled trace would be
-//     BAKED INTO THE VIDEO. `runSimulation` therefore clears and bails while
-//     `Renderer::isRecording()`.
-//   * src/physics (StepGridEnforcement) - the midhooks pin the engine's own
-//     step-loop store inside `GJBaseGameLayer::update` (step_grid_hooks.cpp:32-
-//     60). The dummy is stepped with a direct `PlayerObject::update` +
-//     `checkCollisions` pair and never enters that loop, so the enforcement
-//     scope does not touch it and the trace cannot disturb it. `anti_ssb` is
-//     progress/scroll-side and is likewise out of the dummy's path.
-//   * SKK (replay_engine.cpp) and SKC (skc_hooks.cpp) - both take the tick from
-//     a `processCommands` hook, and both dispatch inputs from
-//     `processQueuedButtons`/`handleButton`. A dummy step calls neither, so
-//     `FrameClock` does not move, SKC consumes no macro clicks, the SKK
-//     substep split does not fire (it is gated on `this == m_player1`,
-//     replay_engine.cpp:3145) and the noclip-accuracy frame is not counted.
-//     `ReplayEngine::simulatingPath` is the flag the engine already reads for
-//     this (replay_engine.cpp:413/2715/2727/2738/2801/2879/3072/3138); it was
-//     set by the removed trajectory and nothing has set it since, so the trace
-//     sets it again for the duration of a simulation.
-//   * `PlayLayer::destroyPlayer` - a dummy death must not reach the bot's
-//     checkpoint/death code. `Priority::First` is -3000 and lower runs first,
-//     so -50 puts this hook ahead of every Normal hook in the chain, and
-//     returning without calling the base short-circuits the rest of the chain
-//     (Priority.hpp:8-18).
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/PlayerObject.hpp>
@@ -142,10 +18,6 @@
 
 #include "logger/logger.hpp"
 
-// Timing/engine state (ReplayEngine::runtimeTickRate, simulatingPath) and the
-// render-capture gate (skkbot2::render::Renderer::isRecording). Both are
-// read-only from here: this file never drives the clock, it only asks what the
-// clock is. `skkBot.hpp` already pulls in `render/renderer.hpp`.
 #include "skkBot.hpp"
 #include "trajectory.hpp"
 
@@ -163,19 +35,8 @@ Settings g_settings;
 
 bool g_simulating = false;
 bool g_simDead = false;
-// Length of ONE physics tick, in seconds, as the real player received it.
-//
-// Not `1/tps` and not `1/240`: `getModifiedDelta` hands the engine
-// `clamp(m_timeWarp, 0, 1) * 1/tps` (physicsbypass.cpp:1176-1186), so a time
-// warp changes the step length and the dummy has to follow it or it predicts a
-// different distance per tick than the game integrates. `g_dtStepValid` keeps
-// the 1/240 default honest until the first live step has been observed.
 float g_dtStep = 1.0f / 240.0f;
 bool g_dtStepValid = false;
-// Steps taken by the REAL player since the last trace. The scheduler hook only
-// recomputes when this is non-zero, so a paused or frozen frame costs nothing
-// and the Frame Stepper (whose step bypasses the hook chain) still produces
-// exactly one recompute per frame that actually moved.
 void runSimulation(PlayLayer* layer);
 
 class TrajectoryDrawNode : public cocos2d::CCDrawNode {
@@ -193,6 +54,14 @@ public:
     void visit() override {
         if (auto* pl = PlayLayer::get()) {
             runSimulation(pl);
+            if (pl->m_objectLayer && getParent()) {
+                const auto layerToWorld =
+                    pl->m_objectLayer->nodeToWorldTransform();
+                const auto worldToParent = getParent()->worldToNodeTransform();
+                setAdditionalTransform(
+                    cocos2d::CCAffineTransformConcat(layerToWorld,
+                                                     worldToParent));
+            }
         }
         CCDrawNode::visit();
     }
@@ -202,7 +71,6 @@ geode::Ref<TrajectoryDrawNode> g_drawNode = nullptr;
 geode::Ref<PlayerObject> g_dummyJump = nullptr;
 geode::Ref<PlayerObject> g_dummyNormal = nullptr;
 
-// One physics tick, or the engine's nominal tick before the first live step.
 float tickDelta(PlayLayer* layer) {
     if (g_dtStepValid && g_dtStep > 0.0f) {
         return g_dtStep;
@@ -221,11 +89,6 @@ float tickDelta(PlayLayer* layer) {
     return static_cast<float>(warp / std::max(1.0, tps));
 }
 
-// --- player state copy -----------------------------------------------------
-// Field-for-field clone of the live player onto a dummy. GDH's
-// checkpointData.hpp::copyPlayerState; `m_holdingButtons` and the batch nodes
-// are intentionally skipped there too (they belong to the real player's
-// rendering, not to its physics).
 void copyPlayerState(PlayerObject* from, PlayerObject* to) {
     if (!from || !to) return;
 
@@ -296,7 +159,6 @@ void copyPlayerState(PlayerObject* from, PlayerObject* to) {
     to->m_isOnGround3 = from->m_isOnGround3;
     to->m_checkpointTimeout = from->m_checkpointTimeout;
     to->m_lastCheckpointTime = from->m_lastCheckpointTime;
-    // m_lastJumpTime (wall-clock) NOT copied between sim players.
     to->m_lastFlipTime = from->m_lastFlipTime;
     to->m_flashTime = from->m_flashTime;
     to->m_flashDuration = from->m_flashDuration;
@@ -308,7 +170,7 @@ void copyPlayerState(PlayerObject* from, PlayerObject* to) {
     to->m_maybeIsVehicleGlowing = from->m_maybeIsVehicleGlowing;
     to->m_accelerationOrSpeed = from->m_accelerationOrSpeed;
     to->m_snapDistance = from->m_snapDistance;
-    to->m_ringJumpRelated = from->m_ringJumpRelated;
+    to->m_usedRingThisStep = from->m_usedRingThisStep;
     to->m_objectSnappedTo = from->m_objectSnappedTo;
     to->m_onFlyCheckpointTries = from->m_onFlyCheckpointTries;
     to->m_maybeSpriteRelated = from->m_maybeSpriteRelated;
@@ -477,7 +339,6 @@ void copyPlayerState(PlayerObject* from, PlayerObject* to) {
     to->m_enable22Changes = from->m_enable22Changes;
 }
 
-// --- helpers ---------------------------------------------------------------
 
 cocos2d::ccColor4F parseHexColor(std::string const& hex, cocos2d::ccColor4F fallback) {
     std::string s = hex;
@@ -522,9 +383,12 @@ void initForLayer(PlayLayer* layer) {
         node->setZOrder(9999);
         node->setID("skk-trajectory"_spr);
         node->m_bUseArea = false;
-        layer->m_objectLayer->addChild(node);
+        layer->addChild(node, 9999);
         g_drawNode = node;
     }
+    skkbot2::log::info(
+        "[TRAJ] initForLayer: dummyJump={} dummyNormal={} drawNode={}",
+        g_dummyJump != nullptr, g_dummyNormal != nullptr, g_drawNode != nullptr);
 }
 
 void clearCollisionLogs(PlayerObject* player) {
@@ -546,7 +410,6 @@ void renderHitboxOutline(cocos2d::CCRect const& rect, cocos2d::ccColor4F const& 
     g_drawNode->drawPolygon(vertices, 4, {0.f, 0.f, 0.f, 0.f}, 0.25f, border);
 }
 
-// --- simulation ------------------------------------------------------------
 
 void simulatePath(PlayLayer* layer, PlayerObject* simPlayer, PlayerObject* sourcePlayer,
                   bool isJumpInput) {
@@ -591,9 +454,6 @@ void simulatePath(PlayLayer* layer, PlayerObject* simPlayer, PlayerObject* sourc
 
     cocos2d::ccColor4F lineColor = isJumpInput ? g_settings.jumpColor : g_settings.normalColor;
 
-    // `stepMultiplier` trades resolution for cost by taking bigger steps over
-    // fewer iterations - the same wall-clock span, half the dummy updates. It is
-    // the only knob that changes physics fidelity; FPS/TPS/Speed never do.
     float effectiveDt = tickDelta(layer) * static_cast<float>(stepMultiplier);
 
     for (int i = 0; i < effectiveIterations; ++i) {
@@ -615,8 +475,6 @@ void simulatePath(PlayLayer* layer, PlayerObject* simPlayer, PlayerObject* sourc
     renderHitboxOutline(simPlayer->getObjectRect(0.25f, 0.25f), g_settings.hitboxInnerColor);
 }
 
-// RAII so no early return can leave the engine (or the wave-trail fix / the
-// checkpoint capture) believing a dummy step was a real one.
 struct SimScope {
     bool previousEngineFlag = false;
 
@@ -642,16 +500,6 @@ struct SimScope {
 void runSimulation(PlayLayer* layer) {
     if (!g_drawNode) return;
 
-    // Why the trace is not drawn. Each reason is a subsystem this file has to
-    // respect, not a defensive habit:
-    //   * render capture - the draw node is a child of the scene and
-    //     `Renderer` visits the scene for every captured frame, so an enabled
-    //     trace would be baked into the video (render_hooks.cpp:235-237);
-    //   * paused / not started / level over - GD is not stepping the player, so
-    //     the state the line would start from is not a tick boundary that the
-    //     run will ever pass through;
-    //   * dead - the respawn rewinds the world and the line would point from a
-    //     position the player never occupies again.
     auto* engine = ReplayEngine::get();
     bool const enabled = engine ? engine->showTrajectory : g_settings.enabled;
     bool const suppressed = !enabled
@@ -666,6 +514,29 @@ void runSimulation(PlayLayer* layer) {
 
     if (suppressed) {
         g_drawNode->clear();
+        static int prevEnabled = -1;
+        static int supLogged = 0;
+        if ((int)enabled != prevEnabled) {
+            prevEnabled = enabled;
+            supLogged = 0;
+            skkbot2::log::info("[TRAJ] enabled -> {} (layer={} started={})",
+                enabled ? "true" : "false", layer != nullptr,
+                layer ? layer->m_started : false);
+        }
+        if (enabled && supLogged < 10) {
+            supLogged++;
+            skkbot2::log::info(
+                "[TRAJ] suppressed #{}: layer={} recording={} "
+                "started={} paused={} completed={} endAnim={} p1={} dead={}",
+                supLogged, layer != nullptr,
+                skkbot2::render::Renderer::get().isRecording(),
+                layer ? layer->m_started : false,
+                layer ? layer->m_isPaused : false,
+                layer ? layer->m_hasCompletedLevel : false,
+                layer ? layer->m_levelEndAnimationStarted : false,
+                layer ? (layer->m_player1 != nullptr) : false,
+                layer && layer->m_player1 ? layer->m_player1->m_isDead : false);
+        }
         return;
     }
 
@@ -674,9 +545,6 @@ void runSimulation(PlayLayer* layer) {
         if (!g_dummyJump || !g_dummyNormal || !g_drawNode) return;
     }
 
-    // Informational only (the GUI shows it); the physics uses the observed
-    // per-tick delta, which is the same number at warp 1 and the honest one at
-    // any other warp.
     if (auto* engine = ReplayEngine::get()) {
         g_settings.tps = static_cast<float>(engine->runtimeTickRate());
     }
@@ -718,19 +586,12 @@ void reset() {
     }
     g_simulating = false;
     g_simDead = false;
-    // The observed tick length belongs to the layer that produced it; the next
-    // one re-learns it on its first step and falls back to
-    // `warp / runtimeTickRate()` until then.
     g_dtStep = 1.0f / 240.0f;
     g_dtStepValid = false;
 }
 
-} // namespace
+}
 
-// Public knob for the rest of the mod (checkpoints, wave trail, ...). The
-// wave-trail fix and the checkpoint system used to read a flag like this; the
-// call sites were removed together with the old trajectory, so nothing calls
-// it today. Keep it exported so the guard can be re-added cheaply.
 bool isSimulating() {
     return g_simulating;
 }
@@ -739,12 +600,8 @@ Settings& settings() {
     return g_settings;
 }
 
-} // namespace skk::trajectory
+}
 
-// ---------------------------------------------------------------------------
-// Hooks. Every world-mutating callback is suppressed while a dummy is being
-// stepped, so the trace cannot change the real level state.
-// ---------------------------------------------------------------------------
 
 class $modify(SkkTrajectoryPlayLayer, PlayLayer) {
     struct Fields {
@@ -757,8 +614,8 @@ class $modify(SkkTrajectoryPlayLayer, PlayLayer) {
         (void) self.setHookPriority("PlayLayer::destroyPlayer", -50);
     }
 
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, dontCreateObjects)) return false;
 
         m_fields.self();
         skk::trajectory::initForLayer(this);
@@ -796,7 +653,7 @@ class $modify(SkkTrajectoryBaseGameLayer, GJBaseGameLayer) {
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
+    void collisionCheckObjects(PlayerObject* player, std::vector<GameObject*>* objects,
                                int objectCount, float dt) {
         if (!skk::trajectory::g_simulating) {
             if (objects == &m_calcNonEffectObjects && objectCount > 0 && skk::phys::nearMoversEnabled()) {
@@ -810,7 +667,7 @@ class $modify(SkkTrajectoryBaseGameLayer, GJBaseGameLayer) {
         if (skk::trajectory::g_settings.noCollisions) return;
         if (!player || !objects || objectCount <= 0) return;
 
-        auto addCollisionObject = [](GameObject* obj, gd::vector<GameObject*>& vec,
+        auto addCollisionObject = [](GameObject* obj, std::vector<GameObject*>& vec,
                                      int& count, int& index) {
             if (count < index) {
                 vec.at(count) = obj;
@@ -893,19 +750,10 @@ class $modify(SkkTrajectoryPlayerObject, PlayerObject) {
 
         if (skk::trajectory::g_simulating) return;
 
-        // Only the real players feed the clock. `g_simulating` already covers
-        // the dummies; the identity check keeps this true even if a future
-        // caller forgets the scope.
         auto* pl = PlayLayer::get();
         if (!pl || (this != pl->m_player1 && this != pl->m_player2)) return;
 
         if (dt > 0.0f) {
-            // The exact delta the engine integrated this tick:
-            // getModifiedDelta = clamp(m_timeWarp, 0, 1) * (1/tps)
-            // (physicsbypass.cpp:1176-1186). Stored as-is. GDH divided it by
-            // m_timeWarp, which turns it back into 1/tps and makes the dummy
-            // travel 1/warp times too far whenever a time-warp trigger is
-            // active - the one place where the trace silently lies.
             skk::trajectory::g_dtStep = dt;
             skk::trajectory::g_dtStepValid = true;
         }
@@ -937,7 +785,7 @@ class $modify(SkkTrajectoryPlayerObject, PlayerObject) {
 };
 
 class $modify(SkkTrajectoryEffectGameObject, EffectGameObject) {
-    void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+    void triggerObject(GJBaseGameLayer* layer, int uniqueID, std::vector<int> const* remapKeys) {
         if (skk::trajectory::g_simulating) return;
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
@@ -957,43 +805,3 @@ class $modify(SkkTrajectoryHardStreak, HardStreak) {
     }
 };
 
-// ---------------------------------------------------------------------------
-// TODO when this gets wired in:
-//   1. Expose `skk::trajectory::settings().enabled` (+ iterations, colours) in
-//      the RECORD tab; the old row and its "Both Hypotheses (Hold/Rel)" toggle
-//      were removed on 24.10.2026.
-//   2. Re-add the `isSimulating()` guards in `src/core/checkpoint_system.cpp`
-//      and `src/hacks/wave_trail_fix.cpp` (they were deleted with the old
-//      trajectory). Today the dummy is safe without them - it never enters
-//      `processCommands`/`processQueuedButtons`, so the frame clock, the SKC
-//      dispatch, the noclip-accuracy frame and the SKK checkpoint capture are
-//      all out of its path - but `WTSPlayerObject::update` still runs its drag
-//      fix for the dummy on every step, which is pure waste at 600 dummy steps
-//      per frame.
-//   3. Accuracy: this is a two-line hypothesis (hold / release), not a
-//      lookahead over the macro's real future inputs. Every step also runs
-//      `PlayerObject::update` on a dummy whose `m_audioScale`/streak state is
-//      copied, so expect drift on orbs, pads, dash orbs and dual portals.
-//
-// ---------------------------------------------------------------------------
-// WHAT IS ALREADY SETTLED (audit 24.10.2026 - do not re-litigate)
-// ---------------------------------------------------------------------------
-//   * Recompute rate is pinned to the DRAWN FRAME, not to the tick rate. One
-//     `CCScheduler::update` hook at Priority::Early, post-call. This is the
-//     whole FPS/TPS/Speed answer: none of the three changes a step's LENGTH, so
-//     none of them may change the trace's dt - and none of them may multiply
-//     the trace's cost either. Vanilla play, TPS bypass, speedhack, a pinned
-//     FPS, the Frame Stepper and render capture all reach the same hook.
-//   * The dt is the engine's own per-tick delta, observed on the real player
-//     (`PlayerObject::update`), never `1/240` and never `1/tps` while a warp is
-//     active. Speed portals and dash orbs do not enter this value.
-//   * Render capture suppresses the trace entirely. The draw node is a scene
-//     child, so "enabled" would otherwise mean "burned into the MP4".
-//   * `src/physics/step_grid_hooks` never sees the dummy: the enforcement scope
-//     wraps `GJBaseGameLayer::update`'s internal step loop, and the dummy is
-//     stepped with a direct `PlayerObject::update` + `checkCollisions` pair.
-//   * Both engines are already covered without a single edit to them: SKK and
-//     SKC take their tick from `processCommands`, which a dummy step does not
-//     call. `ReplayEngine::simulatingPath` is set for the duration anyway,
-//     because that is the flag the engine reads and it was left dead by the
-//     removal.

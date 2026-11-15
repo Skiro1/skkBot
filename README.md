@@ -18,22 +18,25 @@ renderer using bundled FFmpeg — no extra downloads needed.
 - **Triple RNG lock** (shake + teleport + per-object), velocity fix (always on),
   gravity/up-down/dash state correction from player-visual bits
 - **Per-frame persistence-attempt** recording + playback, practice-mode support (practice
-  fix for broken objects), frame stepper (forward)
+  fix for broken objects), frame stepper (forward, keybinds)
 - **Checkpoint system** with `PlayerStateBundle` (54 fields) and Rubber-Banding reconcile,
   hold-restore after checkpoint restore
 - **Single macro format `.skk` (SKK3)**: zstd-22 compression, dense wire encoding
   (varint/zigzag/XOR + RLE), per-frame delta layout, checkpoints, persistence,
-  triple-RNG boundaries
+  triple-RNG boundaries, stored attempt seed, target display FPS
 - **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output, the codec
   list shows every video encoder available in the build (NVENC, AMF, QSV, libx264,
   libx265, AV1, VP9/VP8, MPEG-4, ProRes, MJPEG, ...); resolution presets (720p–8K),
-  1–240 FPS, bitrate 5–200 Mbps, fade in/out.
+  1–240 FPS, bitrate 5–300 Mbps, fade in/out (video + audio), speedhack during render,
+  and a **live render monitor** (hear the render mix in real time while it renders).
   *FFmpeg DLLs are not bloated inside the .geode file*; the mod can automatically benchmark
   mirror speeds (GitHub) and download/unpack them directly into `geode/mods/skiro1.skk-bot/ffmpeg/` on demand.
 - **Audio recording**: AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC3, E-AC3 (as available in the
   FFmpeg build); **level audio is captured from block 0**
 - **Modern ImGui GUI**: intuitive modern interface enabled by default with tab
-  navigation (Record, Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
+  navigation (Record, Assist, Video, Settings), macro search, Solid background toggle,
+  theme customization, custom level art (Layout Mode with `<Default Art>`, RGB colors,
+  regular BG), and classic window fallback
 - **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,
   and Wave Trail Fix (draw + drag fixes)
 - **Logging system** (None/Error/Warn/Info/All): Geode console + optional file logging,
@@ -72,7 +75,11 @@ This mod won't load together with:
 
 ## Formats
 - **.skk** (SKK3) — native binary format: input events with per-substep click phases, per-frame physics + camera data, checkpoints, persistence attempts, RNG boundaries, and target display FPS. Supports both recording and playback. Only the latest format is supported — old files must be re-recorded.
-- **.skc** (SKC) — ultra-compressed inputs-only format: range-coded compact macro stream (~1–2 bytes per action) without heavy physics snapshots. Supports both recording and playback. *(Note: currently in active development / beta; platformer mode requires caution with deaths/checkpoints; does not support CBS and COS).*
+- **.skc** (SKC) — ultra-compressed inputs-only format: range-coded compact macro stream
+  (~1–2 bytes per action) without heavy physics snapshots. Supports both recording and
+  playback, including playback starting from mid-level; stores the attempt seed for
+  bit-exact RNG (advanced v5 compression: shake quantized to 31 bits — a saved seed can
+  increase the file size considerably).
 - **Third-Party Replay Formats (Playback only)** — full playback support for macros exported from other bots:
   - Echo (`.echo`)
   - Astral (`.ast`)

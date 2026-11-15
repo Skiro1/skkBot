@@ -14,9 +14,6 @@ inline bool isExternalAccuracyMod(AccuracyMode mode) {
 }
 
 inline AccuracyMode sanitizeAccuracyMode(int rawMode) {
-    // Old files may still carry CBF (2) / SIP (3) accuracy tags; both are now
-    // permanently degraded to CBS (best native level) since SIP/CBF are
-    // declared incompatible at load time.
     if (rawMode == static_cast<int>(AccuracyMode::CBS)) {
         return AccuracyMode::CBS;
     }

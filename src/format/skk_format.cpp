@@ -5,6 +5,7 @@
 #include "core/rng_lock.hpp"
 #include "utils.hpp"
 
+#include <Geode/Geode.hpp>
 #include <Geode/utils/file.hpp>
 
 #include <algorithm>
@@ -88,8 +89,6 @@ static PlayerStateBundle capturePlayerState(PlayerObject* player, bool isPlatfor
 void SkMacro::recordAction(std::vector<SkInput>& target, int tick, int button, bool player2, bool pressed, float offset, double cbsTimeOffset) {
     SkInput input;
     input.tick = std::max(0, tick);
-    // Rewind self-heal (see recordPerFrame): checkpoint respawn restarts the
-    // tick clock; drop the future tail to keep on-disk order valid.
     if (!target.empty() && input.tick < target.back().tick) {
         size_t dropped = 0;
         while (!target.empty() && target.back().tick >= input.tick) {
@@ -107,11 +106,6 @@ void SkMacro::recordAction(std::vector<SkInput>& target, int tick, int button, b
     double safeFramerate = std::isfinite(framerate) && framerate > 0.0 ? framerate : 240.0;
     double tickDuration = 1.0 / safeFramerate;
     input.timeSeconds = static_cast<double>(std::max(0, tick)) / safeFramerate;
-    // Defensive guard: cbsTimeOffset is a within-tick phase and must be < 1
-    // tick duration.  A garbage baseline (tickStartTimestamp still zeroed by
-    // resetTimingTracking) inflates it to the entire accumulated game clock,
-    // breaking timeSeconds monotonicity and producing an on-disk "unsorted
-    // inputs" rejection.  Reject the offset when it exceeds a full tick.
     if (std::isfinite(cbsTimeOffset) && cbsTimeOffset >= 0.0 && cbsTimeOffset < tickDuration) {
         input.timeSeconds += cbsTimeOffset;
     } else if (std::isfinite(offset) && offset > 0.0f) {
@@ -132,7 +126,6 @@ void SkMacro::recordAction(int tick, int button, bool player2, bool pressed, flo
 void SkMacro::recordAnchor(std::vector<PlaybackAnchor>& target, int tick, PlayerObject* p1, PlayerObject* p2, bool isPlatformer, bool isDual) {
     PlaybackAnchor anchor;
     anchor.tick = std::max(0, tick);
-    // Rewind self-heal (see recordPerFrame).
     if (!target.empty() && anchor.tick < target.back().tick) {
         while (!target.empty() && target.back().tick >= anchor.tick) {
             target.pop_back();
@@ -166,15 +159,10 @@ void SkMacro::recordAnchor(int tick, PlayerObject* p1, PlayerObject* p2, bool is
     recordAnchor(anchors, tick, p1, p2, isPlatformer, isDual);
 }
 
-// v2 per-frame visual orientation flag bits: now shared via skk_format.hpp
-// (kVisual* constants, vehicleModeBits, visualFlagsOf).
 
 void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerObject* p1, PlayerObject* p2) {
     SkPerFrame frame;
     frame.tick = std::max(0, tick);
-    // Rewind self-heal: a tick going backwards means the run restarted
-    // (checkpoint respawn / practice). Drop the stale tail so the stream
-    // stays monotonic on disk (readers hard-reject unsorted per-frames).
     if (!target.empty() && frame.tick < target.back().tick) {
         size_t dropped = 0;
         while (!target.empty() && target.back().tick >= frame.tick) {
@@ -196,14 +184,6 @@ void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerOb
             frame.p1RingId = static_cast<GameObject*>(p1->m_dashRing)->m_objectID;
         }
     }
-    // P2 liveness gate (BUG-21): in a 2P/dual level GD keeps m_player2
-    // allocated but DORMANT until it actually joins — spawnPlayer2() parents
-    // it into the layer, removePlayer2() detaches it. A dormant P2 sits at
-    // (0,0) and never moves. Recording it as hasPlayer2=true poisons the
-    // stream: on playback, once a dual portal activates the LIVE P2, the
-    // pre-phy pin/reconcile yank it back to the recorded (0,0) — a
-    // 14000px TELEPORT-SPIKE that kills it. GD's own liveness signal is
-    // the parenting, so mirror it here.
     if (p2 && p2->getParent() != nullptr) {
         frame.hasPlayer2 = true;
         auto pos = p2->getPosition();
@@ -217,8 +197,6 @@ void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerOb
             frame.p2RingId = static_cast<GameObject*>(p2->m_dashRing)->m_objectID;
         }
     }
-    // BUG-04 study: reporting lives on the playback side (live-vs-recorded
-    // mismatches), not here - the naive ud!=gravNeg check was a false positive.
     if (!target.empty() && target.back().tick == frame.tick) {
         target.back() = std::move(frame);
     } else {
@@ -238,16 +216,6 @@ void SkMacro::recordPerFrame(int tick, PlayerObject* p1, PlayerObject* p2) {
 }
 
 void SkMacro::truncateAfter(int tick) {
-    // Inputs: remove >= tick (inclusive).  After truncation closeSeamHoldEdges
-    // re-adds a synthetic release for any dangling hold, then syncPhysicalHolds
-    // re-presses whatever the user is still holding — both at `tick`.  Using
-    // > tick left those fresh seam inputs in the stream; every subsequent death
-    // appended another release+press pair at the boundary tick, inflating the
-    // input count by +2 per death loop (BUG: inputs never decrease on respawn).
-    //
-    // PerFrames / anchors: keep > tick (exclusive) so the boundary frame and
-    // anchor survive for captureResealBoundaryFrame to rewrite to the respawn
-    // position (BUG-06 seam seal).
     while (!inputs.empty() && inputs.back().tick >= tick) {
         inputs.pop_back();
     }
@@ -264,7 +232,15 @@ std::vector<uint8_t> SkMacro::serialize() const {
 }
 
 std::vector<uint8_t> SkMacro::serializeSKK3() const {
-    return skk::skk3::serialize(skk::skk3::fromSkMacro(*this));
+    auto macro3 = skk::skk3::fromSkMacro(*this);
+    const bool seedInFile =
+        wireSeedStamp != 0 ? wireSeedStamp > 0
+                           : geode::Mod::get()->getSavedValue<bool>(
+                                 "gui_record_seed", true);
+    if (!seedInFile) {
+        macro3.setupRngSeed = 0;
+    }
+    return skk::skk3::serialize(macro3);
 }
 
 SkMacro* SkMacro::deserialize(std::vector<uint8_t> const& data) {
@@ -377,7 +353,6 @@ bool SkMacro::persistToDirectory(std::filesystem::path const& directory) {
         return false;
     }
 
-    // One rule for both engines: an exact name+extension match gets _1.
     pending.name = ReplayStorage::makeUniqueReplayNameInDirectory(
         directory,
         pending.name,
@@ -386,7 +361,7 @@ bool SkMacro::persistToDirectory(std::filesystem::path const& directory) {
     pending.persistedName = pending.name;
 
     pending.fileFormat = SkFileFormat::SKK3;
-    auto outputPath = directory / (pending.name + ".skk");
+    auto outputPath = directory / skk::stringToPath(pending.name + ".skk");
     if (!pending.saveToPath(outputPath)) {
         return false;
     }
@@ -395,6 +370,8 @@ bool SkMacro::persistToDirectory(std::filesystem::path const& directory) {
 }
 
 bool SkMacro::saveToPath(std::filesystem::path const& path) {
+    skkbot2::log::info("[SAVE] saveToPath ENTRY path={}", skk::pathToUtf8(path));
+    skkbot2::Logger::get().flush();
     std::error_code ec;
     if (auto parent = path.parent_path(); !parent.empty() && !std::filesystem::exists(parent, ec)) {
         std::filesystem::create_directories(parent, ec);
@@ -402,24 +379,38 @@ bool SkMacro::saveToPath(std::filesystem::path const& path) {
     if (ec) {
         skkbot2::log::error("Could not prepare replay path '{}': {}",
             skk::pathToUtf8(path), ec.message());
+        skkbot2::Logger::get().flush();
         return false;
     }
 
+    skkbot2::log::info("[SAVE] serialize ENTRY inputs={} anchors={} frames={}",
+        inputs.size(), anchors.size(), perFrames.size());
+    skkbot2::Logger::get().flush();
     auto bytes = serialize();
+    skkbot2::log::info("[SAVE] serialize EXIT bytes={}", bytes.size());
+    skkbot2::Logger::get().flush();
     if (bytes.empty()) {
         skkbot2::log::error("Could not save replay '{}': serialization produced no data", skk::pathToUtf8(path));
+        skkbot2::Logger::get().flush();
         return false;
     }
 
-    auto writeResult = utils::file::writeBinarySafe(path, bytes);
+    auto writeResult = utils::file::writeBinarySafe(skk::pathToUtf8(path), bytes);
+    skkbot2::log::info("[SAVE] writeBinarySafe EXIT ok={}", (bool)writeResult);
+    skkbot2::Logger::get().flush();
     if (!writeResult) {
         skkbot2::log::error("Could not write replay file '{}': {}",
             skk::pathToUtf8(path), writeResult.unwrapErr());
+        skkbot2::Logger::get().flush();
         return false;
     }
 
+    const bool seedInFile =
+        wireSeedStamp != 0 ? wireSeedStamp > 0
+                           : geode::Mod::get()->getSavedValue<bool>(
+                                 "gui_record_seed", true);
     skkbot2::log::info(
-        "SAVED '{}' bytes={} | main: inputs={} anchors={} frames={} | chainLinks={} varianceSlots={} setupSeed=0x{:X}",
+        "SAVED '{}' bytes={} | main: inputs={} anchors={} frames={} | chainLinks={} varianceSlots={} setupSeed=0x{:X}{}",
         skk::pathToUtf8(path),
         bytes.size(),
         inputs.size(),
@@ -427,19 +418,24 @@ bool SkMacro::saveToPath(std::filesystem::path const& path) {
         perFrames.size(),
         persistenceAttempts.size(),
         varianceOverrides.size(),
-        setupRngSeed
-    );
+        seedInFile ? setupRngSeed : 0,
+        seedInFile ? "" : " (save seed off - stripped from the file)");
+    skkbot2::Logger::get().flush();
     if (!perFrames.empty() && perFrames.front().tick > 120) {
         skkbot2::log::warn("NOTE: first recorded frame is tick {} (~{:.1f}s) at p1=({:.0f},{:.0f}) - capture started MID-RUN; "
                            "playback will POSITION-ALIGN to wherever the player is, not assume a tick-0 timeline "
                            "(start recording from the level start for full coverage)",
                            perFrames.front().tick, perFrames.front().tick / 240.0,
                            perFrames.front().p1x, perFrames.front().p1y);
+        skkbot2::Logger::get().flush();
     } else if (!anchors.empty() && anchors.front().tick > 120) {
         skkbot2::log::warn("NOTE: first recorded anchor is tick {} - capture started MID-RUN; "
                            "playback will make a best-effort position alignment",
                            anchors.front().tick);
+        skkbot2::Logger::get().flush();
     }
+    skkbot2::log::info("[SAVE] saveToPath EXIT returning true");
+    skkbot2::Logger::get().flush();
     return true;
 }
 
@@ -485,7 +481,7 @@ SkMacro* SkMacro::loadFromDisk(std::string const& filename) {
     if (requestedExtension == ".skk") {
         candidates.push_back(directory / requested);
     } else {
-        candidates.push_back(directory / (filename + ".skk"));
+        candidates.push_back(directory / skk::stringToPath(filename + ".skk"));
         candidates.push_back(directory / filename);
     }
 

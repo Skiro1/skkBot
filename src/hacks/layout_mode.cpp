@@ -1,27 +1,4 @@
-// Layout Mode — strips a level down to its gameplay layout ("blueprint mode"):
-// decorations and colour triggers disappear, every object loses its authored
-// colours and glow, and the background / ground / line / middleground are
-// repainted to a flat palette so only the geometry and hitboxes read.
-//
-// Reversible Architecture (Echo/Gucci/Toasty pattern):
-// - NEVER drop objects in addObject: all objects are added to PlayLayer so GD's
-//   level state, trigger dispatch, and object indices are completely preserved.
-// - Dynamic toggle: can be turned ON/OFF anytime during gameplay without breaking
-//   level objects or leaving permanent visual glitches.
-// - Comprehensive decoration coverage: 5..4385 ID sets from Echo/Eclipse/Toasty/GDH
-//   plus trigger IDs, pulse/opacity effect suppression, gradient command suppression,
-//   custom shaders suppression, and glitter particle toggle.
-// - 2.2 Object Stripe / Line Artifact Fix:
-//   * Explicitly hides m_glowSprite on all objects (and hooks GameObject::addGlow so newly
-//     created glow sprites in 2.2 don't batch-render as stretched stripes).
-//   * Never blindly forces setChildColor on 2.2 composite objects with decorative child sprites;
-//     only sets color on solid object and its direct color sprites.
-//   * Suppresses 2.2 line/middleground strip artifacts and custom particle effects.
-// - All modified objects (hidden decorations, glow/color overrides, glowSprite visibility)
-//   have their original state remembered and fully restored when toggled OFF or exiting level.
-// - Full color restoration: original ColorAction states and sprite colors are saved
-//   on ON and restored on OFF, followed by re-evaluation so the level's real colors
-//   immediately return without needing a level reload.
+﻿
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/AudioLineGuideGameObject.hpp>
@@ -44,6 +21,7 @@
 #include <Geode/modify/ShaderLayer.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,7 +33,6 @@ using namespace geode::prelude;
 
 namespace skk::layout_mode {
 
-// Flat "blueprint" palette.
 constexpr int kBackground = 1000;
 constexpr int kGround     = 1001;
 constexpr int kLine       = 1002;
@@ -68,13 +45,33 @@ const ccColor3B kGroundColor{0, 102, 255};
 const ccColor3B kLineColor{255, 255, 255};
 const ccColor3B kMiddleColor{40, 125, 255};
 
+inline GLubyte paletteByte(int v) {
+    return static_cast<GLubyte>(std::clamp(v, 0, 255));
+}
+inline ccColor3B engineBgColor() {
+    auto* engine = ReplayEngine::get();
+    if (!engine) return kBackgroundColor;
+    return {paletteByte(engine->layoutModeBackgroundR),
+            paletteByte(engine->layoutModeBackgroundG),
+            paletteByte(engine->layoutModeBackgroundB)};
+}
+inline ccColor3B engineGroundColor() {
+    auto* engine = ReplayEngine::get();
+    if (!engine) return kGroundColor;
+    return {paletteByte(engine->layoutModeGroundR),
+            paletteByte(engine->layoutModeGroundG),
+            paletteByte(engine->layoutModeGroundB)};
+}
+inline bool regularBgOn() {
+    auto* engine = ReplayEngine::get();
+    return engine && engine->layoutModeRegularBg;
+}
+
 bool on() {
     auto* engine = ReplayEngine::get();
     return engine && engine->layoutMode;
 }
 
-// Well-known visual/color triggers that should be hidden in layout mode
-// (from Echo, GDH, and GucciBot catalogs).
 const std::unordered_set<int>& triggerHideIds() {
     static const std::unordered_set<int> ids{
         29, 30, 32, 33, 104, 105, 221, 717, 718, 743, 744, 899, 900, 915,
@@ -86,7 +83,6 @@ const std::unordered_set<int>& triggerHideIds() {
     return ids;
 }
 
-// Comprehensive decoration IDs catalog (from GDH / Eclipse / Toasty catalog)
 const std::unordered_set<int>& decorationHideIds() {
     static const std::unordered_set<int> ids{
         5, 15, 16, 17, 18, 19, 20, 21, 41, 48, 49, 50, 51, 52, 53, 54, 60, 73, 80, 85, 86, 87, 97, 106, 107, 110, 113, 114, 115, 120,
@@ -250,7 +246,6 @@ const std::unordered_set<int>& decorationHideIds() {
     return ids;
 }
 
-// Checkpoint / player coins / essential gameplay objects that must NEVER be hidden as decoration
 bool isGameplayException(int objectId) {
     return objectId == 38 || objectId == 44 || objectId == 747 || objectId == 749;
 }
@@ -305,7 +300,6 @@ bool isExplicitGameplayObject(GameObject* object) {
         case GameObjectType::SoloPortal:
             return true;
         case GameObjectType::Modifier:
-            // Specific 2.2 modifier rings/speed triggers
             switch (object->m_objectID) {
                 case 200:
                 case 201:
@@ -325,19 +319,16 @@ bool shouldHideObject(GameObject* object) {
     if (!object) return false;
     if (isGameplayException(object->m_objectID)) return false;
 
-    // Check triggers first
     if (triggerHideIds().contains(object->m_objectID) || object->m_isTrigger) {
         return true;
     }
 
-    // 2.2 guideline / audio line guide
     if (object->m_objectID == 3032 ||
         typeid(*object) == typeid(AudioLineGuideGameObject) ||
         object->m_isUIObject) {
         return true;
     }
 
-    // Check comprehensive decoration IDs or GD Decoration type
     if (object->m_objectType == GameObjectType::Decoration ||
         object->m_isDecoration ||
         object->m_isDecoration2 ||
@@ -351,7 +342,6 @@ bool shouldHideObject(GameObject* object) {
         return false;
     }
 
-    // 2.2 guideline/middleground/extra non-gameplay objects
     if (object->m_objectType == GameObjectType::Modifier ||
         object->m_objectType == GameObjectType::Special ||
         object->m_objectType == GameObjectType::EnterEffectObject) {
@@ -397,22 +387,28 @@ struct SavedColorAction {
     float currentOpacity = 1.0f;
 };
 
-// Global state tracking for reversibility
 static std::unordered_map<GameObject*, HiddenObjectOriginalState> s_hiddenObjectsState;
 static std::unordered_map<GameObject*, ObjectOriginalState> s_modifiedSolidObjects;
 static std::unordered_map<int, SavedColorAction> s_originalColorActions;
 static std::unordered_map<size_t, std::pair<ccColor3B, float>> s_originalSpriteColors;
 static bool s_isStyled = false;
+static bool s_artApplied = false;
 
 void paintColors(PlayLayer* play) {
     if (!play || !play->m_effectManager || !on()) return;
 
     auto* effects = play->m_effectManager;
+    const bool regularBg = regularBgOn();
+    const ccColor3B bgCol = engineBgColor();
+    const ccColor3B groundCol = engineGroundColor();
     constexpr std::array<int, 6> ids{
         kBackground, kGround, kGroundAlt, kLine, kMiddle, kMiddleAlt
     };
+    const auto bgChannel = [regularBg](int id) {
+        return regularBg && (id == kBackground || id == kMiddle ||
+                             id == kMiddleAlt);
+    };
 
-    // Save original ColorAction states once when activating
     if (s_originalColorActions.empty()) {
         for (int id : ids) {
             auto* action = effects->getColorAction(id);
@@ -427,30 +423,30 @@ void paintColors(PlayLayer* play) {
     }
 
     for (int id : ids) {
+        if (bgChannel(id)) continue;
         auto* action = effects->getColorAction(id);
         if (!action) continue;
 
         switch (id) {
             case kBackground:
-                action->m_color = kBackgroundColor;
+                action->m_color = bgCol;
                 break;
             case kGround:
             case kGroundAlt:
-                action->m_color = kGroundColor;
+                action->m_color = groundCol;
                 break;
             case kLine:
                 action->m_color = kLineColor;
                 break;
             case kMiddle:
             case kMiddleAlt:
-                action->m_color = kMiddleColor;
+                action->m_color = bgCol;
                 break;
             default:
                 break;
         }
     }
 
-    // Also paint and override m_colorActionSpriteVector channels
     auto& sprites = effects->m_colorActionSpriteVector;
     if (s_originalSpriteColors.empty() && !sprites.empty()) {
         for (size_t id = 1; id < sprites.size(); ++id) {
@@ -461,42 +457,428 @@ void paintColors(PlayLayer* play) {
     }
 
     for (size_t id = 1; id < sprites.size(); ++id) {
+        if (bgChannel(static_cast<int>(id))) continue;
         auto* sprite = sprites[id];
         if (!sprite) continue;
         switch (id) {
             case kBackground:
-                sprite->m_color = kBackgroundColor;
+                sprite->m_color = bgCol;
                 break;
             case kLine:
                 sprite->m_color = kLineColor;
                 break;
             case kGround:
             case kGroundAlt:
-                sprite->m_color = kGroundColor;
+                sprite->m_color = groundCol;
                 break;
             case 1010:
                 sprite->m_color = {0, 0, 0};
                 break;
             case kMiddle:
             case kMiddleAlt:
-                sprite->m_color = kMiddleColor;
+                sprite->m_color = bgCol;
                 break;
             default:
-                sprite->m_color = kGroundColor;
+                sprite->m_color = groundCol;
                 break;
         }
         sprite->m_opacity = 1.0f;
     }
 }
 
+
+bool defaultArtOn();
+
+bool replacedByDefaultArt(GameObject* object) {
+    if (!object || !on() || !defaultArtOn()) return false;
+    switch (object->m_objectType) {
+        case GameObjectType::Solid:
+        case GameObjectType::Slope:
+            return true;
+        case GameObjectType::Hazard:
+        case GameObjectType::AnimatedHazard:
+            return object->m_objectRadius <= 0.f;
+        default:
+            return false;
+    }
+}
+
+struct ArtPiece {
+    CCSpriteFrame* frame = nullptr;
+    float width = 0.f, height = 0.f, radius = 0.f;
+    bool twoHalves = false;
+    CCSpriteFrame* fillFrame = nullptr;
+    int batch = 0;
+};
+
+struct ArtState {
+    ArtPiece block, spike, saw, slope, wideSlope;
+    PlayLayer* measuredLevel = nullptr;
+    bool loaded = false;
+};
+
+static ArtState g_art;
+
+static ArtState& artState(PlayLayer* play) {
+    static ArtState state;
+    if (!state.loaded) {
+        state.loaded = true;
+        auto frameOf = [](const char* name) -> CCSpriteFrame* {
+            auto* frame =
+                CCSpriteFrameCache::sharedSpriteFrameCache()->spriteFrameByName(
+                    name);
+            if (frame) frame->retain();
+            return frame;
+        };
+        state.block = {frameOf("square_01_001.png"), 30.f, 30.f, 0.f, false,
+                       nullptr, 0};
+        state.spike = {frameOf("spike_01_001.png"), 6.f, 12.f, 0.f, false,
+                       nullptr, 2};
+        state.saw = {frameOf("sawblade_01_001.png"), 0.f, 0.f, 32.f, true,
+                     nullptr, 2};
+        state.slope = {frameOf("blockOutline_14_001.png"), 30.f, 30.f, 0.f,
+                       false, frameOf("triangle_a_02_001.png"), 1};
+        state.wideSlope = {frameOf("blockOutline_15_001.png"), 60.f, 30.f, 0.f,
+                           false, frameOf("triangle_a_04_001.png"), 1};
+        g_art = state;
+    }
+    if (play && state.measuredLevel != play && play->m_objects) {
+        state.measuredLevel = play;
+        bool spike = false, saw = false;
+        for (auto* obj : CCArrayExt<GameObject*>(play->m_objects)) {
+            if (!obj || (spike && saw)) break;
+            const float sx = std::abs(obj->m_scaleX),
+                        sy = std::abs(obj->m_scaleY);
+            if (sx <= 0.f || sy <= 0.f) continue;
+            if (!spike && obj->m_objectID == 8 && obj->m_width > 0.f &&
+                obj->m_height > 0.f) {
+                spike = true;
+                state.spike.width = obj->m_width;
+                state.spike.height = obj->m_height;
+            }
+            if (!saw && obj->m_objectID == 88 && obj->m_objectRadius > 0.f) {
+                saw = true;
+                state.saw.radius = obj->m_objectRadius;
+            }
+        }
+        g_art = state;
+    }
+    return state;
+}
+
+struct ArtNodes {
+    CCNode* nodes[3] = {nullptr, nullptr, nullptr};
+    PlayLayer* play = nullptr;
+    std::vector<CCSprite*> pools[3];
+    std::size_t used[3] = {0, 0, 0};
+};
+
+static ArtNodes g_artNodes;
+static std::unordered_set<GameObject*> s_artHidden;
+static std::unordered_map<GameObject*, std::pair<int, int>> s_artChannels;
+
+bool defaultArtOn() {
+    auto* engine = ReplayEngine::get();
+    return engine && engine->layoutModeDefaultArt;
+}
+
+void resetDefaultArt() {
+    for (auto* node : g_artNodes.nodes) {
+        if (node) {
+            if (node->getParent()) node->removeFromParent();
+            node->release();
+        }
+    }
+    g_artNodes = ArtNodes{};
+    s_artHidden.clear();
+    s_artChannels.clear();
+}
+
+void refreshDefaultArt(PlayLayer* play) {
+    for (auto* obj : s_artHidden) {
+        auto it = s_hiddenObjectsState.find(obj);
+        if (it == s_hiddenObjectsState.end()) continue;
+        const auto& orig = it->second;
+        if (obj) {
+            obj->m_isHide = orig.isHide;
+            obj->setVisible(orig.isVisible);
+            obj->setOpacity(orig.opacity);
+            if (obj->m_glowSprite)
+                obj->m_glowSprite->setVisible(orig.glowSpriteVisible);
+            if (obj->m_colorSprite)
+                obj->m_colorSprite->setVisible(orig.colorSpriteVisible);
+        }
+        s_hiddenObjectsState.erase(it);
+    }
+    resetDefaultArt();
+    s_isStyled = false;
+    if (play)
+        skkbot2::Logger::get().info(
+            "skkBot2: Layout Mode Default Art refreshed ({} objects restored)",
+            s_artHidden.size());
+}
+
+static bool artChannelInvisible(PlayLayer* play, int channel) {
+    if (channel <= 0 || !play->m_effectManager) return false;
+    auto& sprites = play->m_effectManager->m_colorActionSpriteVector;
+    if (static_cast<std::size_t>(channel) >= sprites.size()) return false;
+    auto* sprite = sprites[static_cast<std::size_t>(channel)];
+    return sprite && sprite->m_opacity <= 0.001f;
+}
+
+static bool artInvisibleByColor(PlayLayer* play, GameObject* object) {
+    auto it = s_artChannels.find(object);
+    if (it == s_artChannels.end()) return false;
+    const auto [base, detail] = it->second;
+    if (!artChannelInvisible(play, base)) return false;
+    return detail <= 0 || artChannelInvisible(play, detail);
+}
+
+void drawDefaultArt(PlayLayer* play) {
+    if (!play || !on() || !defaultArtOn() || !s_isStyled ||
+        !play->m_objectLayer) {
+        if (g_artNodes.play && g_artNodes.play != play) resetDefaultArt();
+        return;
+    }
+    auto& art = artState(play);
+    if (!art.block.frame || !art.spike.frame || !art.saw.frame ||
+        !art.slope.frame || !art.wideSlope.frame || !art.slope.fillFrame ||
+        !art.wideSlope.fillFrame) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            skkbot2::log::warn(
+                "[LayoutArt] default sprites not found in cache - art skipped");
+        }
+        return;
+    }
+
+    if (!g_artNodes.nodes[0] || g_artNodes.play != play) {
+        resetDefaultArt();
+        g_artNodes.play = play;
+        auto* texture = art.block.frame->getTexture();
+        bool oneTexture = texture != nullptr;
+        for (auto* frame : {art.spike.frame, art.saw.frame, art.slope.frame,
+                            art.wideSlope.frame, art.slope.fillFrame,
+                            art.wideSlope.fillFrame})
+            oneTexture = oneTexture && frame->getTexture() == texture;
+        const int z = play->m_player1 &&
+                              play->m_player1->getParent() == play->m_objectLayer
+                          ? play->m_player1->getZOrder() - 1
+                          : 0;
+        for (auto*& node : g_artNodes.nodes) {
+            node = oneTexture
+                       ? static_cast<CCNode*>(
+                             CCSpriteBatchNode::createWithTexture(texture))
+                       : CCNode::create();
+            node->retain();
+            play->m_objectLayer->addChild(node, z);
+        }
+    }
+
+    g_artNodes.used[0] = g_artNodes.used[1] = g_artNodes.used[2] = 0;
+
+    auto* objectLayer = play->m_objectLayer;
+    const auto win = CCDirector::sharedDirector()->getWinSize();
+    const CCPoint bl = objectLayer->convertToNodeSpace({0.f, 0.f});
+    const CCPoint tr = objectLayer->convertToNodeSpace({win.width, win.height});
+    const float minX = std::min(bl.x, tr.x) - 120.f;
+    const float maxX = std::max(bl.x, tr.x) + 120.f;
+    const float minY = std::min(bl.y, tr.y) - 120.f;
+    const float maxY = std::max(bl.y, tr.y) + 120.f;
+
+    auto nextSprite = [&](int batch, CCSpriteFrame* frame) -> CCSprite* {
+        auto& pool = g_artNodes.pools[batch];
+        auto& usedCount = g_artNodes.used[batch];
+        CCSprite* out = nullptr;
+        if (usedCount < pool.size()) {
+            out = pool[usedCount];
+        } else {
+            out = CCSprite::createWithSpriteFrame(frame);
+            if (!out) return nullptr;
+            g_artNodes.nodes[batch]->addChild(out);
+            pool.push_back(out);
+        }
+        ++usedCount;
+        if (!out->isFrameDisplayed(frame)) out->setDisplayFrame(frame);
+        out->setVisible(true);
+        return out;
+    };
+
+    const ccColor3B solidCol = engineGroundColor();
+    const ccColor3B black{0, 0, 0};
+
+    auto drawObjectArt = [&](GameObject* object) {
+        if (!object || !replacedByDefaultArt(object) || object->m_isDisabled ||
+            object->m_isGroupDisabled)
+            return;
+        if (object == play->m_anticheatSpike ||
+            object == play->m_player1CollisionBlock ||
+            object == play->m_player2CollisionBlock)
+            return;
+        if (object->m_objectType == GameObjectType::Solid &&
+            (object->m_isNoTouch || object->m_isPassable ||
+             artInvisibleByColor(play, object))) {
+            object->setOpacity(0);
+            return;
+        }
+        const CCPoint pos0 = object->getPosition();
+        if (pos0.x < minX || pos0.x > maxX || pos0.y < minY || pos0.y > maxY)
+            return;
+        const float objSx = std::abs(object->m_scaleX),
+                    objSy = std::abs(object->m_scaleY);
+        const bool hazard =
+            object->m_objectType == GameObjectType::Hazard ||
+            object->m_objectType == GameObjectType::AnimatedHazard ||
+            (object->m_objectType == GameObjectType::Slope &&
+             object->m_slopeIsHazard);
+        const ArtPiece* piece = nullptr;
+        float sx = objSx, sy = objSy;
+        const bool slope = object->m_objectType == GameObjectType::Slope;
+        std::optional<CCRect> blockBox;
+        bool flipX = false, flipY = false;
+        if (slope) {
+            object->m_isOrientedBoxDirty = false;
+            object->m_isObjectRectDirty = false;
+            const CCRect box = object->getObjectRect();
+            if (box.size.width < 0.5f || box.size.height < 0.5f) {
+                object->setOpacity(0);
+                return;
+            }
+            const float w = box.size.width, h = box.size.height;
+            piece = (w > h * 1.5f) ? &art.wideSlope : &art.slope;
+            sx = w / piece->width;
+            sy = h / piece->height;
+            switch (object->m_slopeDirection) {
+                case 0:
+                case 7:
+                    break;
+                case 1:
+                case 5:
+                    flipY = true;
+                    break;
+                case 3:
+                case 6:
+                    flipX = flipY = true;
+                    break;
+                default:
+                    flipX = true;
+                    break;
+            }
+        } else if (hazard && object->m_objectRadius > 0.f) {
+            piece = &art.saw;
+            sx = sy = object->m_objectRadius *
+                      std::max(objSx, objSy) / piece->radius;
+        } else if (hazard) {
+            piece = &art.spike;
+            if (object->m_width > 0.f)
+                sx = object->m_width * objSx / piece->width;
+            if (object->m_height > 0.f)
+                sy = object->m_height * objSy / piece->height;
+        } else {
+            piece = &art.block;
+            object->m_isOrientedBoxDirty = false;
+            object->m_isObjectRectDirty = false;
+            const CCRect box = object->getObjectRect();
+            if (box.size.width < 0.5f || box.size.height < 0.5f) {
+                object->setOpacity(0);
+                return;
+            }
+            blockBox = box;
+        }
+
+        object->setOpacity(0);
+        if (object->m_colorSprite) object->m_colorSprite->setVisible(false);
+        if (object->m_glowSprite) object->m_glowSprite->setVisible(false);
+
+        ccColor3B color = solidCol;
+        if (hazard) color = black;
+
+        CCPoint pos = pos0;
+        float rotX = object->getRotationX(), rotY = object->getRotationY();
+        flipX = flipX || object->isFlipX();
+        flipY = flipY || object->isFlipY();
+        if (slope) {
+            rotX = rotY = 0.f;
+        }
+        if (blockBox) {
+            pos = CCPoint{blockBox->getMidX(), blockBox->getMidY()};
+            sx = blockBox->size.width / piece->width;
+            sy = blockBox->size.height / piece->height;
+            rotX = rotY = 0.f;
+            flipX = flipY = false;
+        }
+        if (piece == &art.block && rotX == rotY) {
+            const float turns = rotX / 90.f;
+            const float nearest = std::round(turns);
+            if (std::abs(turns - nearest) < 0.001f) {
+                if (static_cast<long>(nearest) % 2 != 0)
+                    std::swap(sx, sy);
+                rotX = rotY = 0.f;
+                flipX = flipY = false;
+            }
+        }
+        auto drawSprite = [&](CCSpriteFrame* frame, float turn,
+                              ccColor3B tint) {
+            auto* out = nextSprite(piece->batch, frame);
+            if (!out) return;
+            out->setPosition(pos);
+            out->setRotationX(rotX + turn);
+            out->setRotationY(rotY + turn);
+            out->setScaleX(sx);
+            out->setScaleY(sy);
+            out->setFlipX(flipX);
+            out->setFlipY(flipY);
+            out->setColor(tint);
+        };
+        if (piece->fillFrame) drawSprite(piece->fillFrame, 0.f, black);
+        drawSprite(piece->frame, 0.f, color);
+        if (piece->twoHalves) drawSprite(piece->frame, 180.f, color);
+    };
+
+    auto& sections = play->m_sections;
+    auto& sizes = play->m_sectionSizes;
+    const float xFactor =
+        play->m_sectionXFactor > 0.f ? play->m_sectionXFactor : 0.01f;
+    const int colCount = static_cast<int>(
+        std::min<std::size_t>(sections.size(), sizes.size()));
+    const int firstX = std::max(
+        static_cast<int>(std::floor(minX * xFactor)) - 1, 0);
+    const int lastX = std::min(
+        static_cast<int>(std::floor(maxX * xFactor)) + 1, colCount - 1);
+    for (int x = firstX; x <= lastX; ++x) {
+        auto* column = sections[x];
+        auto* counts = sizes[x];
+        if (!column || !counts) continue;
+        const int rows = static_cast<int>(
+            std::min<std::size_t>(column->size(), counts->size()));
+        for (int y = 0; y < rows; ++y) {
+            auto* bucket = (*column)[y];
+            if (!bucket) continue;
+            const int count =
+                std::min<int>((*counts)[y], static_cast<int>(bucket->size()));
+            for (int i = 0; i < count; ++i) drawObjectArt((*bucket)[i]);
+        }
+    }
+    const int moving = std::min<int>(play->m_calcNonEffectObjectsSize,
+                                     static_cast<int>(
+                                         play->m_calcNonEffectObjects.size()));
+    for (int i = 0; i < moving; ++i)
+        drawObjectArt(play->m_calcNonEffectObjects[static_cast<std::size_t>(i)]);
+
+    for (int batch = 0; batch < 3; ++batch)
+        for (std::size_t i = g_artNodes.used[batch];
+             i < g_artNodes.pools[batch].size(); ++i)
+            g_artNodes.pools[batch][i]->setVisible(false);
+}
+
 void applyLayout(PlayLayer* play) {
     if (!play || !play->m_objects) return;
 
-    // Toggle OFF transition: restore all objects and colors
     if (!on()) {
         if (!s_isStyled) return;
+        resetDefaultArt();
 
-        // 1. Restore hidden objects completely
         for (const auto& [obj, orig] : s_hiddenObjectsState) {
             if (obj) {
                 obj->m_isHide = orig.isHide;
@@ -520,7 +902,6 @@ void applyLayout(PlayLayer* play) {
         }
         s_hiddenObjectsState.clear();
 
-        // 2. Restore modified solid/gameplay objects
         for (const auto& [obj, orig] : s_modifiedSolidObjects) {
             if (obj) {
                 obj->m_isHide = orig.isHide;
@@ -549,19 +930,16 @@ void applyLayout(PlayLayer* play) {
                 obj->setColor(orig.color);
                 obj->setChildColor(orig.color);
 
-                // Re-evaluate object colors through GD's internal coloring pipeline
                 play->manualUpdateObjectColors(obj);
             }
         }
         s_modifiedSolidObjects.clear();
 
-        // 3. Restore middleground visibility
         play->toggleMGVisibility(true);
         if (play->m_middleground) {
             play->m_middleground->setVisible(true);
         }
 
-        // 4. Restore original ColorAction states
         if (play->m_effectManager) {
             for (const auto& [id, orig] : s_originalColorActions) {
                 auto* action = play->m_effectManager->getColorAction(id);
@@ -574,7 +952,6 @@ void applyLayout(PlayLayer* play) {
             }
             s_originalColorActions.clear();
 
-            // 5. Restore original sprite action colors
             auto& sprites = play->m_effectManager->m_colorActionSpriteVector;
             for (const auto& [id, orig] : s_originalSpriteColors) {
                 if (id < sprites.size() && sprites[id]) {
@@ -584,42 +961,54 @@ void applyLayout(PlayLayer* play) {
             }
             s_originalSpriteColors.clear();
 
-            // Force full recalculation of colors in effect manager
             play->m_effectManager->calculateBaseActiveColors();
             play->m_effectManager->processColors();
         }
 
-        // 6. Reset m_keyPulses and gradient layers
         std::fill(play->m_keyPulses.m_bits.begin(), play->m_keyPulses.m_bits.end(), 0u);
         play->resetGradientLayers();
 
         s_isStyled = false;
+        s_artApplied = false;
         skkbot2::Logger::get().info("skkBot2: Layout Mode restored (turned OFF)");
         return;
     }
 
-    // Toggle ON: paint colors every frame
     paintColors(play);
 
-    // If objects are already styled, keep middleground hidden and return
     if (s_isStyled) {
-        play->toggleMGVisibility(false);
-        if (play->m_middleground) {
-            play->m_middleground->setVisible(false);
+        const bool artOn = defaultArtOn();
+        if (artOn && !s_artApplied) {
+            s_isStyled = false;
+            s_artApplied = true;
+        } else if (!artOn && s_artApplied) {
+            refreshDefaultArt(play);
+            s_artApplied = false;
         }
+    }
+
+    const bool keepMG = regularBgOn();
+
+    if (s_isStyled) {
+        play->toggleMGVisibility(keepMG);
+        if (play->m_middleground) {
+            play->m_middleground->setVisible(keepMG);
+        }
+        drawDefaultArt(play);
         return;
     }
 
     s_isStyled = true;
+    s_artApplied = defaultArtOn();
     s_hiddenObjectsState.clear();
     s_modifiedSolidObjects.clear();
 
-    // Hide middleground layer
-    play->toggleMGVisibility(false);
+    play->toggleMGVisibility(keepMG);
     if (play->m_middleground) {
-        play->m_middleground->setVisible(false);
+        play->m_middleground->setVisible(keepMG);
     }
 
+    const ccColor3B groundCol = engineGroundColor();
     const auto numObjects = play->m_objects->count();
 
     for (auto* obj : CCArrayExt<GameObject*>(play->m_objects)) {
@@ -656,8 +1045,33 @@ void applyLayout(PlayLayer* play) {
             if (obj->m_particle) {
                 obj->m_particle->setVisible(false);
             }
+        } else if (replacedByDefaultArt(obj)) {
+            s_artChannels[obj] = {obj->m_activeMainColorID,
+                                  obj->m_activeDetailColorID};
+
+            HiddenObjectOriginalState orig;
+            orig.isHide = obj->m_isHide;
+            orig.isVisible = obj->isVisible();
+            orig.opacity = obj->getOpacity();
+            orig.glowSpriteVisible =
+                obj->m_glowSprite ? obj->m_glowSprite->isVisible() : false;
+            orig.colorSpriteVisible =
+                obj->m_colorSprite ? obj->m_colorSprite->isVisible() : false;
+            orig.particleVisible =
+                obj->m_particle ? obj->m_particle->isVisible() : false;
+            s_hiddenObjectsState[obj] = orig;
+            s_artHidden.insert(obj);
+
+            obj->m_isHide = true;
+            obj->setVisible(true);
+            obj->setOpacity(0);
+            if (obj->m_glowSprite) {
+                obj->m_glowSprite->setVisible(false);
+            }
+            if (obj->m_colorSprite) {
+                obj->m_colorSprite->setVisible(false);
+            }
         } else {
-            // Solid/gameplay object: capture original state
             ObjectOriginalState orig;
             orig.isHide = obj->m_isHide;
             orig.isVisible = obj->isVisible();
@@ -685,7 +1099,6 @@ void applyLayout(PlayLayer* play) {
 
             s_modifiedSolidObjects[obj] = orig;
 
-            // Apply blueprint styling
             obj->m_isHide = false;
             obj->setVisible(true);
             obj->m_hasNoGlow = true;
@@ -706,10 +1119,8 @@ void applyLayout(PlayLayer* play) {
 
             bool hazard = obj->m_objectType == GameObjectType::Hazard ||
                           obj->m_objectType == GameObjectType::AnimatedHazard;
-            ccColor3B blueprintColor = hazard ? ccColor3B{0, 0, 0} : kGroundColor;
+            ccColor3B blueprintColor = hazard ? ccColor3B{0, 0, 0} : groundCol;
             obj->setColor(blueprintColor);
-            // In 2.2, many objects have decorative multi-part children (e.g. outline trims).
-            // Only set child color if there is no decorative child that forms line stripes.
             if (!obj->m_hasCustomChild) {
                 obj->setChildColor(blueprintColor);
             }
@@ -719,11 +1130,11 @@ void applyLayout(PlayLayer* play) {
         }
     }
 
-    // Invalidate active enter/gradient effects to prevent stretched 2.2 line artifacts
     play->resetGradientLayers();
 
-    skkbot2::Logger::get().info("skkBot2: Layout Mode styled {} objects ({} hidden, {} solid styled)",
-                                numObjects, s_hiddenObjectsState.size(), s_modifiedSolidObjects.size());
+    skkbot2::Logger::get().info("skkBot2: Layout Mode styled {} objects ({} hidden, {} solid styled, {} default art)",
+                                numObjects, s_hiddenObjectsState.size(), s_modifiedSolidObjects.size(),
+                                s_artHidden.size());
 }
 
 void clearState() {
@@ -732,14 +1143,16 @@ void clearState() {
     s_originalColorActions.clear();
     s_originalSpriteColors.clear();
     s_isStyled = false;
+    s_artApplied = false;
+    resetDefaultArt();
 }
 
-}  // namespace skk::layout_mode
+}
 
 class $modify(LayoutModePlayLayer, PlayLayer) {
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
         skk::layout_mode::clearState();
-        return PlayLayer::init(level, useReplay, dontCreateObjects);
+        return PlayLayer::init(level, dontCreateObjects);
     }
 
     void resetLevel() {
@@ -758,15 +1171,12 @@ class $modify(LayoutModePlayLayer, PlayLayer) {
     }
 
     void addObject(GameObject* obj) {
-        // ALWAYS pass through to PlayLayer so GD's object list, triggers, and indices
-        // are never corrupted or lost!
         PlayLayer::addObject(obj);
 
         if (!skk::layout_mode::on() || !obj) {
             return;
         }
 
-        // If layout mode is already active at load time, hide decoration/triggers right away
         if (skk::layout_mode::shouldHideObject(obj)) {
             skk::layout_mode::HiddenObjectOriginalState orig;
             orig.isHide = obj->m_isHide;
@@ -789,27 +1199,7 @@ class $modify(LayoutModePlayLayer, PlayLayer) {
     }
 };
 
-class $modify(LayoutModeGameObject, GameObject) {
-    void addGlow(gd::string frame) {
-        GameObject::addGlow(std::move(frame));
-        if (skk::layout_mode::on() && PlayLayer::get()) {
-            this->m_hasNoGlow = true;
-            if (this->m_glowSprite) {
-                this->m_glowSprite->setVisible(false);
-            }
-            if (skk::layout_mode::shouldHideObject(this)) {
-                this->m_isHide = true;
-                this->setVisible(false);
-                this->setOpacity(0);
-                if (this->m_colorSprite) {
-                    this->m_colorSprite->setVisible(false);
-                }
-            }
-        }
-    }
-};
 
-// Repaints the level background / ground / line / middleground when active.
 class $modify(LayoutModeGJBaseGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -855,8 +1245,6 @@ class $modify(LayoutModeGJBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
-        // Always call through: skipping it would bypass GD's colour bookkeeping
-        // and leave the layer's internal colour state stale.
         GJBaseGameLayer::updateColor(color, fadeTime, colorID, blending, opacity,
                                      copyHSV, colorIDToCopy, copyOpacity,
                                      callerObject, unk1, unk2);

@@ -1,3 +1,29 @@
+# v0.1.4 (2026-11-15)
+SKC seed & mid-level playback, hitbox/checkpoint fixes, live render monitor, Geode 6.0.0-alpha.2 port (GD 2.2091), menu customization.
+
+## New
+- **Attempt seed for SKC**: the RNG seed is now stored in the macro and replayed, giving bit-exact RNG on playback
+- **Attempt seed for SKK**: seed is saved in the macro and re-set before every playback attempt
+- **Live render monitor**: hear the render mix in real time through the normal audio device while the render runs (new Monitor toggle in the AUDIO section)
+
+## Improvements
+- **Improved SKC compression**: further encoder tuning (v5, shake quantized to 31 bits) — a saved seed can make the file considerably larger, but click data stays minimal
+- **Improved Play and Record for SKC and SKK**: checkpoint capture/restore reconciliation, hold-shadow sync, restore-window fixes
+- **Improved menu**: theme customization, custom level art (Layout Mode with `<Default Art>`, RGB colors, regular BG) and bug fixes
+- **Renderer**: bitrate raised to 300 Mbps, audio fade in/out, live render monitor, audio kick audit
+- **Ported to Geode 6.0.0-alpha.2** (GD 2.2091): all 17 binary offset sites verified OK
+
+## Fixes
+- **Fixed hitboxes**: separate main/inner player boxes for accurate hitbox overlay
+- **Fixed invisible checkpoints in SKK**: checkpoints restored correctly on playback
+- **Fixed SKC playback from mid-level**: macros can now start playing not only from the beginning of the level
+- **Fixed layout mode**
+- **Fixed checkpoint seam physics (BUG-136)**: seam bridge carries prevCollision + collision log + Echo layer across checkpoint restores (with a safety meter)
+- **Fixed release suppression window after checkpoint restore (BUG-104)**: genuine releases now pass through the restore window
+- **Fixed music desync on render**: audio drift audit tightened
+
+---
+
 # v0.1.3 (2026-11-04)
 Timing & accuracy update: Real Time mode, SKC precision overhaul, checkpoint fixes, macro auto-save.
 

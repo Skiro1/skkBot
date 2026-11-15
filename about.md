@@ -14,22 +14,28 @@ that replaces the cocos frontend of the old skkBot.
 - **Triple RNG lock** (shake + teleport + per-object 2068), velocity fix (always on),
   gravity/up-down/dash state correction from player-visual bits
 - **Per-frame persistence-attempt** recording + playback, practice-mode support,
-  frame stepper (forward), dead-cell hold-sync on checkpoints
+  frame stepper (forward, keybinds), dead-cell hold-sync on checkpoints
 - **Checkpoint system** with `PlayerStateBundle` (54 fields) and Rubber-Banding reconcile
 - **Supported Macro Formats**:
-  - **.skk (SKK3)**: native state-verified binary format with physics snapshots, checkpoints, persistence attempts, triple-RNG boundaries, and target display FPS (Recording & Playback).
-  - **.skc (SKC)**: ultra-compressed inputs-only format (~1–2 bytes/action) using adaptive range coding without heavy physics snapshots (Recording & Playback, beta).
+  - **.skk (SKK3)**: native state-verified binary format with physics snapshots, checkpoints,
+    persistence attempts, triple-RNG boundaries, stored attempt seed, and target display FPS (Recording & Playback).
+  - **.skc (SKC)**: ultra-compressed inputs-only format (~1–2 bytes/action) using adaptive
+    range coding without heavy physics snapshots (Recording & Playback, including playback
+    from mid-level; stores the attempt seed for bit-exact RNG; v5 compression).
   - **Third-Party Formats (Playback only)**: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay Lite (`.ttrl`), Xenon (`.xe`). External physics injection is safely ignored.
 - **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output,
   full encoder list (libx264, libx265, NVENC, AMF, QSV, AV1, VP9/VP8, MPEG-4, ProRes,
-  MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–200 Mbps, audio AAC/MP3/Opus/Vorbis/
+  MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–300 Mbps, video + audio fade in/out,
+  speedhack during render, live render monitor; audio AAC/MP3/Opus/Vorbis/
   FLAC/ALAC/AC3/E-AC3; **level audio is captured from block 0**.
   FFmpeg DLLs are kept outside the .geode file to minimize size. The bot can automatically test
   mirror download speed (GitHub), download and install the required DLLs to
   `geode/mods/skiro1.skk-bot/ffmpeg/` on the fly.
   Manual link: [GitHub dll.zip](https://github.com/Skiro1/skkBot/releases/download/ffmpeg/dll.zip).
 - **Modern ImGui GUI**: intuitive modern interface with tab navigation (Record,
-  Assist, Video, Settings), macro search, Solid background toggle, and classic window fallback
+  Assist, Video, Settings), macro search, Solid background toggle, theme customization,
+  custom level art (Layout Mode with `<Default Art>`, RGB colors, regular BG),
+  and classic window fallback
 - **Assist & Visuals**: Hitbox overlay (isolated from shaders), real-time trajectory simulation,
   and Wave Trail Fix (draw + drag fixes)
 - **Logging system** (None/Error/Warn/Info/All): Geode console + optional file logging,

@@ -37,7 +37,11 @@ namespace skk {
     }
 
     inline std::string pathToUtf8(std::filesystem::path const& path) {
-        return geode::utils::string::pathToString(path);
+#ifdef GEODE_IS_WINDOWS
+        return geode::utils::string::wideToUtf8(path.wstring());
+#else
+        return path.native();
+#endif
     }
 
     inline std::filesystem::path stringToPath(std::string_view value) {

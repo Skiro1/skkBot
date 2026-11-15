@@ -6,5 +6,5 @@ namespace skk::phys {
     [[nodiscard]] bool nearMoversEnabled();
     void setNearMoversEnabled(bool enabled);
 
-    gd::vector<GameObject*>* filterNearMovers(PlayerObject* player, gd::vector<GameObject*>* objects, int count, float dt);
+    std::vector<GameObject*>* filterNearMovers(PlayerObject* player, std::vector<GameObject*>* objects, int count, float dt);
 }

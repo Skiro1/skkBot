@@ -1,5 +1,8 @@
 #include <Geode/Geode.hpp>
 
+#include "version_offsets.hpp"
+#include "physics/cocos_string_opt.hpp"
+
 #ifdef GEODE_IS_WINDOWS
 #include <cstdarg>
 #include <cstdio>
@@ -7,10 +10,6 @@
 
 using namespace geode::prelude;
 
-// RobTop's CCString::initWithFormatAndValist allocates 100 KB on the heap every format call.
-// Under high TPS or frequent string formatting, this fragments heap memory and slows down the CPU.
-// Replacing it with a stack buffer of 1024 bytes avoids all heap allocation.
-#define CCSTRING_INIT_WITH_FORMAT 0x105e0
 
 using InitWithFormat = bool (*)(cocos2d::CCString*, const char*, va_list);
 static InitWithFormat original_init = nullptr;
@@ -28,13 +27,32 @@ static bool init_formatted(cocos2d::CCString* self, const char* format, va_list 
     return true;
 }
 
-$execute {
-    auto cocos = geode::base::getCocos();
-    original_init = reinterpret_cast<InitWithFormat>(cocos + CCSTRING_INIT_WITH_FORMAT);
+namespace skk {
+
+bool installCocosStringOpt() {
+    auto* cocosBase = reinterpret_cast<uint8_t*>(geode::base::getCocos());
+    if (!cocosBase) {
+        skkbot2::log::warn("cocos string opt: cocos module unavailable, optimization off");
+        return false;
+    }
+    const size_t cocosSize = skk::offsets::moduleSizeOf(cocosBase);
+    auto addr = skk::offsets::resolve(skk::offsets::kCocosStringInitWithFormat,
+                                      cocosBase, cocosSize);
+    if (!addr) {
+        skkbot2::log::warn("cocos string opt: CCString::initWithFormatAndValist "
+                           "не резолвится (RVA 0x{:X}, сигнатура не совпала) - "
+                           "оптимизация отключена",
+                           skk::offsets::kCocosStringInitWithFormat.rva);
+        return false;
+    }
+    original_init = reinterpret_cast<InitWithFormat>(*addr);
     (void)Mod::get()->hook(
         reinterpret_cast<void*>(original_init),
         &init_formatted,
         "CCString::initWithFormatAndValist"
     );
+    return true;
+}
+
 }
 #endif

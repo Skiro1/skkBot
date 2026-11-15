@@ -1,5 +1,6 @@
 #include "full_player_checkpoint.hpp"
 #include "broken_object_tracker.hpp"
+#include "crashprobe.hpp"
 
 #include <Geode/Geode.hpp>
 #include <cmath>
@@ -10,6 +11,33 @@ static bool holdButtonHeld(PlayerObject* player, int button) {
     if (!player) return false;
     auto it = player->m_holdingButtons.find(button);
     return it != player->m_holdingButtons.end() && it->second;
+}
+
+static void captureCollisionLogDict(
+    cocos2d::CCDictionary* dict,
+    std::vector<std::pair<int, GameObject*>>& out) {
+    out.clear();
+    if (!dict) return;
+    auto* keys = dict->allKeys();
+    if (!keys) return;
+    out.reserve(keys->count());
+    for (unsigned i = 0; i < keys->count(); ++i) {
+        auto* key = static_cast<cocos2d::CCInteger*>(keys->objectAtIndex(i));
+        if (!key) continue;
+        auto* obj = static_cast<GameObject*>(
+            dict->objectForKey(key->getValue()));
+        if (obj) out.emplace_back(key->getValue(), obj);
+    }
+}
+
+static void restoreCollisionLogDict(
+    cocos2d::CCDictionary* dict,
+    const std::vector<std::pair<int, GameObject*>>& src) {
+    if (!dict) return;
+    dict->removeAllObjects();
+    for (auto const& entry : src) {
+        if (entry.second) dict->setObject(entry.second, entry.first);
+    }
 }
 
 static uint64_t packFlags1(PlayerObject* p) {
@@ -280,8 +308,6 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
 
     cp.totalTime = p->m_totalTime;
     cp.lastCheckpointTime = p->m_lastCheckpointTime;
-    // m_lastJumpTime (wall-clock, std::chrono) deliberately NOT captured:
-    // it must never leave the live world (BUG-89 / BUG-91).
     cp.lastFlipTime = p->m_lastFlipTime;
     cp.lastSpiderFlipTime = p->m_lastSpiderFlipTime;
     cp.gameModeChangedTime = p->m_gameModeChangedTime;
@@ -296,6 +322,20 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
     cp.lastCollisionTop = p->m_lastCollisionTop;
     cp.lastCollisionLeft = p->m_lastCollisionLeft;
     cp.lastCollisionRight = p->m_lastCollisionRight;
+    cp.prevCollisionBottom = p->m_prevCollisionBottom;
+    cp.prevCollisionTop = p->m_prevCollisionTop;
+    captureCollisionLogDict(p->m_collisionLogTop, cp.collisionLogTop);
+    captureCollisionLogDict(p->m_collisionLogBottom, cp.collisionLogBottom);
+    captureCollisionLogDict(p->m_collisionLogLeft, cp.collisionLogLeft);
+    captureCollisionLogDict(p->m_collisionLogRight, cp.collisionLogRight);
+    cp.collisionLogTopAlias = 0;
+    if (p->m_collisionLogTop == p->m_collisionLogBottom) {
+        cp.collisionLogTopAlias = 1;
+    } else if (p->m_collisionLogTop == p->m_collisionLogLeft) {
+        cp.collisionLogTopAlias = 2;
+    } else if (p->m_collisionLogTop == p->m_collisionLogRight) {
+        cp.collisionLogTopAlias = 3;
+    }
     cp.unk50C = p->m_unk50C;
     cp.unk510 = p->m_unk510;
     cp.collidingWithSlopeId = p->m_collidingWithSlopeId;
@@ -354,14 +394,13 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
     cp.stateNoStickX = p->m_stateNoStickX;
     cp.stateNoStickY = p->m_stateNoStickY;
     cp.stateUnk2 = p->m_stateUnk2;
-    cp.ringJumpRelated = p->m_ringJumpRelated;
+    cp.ringJumpRelated = p->m_usedRingThisStep;
     cp.unkA29 = p->m_unkA29;
     cp.unkA99 = p->m_unkA99;
 
-    // Containers / maps (Deep Practice Fix)
     cp.potentialSlopeMap = p->m_potentialSlopeMap;
-    cp.jumpPadRelated = p->m_jumpPadRelated;
-    cp.ringRelatedSet = p->m_ringRelatedSet;
+    cp.jumpPadRelated = p->m_touchedForceIds;
+    cp.ringRelatedSet = p->m_usedRings;
     cp.touchedRings = p->m_touchedRings;
     cp.rotateObjectsRelated = p->m_rotateObjectsRelated;
     cp.currentRobotAnimation = p->m_currentRobotAnimation;
@@ -388,8 +427,6 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
             auto* node = static_cast<PointNode*>(arr->objectAtIndex(i));
             cp.waveTrailPoints.push_back(node->m_point);
         }
-        // The streak's own draw state, not just its points: without these the
-        // rebuilt HardStreak renders with defaults (see header note).
         cp.waveTrailCurrentPoint = p->m_waveTrail->m_currentPoint;
         cp.waveTrailWaveSize = p->m_waveTrail->m_waveSize;
         cp.waveTrailPulseSize = p->m_waveTrail->m_pulseSize;
@@ -465,8 +502,6 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
 
     p->m_totalTime = totalTime;
     p->m_lastCheckpointTime = lastCheckpointTime;
-    // m_lastJumpTime (wall-clock) deliberately NOT restored - GD recomputes
-    // it from live clicks (BUG-89 / BUG-91).
     p->m_lastFlipTime = lastFlipTime;
     p->m_lastSpiderFlipTime = lastSpiderFlipTime;
     p->m_gameModeChangedTime = gameModeChangedTime;
@@ -481,6 +516,18 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_lastCollisionTop = lastCollisionTop;
     p->m_lastCollisionLeft = lastCollisionLeft;
     p->m_lastCollisionRight = lastCollisionRight;
+    p->m_prevCollisionBottom = prevCollisionBottom;
+    p->m_prevCollisionTop = prevCollisionTop;
+    restoreCollisionLogDict(p->m_collisionLogTop, collisionLogTop);
+    restoreCollisionLogDict(p->m_collisionLogBottom, collisionLogBottom);
+    restoreCollisionLogDict(p->m_collisionLogLeft, collisionLogLeft);
+    restoreCollisionLogDict(p->m_collisionLogRight, collisionLogRight);
+    switch (collisionLogTopAlias) {
+        case 1: p->m_collisionLogTop = p->m_collisionLogBottom; break;
+        case 2: p->m_collisionLogTop = p->m_collisionLogLeft; break;
+        case 3: p->m_collisionLogTop = p->m_collisionLogRight; break;
+        default: break;
+    }
     p->m_unk50C = unk50C;
     p->m_unk510 = unk510;
     p->m_collidingWithSlopeId = collidingWithSlopeId;
@@ -539,14 +586,13 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_stateNoStickX = stateNoStickX;
     p->m_stateNoStickY = stateNoStickY;
     p->m_stateUnk2 = stateUnk2;
-    p->m_ringJumpRelated = ringJumpRelated;
+    p->m_usedRingThisStep = ringJumpRelated;
     p->m_unkA29 = unkA29;
     p->m_unkA99 = unkA99;
 
-    // Containers / maps (Deep Practice Fix)
     p->m_potentialSlopeMap = potentialSlopeMap;
-    p->m_jumpPadRelated = jumpPadRelated;
-    p->m_ringRelatedSet = ringRelatedSet;
+    p->m_touchedForceIds = jumpPadRelated;
+    p->m_usedRings = ringRelatedSet;
     p->m_touchedRings = touchedRings;
     p->m_rotateObjectsRelated = rotateObjectsRelated;
     p->m_currentRobotAnimation = currentRobotAnimation;
@@ -564,27 +610,25 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
 
     if (p->m_waveTrail && p->m_waveTrail->m_pointArray) {
         auto* arr = p->m_waveTrail->m_pointArray;
+        skkbot2::crashprobe::armWindow(3.0);
+        skkbot2::log::info(
+            "[CPWT] restore trail this=0x{:x} stored={} beforeCnt={}",
+            (uintptr_t)p->m_waveTrail, waveTrailPoints.size(), arr->count());
+        skkbot2::Logger::get().flush();
         arr->removeAllObjects();
         for (auto& pt : waveTrailPoints) {
-            auto* node = PointNode::create(pt);
-            if (node) arr->addObject(node);
+            p->m_waveTrail->addPoint(pt);
         }
-        // Re-pin the streak's draw state. This apply runs AFTER
-        // forceCurrentModeVisual, which rebuilt m_waveTrail via
-        // toggleDartMode(true) — a fresh HardStreak with reset flags. Without
-        // m_drawStreak/m_currentPoint/m_waveSize the respawned wave trail
-        // either does not draw at all or starts from the wrong origin, so the
-        // trail visibly vanishes/jumps after a practice restart.
+        skkbot2::log::info(
+            "[CPWT] restore via addPoint done stored={} cnt={}",
+            waveTrailPoints.size(), arr->count());
+        skkbot2::Logger::get().flush();
         p->m_waveTrail->m_currentPoint = waveTrailCurrentPoint;
         p->m_waveTrail->m_waveSize = waveTrailWaveSize;
         p->m_waveTrail->m_pulseSize = waveTrailPulseSize;
         p->m_waveTrail->m_isSolid = waveTrailIsSolid;
         p->m_waveTrail->m_isFlipped = waveTrailIsFlipped;
         p->m_waveTrail->m_drawStreak = waveTrailDrawStreak;
-        // HardStreak is a CCNode whose own position is the streak's origin.
-        // The rebuilt streak inherits no position, so the first frame after a
-        // restore would draw from (0,0); pin it to the player like GD's own
-        // update does for darts (silicate does the same in its render hook).
         p->m_waveTrail->setPosition(p->m_position);
     }
 }

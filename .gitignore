@@ -11,3 +11,4 @@ build_out.log
 *.log
 node_modules/
 dist/
+remove_all_comments.bat

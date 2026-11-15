@@ -8,7 +8,6 @@ namespace skk::codec {
 static constexpr uint8_t kCodecZstd = 0;
 static constexpr size_t kHeaderSize = 8;
 
-// ─── Compress ────────────────────────────────────────────────────────
 std::vector<uint8_t> compress(
     std::vector<uint8_t> const& data,
     Level level
@@ -33,7 +32,6 @@ std::vector<uint8_t> compress(
     return out;
 }
 
-// ─── Decompress ──────────────────────────────────────────────────────
 std::vector<uint8_t> decompress(
     std::vector<uint8_t> const& data,
     size_t expectedSize
@@ -58,4 +56,4 @@ std::vector<uint8_t> decompress(
     return out;
 }
 
-}  // namespace skk::codec
+}

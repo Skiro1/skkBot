@@ -9,8 +9,6 @@
 #include <cstring>
 #include <fstream>
 
-// Guards against a corrupt countExp/repeatsExp turning into a huge allocation.
-// A section's own byte size already bounds it, so this is a second line.
 static constexpr uint64_t kMaxSectionInputs = 1u << 20;
 static constexpr uint64_t kMaxActions = 8'000'000;
 
@@ -18,7 +16,6 @@ namespace {
 
 constexpr uint8_t kHeader[8] = {'S', 'L', 'C', '3', 'R', 'P', 'L', 'Y'};
 constexpr uint8_t kFooter = 0xCC;
-constexpr uint16_t kMetadataSize = 64;
 
 class Reader {
 public:
@@ -84,7 +81,6 @@ private:
     bool m_ok = true;
 };
 
-// state = (delta << 4) | (button << 2) | (player2 << 1) | holding
 struct DecodedState {
     uint64_t delta;
     uint8_t button;
@@ -97,7 +93,7 @@ DecodedState decodeState(uint64_t s) {
                         (s & 2) != 0, (s & 1) != 0};
 }
 
-}  // namespace
+}
 
 bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                      std::string& outReason) {
@@ -106,11 +102,15 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
         return false;
     };
 
-    if (data.size() < 10 + kMetadataSize) {
+    if (data.size() < 27) {
         return fail("slc: file is too small to hold a header and metadata");
     }
 
-    Reader r(data);
+    const bool hasFooter = data.back() == kFooter;
+    const std::span<const uint8_t> body =
+        hasFooter ? data.first(data.size() - 1) : data;
+
+    Reader r(body);
     uint8_t header[8];
     for (int i = 0; i < 8; ++i) header[i] = r.u8();
     if (std::memcmp(header, kHeader, sizeof(header)) != 0) {
@@ -118,24 +118,28 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
     }
 
     const uint16_t metaSize = r.u16();
-    if (metaSize != kMetadataSize) {
-        // The reference refuses anything else outright as "outdated or
-        // malformed". v2 lands here too, which is the intent.
+    if (metaSize < 16) {
         return fail("slc: metadata size " + std::to_string(metaSize) +
-                    ", expected " + std::to_string(kMetadataSize) +
-                    " (outdated or malformed replay?)");
+                    ", expected at least 16 (outdated or malformed replay?)");
+    }
+    if (body.size() - 10 <= metaSize) {
+        return fail("slc: metadata size " + std::to_string(metaSize) +
+                    " leaves no room for atoms");
     }
 
     out = Replay{};
     out.meta.tps = r.f64();
     out.meta.seed = r.u64();
-    out.meta.version = r.u32();
-    out.meta.build = r.u32();
-    out.meta.randomnessAlgorithm = r.u32();
-    r.skip(36);  // __padding
+    size_t metaConsumed = 16;
+    if (metaSize >= 38) {
+        out.meta.version = r.u32();
+        out.meta.build = r.u32();
+        out.meta.randomnessAlgorithm = r.u32();
+        metaConsumed = 28;
+    }
+    r.skip(metaSize - metaConsumed);
 
-    // Atoms: uint32 id, uint64 size with the top byte holding flags.
-    while (r.remaining() > 1 && r.ok()) {
+    while (r.remaining() >= 12 && r.ok()) {
         const uint32_t atomId = r.u32();
         const uint64_t rawSize = r.u64();
         const uint64_t atomSize = rawSize & ~(0xFFull << 56);
@@ -147,9 +151,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
         const size_t atomEnd = r.pos() + static_cast<size_t>(atomSize);
 
         if (atomId != 1) {
-            // 0 = Null (skip), 2 = Marker (unknown to us). The reference skips
-            // the body for anything it does not recognise, and that is the
-            // behaviour that keeps custom atoms from breaking a read.
             r.skip(static_cast<size_t>(atomSize));
             continue;
         }
@@ -190,7 +191,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                             out.actions.empty() ? 0 : out.actions.back().frame;
                         const uint64_t frame = prev + st.delta;
                         if (st.button == static_cast<uint8_t>(Button::Swift)) {
-                            // Swift is a hold and release on the same frame.
                             out.actions.push_back(
                                 Action{frame, Button::Jump, true, st.player2});
                             out.actions.push_back(
@@ -208,7 +208,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                 continue;
             }
 
-            // Special: 10 TTTT DD XXXXXXXX  (type, deltaSize, frameDelta)
             const unsigned type = (h >> 10) & 0xF;
             const unsigned sz = 1u << ((h >> 8) & 3);
             const uint64_t frameDelta = r.uintOfSize(sz);
@@ -245,14 +244,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
 
     if (!r.ok()) return fail("slc: truncated stream");
 
-    const uint8_t footer = r.u8();
-    if (footer != kFooter) {
-        return fail("slc: bad footer");
-    }
-    if (r.pos() != data.size()) {
-        return fail("slc: " + std::to_string(data.size() - r.pos()) +
-                    " trailing byte(s) after the footer");
-    }
 
     std::stable_sort(out.actions.begin(), out.actions.end(),
                      [](const Action& a, const Action& b) { return a.frame < b.frame; });
@@ -270,9 +261,6 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
         return fail("slc: unusable tps " + std::to_string(replay.meta.tps));
     }
 
-    // A replay carrying deaths or restarts is not something SKC can play: it
-    // has no death chain and no restart events, so the run would diverge at the
-    // first death with nothing in the log pointing at why.
     if (!replay.specials.empty()) {
         const auto& sp = replay.specials.front();
         const char* kind = sp.kind == SpecialKind::Death     ? "Death"
@@ -301,12 +289,6 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
                                           a.holding, a.player2});
     }
 
-    // Every SLC edge goes in verbatim. A second press on a channel that is
-    // still held is one of the encoder's collapsed TAPS (the release happened
-    // but was not stored), and normalizeActionStream() rebuilds it as a
-    // same-frame up+down instead of deleting it. Deleting it changed the run:
-    // on Windy Road the surviving single press made GD apply the jump one
-    // physics step earlier than the identical timeline replayed as up+down.
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

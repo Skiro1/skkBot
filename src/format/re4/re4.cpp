@@ -13,28 +13,9 @@ namespace {
 
 constexpr uint8_t kMagic[3] = {'R', 'E', '4'};
 
-// Measured, not guessed - and none of the values work, which is the point.
-//
-//   shift  0 -> dies at frame 3899 after 78 clicks
-//   shift -1 -> dies at frame 3899 after 78 clicks
-//
-// The same point, not a nearby one. A real off-by-one moves the death; this did
-// not move at all, so the frame scale is not RE4's problem and no shift fixes
-// it. That is why this stays a measured constant with no formula behind it -
-// see the six-format table in the header for why a formula cannot exist.
-//
-// The cause is GDH's own playback (replayEngine.cpp:107-118): it pins the
-// player's position every frame, unconditionally, and velocity only when
-// velocity_fix is on, which it is not by default. A GDH macro is therefore
-// self-certifying - it completes whatever its inputs are, because the
-// trajectory is handed to it. Its inputs were never required to stand alone.
-//
-// The recording was clean: 9803 physics frames covering 0..9807 with no x jump
-// over 30px, so no deaths or respawns are hiding in there. It was simply
-// recorded under correction.
 static constexpr int64_t kFrameShift = -1;
 
-}  // namespace
+}
 
 bool skk::re4::looksLikeRe4(std::span<const uint8_t> data) {
     return data.size() >= kMagicSize &&
@@ -48,8 +29,6 @@ bool skk::re4::parse(std::span<const uint8_t> data, skk::re4::Replay& out,
         return false;
     };
 
-    // "RE4" is three bytes. A four-byte magic check would consume the low byte
-    // of the fps float and shift every subsequent field by one.
     if (!looksLikeRe4(data)) {
         return fail("re4: not an RE4 file (magic must be \"RE4\")");
     }
@@ -71,20 +50,7 @@ bool skk::re4::parse(std::span<const uint8_t> data, skk::re4::Replay& out,
                     std::to_string(physicCount));
     }
 
-    // Imported anyway, with a warning, rather than refused. GDH pins the player
-    // to the recorded position on every frame of playback
-    // (replayEngine.cpp:107-118), so a macro with physics is self-certifying:
-    // it completes whatever its inputs are, because the trajectory is handed
-    // to the player. Measured on the real file, 0 and -1 both die at frame 3899
-    // after 78 clicks - the same point, not a neighbouring one, which is what a
-    // genuine off-by-one never does. That is expected, and it does not stop
-    // anyone who wants the clicks anyway; it only means "it played" proves
-    // nothing about them.
     if (physicCount > 0) {
-        // Short, because Geode's notification bubble is small and long text
-        // simply gets cut off at the edge of the screen. The full explanation
-        // goes to the log right below; the toast only has to stop the user
-        // wondering why the macro dies at frame 3899 and blaming the shift.
         out.caution = "Recorded with physics pinning - may not replay correctly.";
         skkbot2::log::warn(
             "[RE4] this macro carries {} physics frame(s): GDH pinned the player to a recorded "
@@ -103,9 +69,6 @@ bool skk::re4::parse(std::span<const uint8_t> data, skk::re4::Replay& out,
         return fail("re4: truncated - the physics block runs past the end");
     }
 
-    // Physics is deliberately skipped, not parsed. GDH pins the player to these
-    // coordinates every frame regardless of divergence, so replaying with them
-    // would make any input set "work" and prove nothing. SKC plays the inputs.
     size_t pos = kHeaderSize + physicBytes;
 
     uint64_t inputCount = 0;
@@ -133,8 +96,6 @@ bool skk::re4::parse(std::span<const uint8_t> data, skk::re4::Replay& out,
         pos += 4;
         const uint8_t player2 = data[pos++];
 
-        // GD's PlayerButton here, unlike Neverhook's and Xenon's: RE4 stores an
-        // explicit int32 button rather than assuming Jump.
         uint8_t btn = (button >= 1 && button <= 3) ? static_cast<uint8_t>(button) : 1;
         out.actions.push_back(Action{frame, btn, down != 0, player2 != 0});
     }
@@ -182,10 +143,6 @@ bool skk::re4::toSkcMacro(const skk::re4::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
-    // Stray releases are dropped here and a collapsed tap is rebuilt as a
-    // same-frame up+down (never deleted - see normalizeActionStream()). Doing
-    // it after the shift keeps the "first click" report honest: quoting the
-    // first KEPT action, not a dangling leading release.
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;
