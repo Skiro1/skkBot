@@ -198,7 +198,8 @@ void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report
     actions.swap(out);
 }
 
-bool validateActions(const std::vector<Action>& actions, std::string& outReason) {
+bool validateActions(const std::vector<Action>& actions, std::string& outReason,
+                     bool allowRepeatedPress) {
     bool held[2][3] = {};
     bool seenPress[2][3] = {};
 
@@ -222,7 +223,7 @@ bool validateActions(const std::vector<Action>& actions, std::string& outReason)
         const int slot = action.player2 ? 1 : 0;
 
         if (action.pressed) {
-            if (held[slot][button]) {
+            if (held[slot][button] && !allowRepeatedPress) {
                 outReason = "double press on button " +
                             std::to_string(action.button) +
                             (action.player2 ? " (P2)" : " (P1)") +
@@ -932,7 +933,10 @@ CostProfile profile(const Macro& macro) {
     return prof;
 }
 
-[[nodiscard]] std::optional<Macro> decode(const uint8_t* data, size_t size) {
+namespace {
+
+std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
+                                  size_t* droppedRelease) {
     if (!data) return std::nullopt;
 
     Header header;
@@ -996,9 +1000,34 @@ CostProfile profile(const Macro& macro) {
             "the sub-step marks were dropped and the session runs vanilla");
     }
 
+    if (droppedRelease) {
+        *droppedRelease = 0;
+        bool held[2][3] = {};
+        bool seenPress[2][3] = {};
+        std::erase_if(macro.actions, [&](const Action& action) {
+            if (action.button < 1 || action.button > 3) return false;
+            const int slot = action.player2 ? 1 : 0;
+            const int button = action.button - 1;
+            if (!action.pressed && seenPress[slot][button] &&
+                !held[slot][button]) {
+                ++*droppedRelease;
+                return true;
+            }
+            held[slot][button] = action.pressed;
+            seenPress[slot][button] |= action.pressed;
+            return false;
+        });
+    }
+
     std::string reason;
-    if (!validateActions(macro.actions, reason)) return std::nullopt;
+    if (!validateActions(macro.actions, reason, true)) return std::nullopt;
     return macro;
+}
+
+}
+
+[[nodiscard]] std::optional<Macro> decode(const uint8_t* data, size_t size) {
+    return decodeNative(data, size, nullptr);
 }
 
 std::optional<Header> readHeader(const std::filesystem::path& path) {
@@ -1030,56 +1059,14 @@ std::optional<Macro> loadFromFile(const std::filesystem::path& path) {
     if (auto macro = decode(data.data(), data.size()))
         return macro;
 
-    Header header;
-    size_t payloadOffset = 0;
-    Candidate cand;
-    if (!parseHeader(data.data(), data.size(), header, payloadOffset, cand))
-        return std::nullopt;
-
-    std::vector<Click> clicks;
-    size_t streamBytes = 0;
-    if (!decodeClicks(data.data() + payloadOffset,
-                      data.size() - payloadOffset, clicks, cand, &streamBytes))
-        return std::nullopt;
-
-    std::vector<Action> actions = clicksToActions(clicks, header.subtickEncoded);
-    NormalizeReport report;
-    normalizeActionStream(actions, report);
-    std::string reason;
-    if (!validateActions(actions, reason)) {
-        skkbot2::log::error(
-            "[SKC] salvage failed - {} still unplayable after normalization: {}",
-            skk::pathToUtf8(path.filename()), reason);
-        return std::nullopt;
-    }
-
-    Macro macro;
-    macro.header = header;
-    macro.platformerKnown = header.platformerKnown;
-    macro.platformerMode = header.platformerMode;
-    macro.cbsMode = header.cbsMode;
-    macro.cosMode = header.cosMode;
-    macro.subtickEncoded = header.subtickEncoded;
-    macro.lockDeltaMode = header.lockDeltaMode;
-    macro.realTimeMode = header.realTimeMode;
-    macro.actions = std::move(actions);
-    macro.sortActions();
-
-    if (streamBytes < data.size() - payloadOffset) {
-        const size_t boundary = payloadOffset + streamBytes;
-        const size_t back = std::min<size_t>(streamBytes, 8u);
-        (void)locateAndParseRngJournal(data.data() + boundary - back,
-                                       data.size() - boundary + back,
-                                       macro.rngJournal);
-    }
+    size_t droppedRelease = 0;
+    auto macro = decodeNative(data.data(), data.size(), &droppedRelease);
+    if (!macro) return std::nullopt;
 
     skkbot2::log::warn(
-        "[SKC] SALVAGED {} - decoded but failed validation; normalized "
-        "(dropped {} stray release(s), rebuilt {} flattened tap(s)) and "
-        "accepted. This is a rescue-file shape, usually a practice respawn "
-        "mid-hold; re-verify the replay before trusting it.",
-        skk::pathToUtf8(path.filename()), report.droppedRelease,
-        report.rebuiltTaps);
+        "[SKC] SALVAGED {} - dropped {} stray release(s); "
+        "native presses preserved, no releases inserted; re-verify the replay.",
+        skk::pathToUtf8(path.filename()), droppedRelease);
     return macro;
 }
 
@@ -1111,6 +1098,27 @@ bool saveToFile(const std::filesystem::path& path, const Macro& macro) {
 }
 
 bool selfTest() {
+    for (const uint32_t secondFrame : {13663u, 13664u}) {
+        Macro native;
+        native.wireSeedStamp = -1;
+        native.actions = {{13663, 1, true, false},
+                          {secondFrame, 1, true, false},
+                          {13665, 1, false, false}};
+        const auto bytes = encode(native);
+        auto back = decode(bytes.data(), bytes.size());
+        if (!back || back->actions != native.actions || encode(*back) != bytes) {
+            skkbot2::log::error("[SKC] self-test BUG-138: native repeated press changed");
+            return false;
+        }
+        auto foreign = native.actions;
+        NormalizeReport report;
+        normalizeActionStream(foreign, report);
+        if (report.rebuiltTaps != 1 || foreign.size() != 4) {
+            skkbot2::log::error("[SKC] self-test BUG-138: foreign tap repair changed");
+            return false;
+        }
+    }
+
     Macro macro;
     macro.header.tps = 360.0f;
     macro.header.fps = 144.0f;
@@ -1550,7 +1558,7 @@ bool decodeWith(const uint8_t* data, size_t size, const Variant& variant,
     macro.sortActions();
 
     std::string reason;
-    if (!validateActions(macro.actions, reason)) return false;
+    if (!validateActions(macro.actions, reason, true)) return false;
 
     outActions = std::move(macro.actions);
     return true;

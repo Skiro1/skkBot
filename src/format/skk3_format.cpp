@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 #include "codec.hpp"
 
@@ -2529,6 +2530,37 @@ HeaderSelfTestResult selfTestHeader() {
         in.player2 = false;
         in.pressed = (i % 2) == 0;
         base.inputs.push_back(in);
+    }
+
+    {
+        Macro native = base;
+        native.inputs.clear();
+        for (const auto [frame, pressed] : {
+                 std::pair{13663, true}, std::pair{13663, true},
+                 std::pair{13664, false}, std::pair{13665, true},
+                 std::pair{13666, true}, std::pair{13667, false}}) {
+            Input input;
+            input.timeSeconds = static_cast<double>(frame) * (1.0 / 240.0);
+            input.button = 1;
+            input.pressed = pressed;
+            native.inputs.push_back(input);
+        }
+        std::string error;
+        const auto bytes = serialize(native);
+        auto back = deserialize(bytes, &error);
+        if (!back || back->inputs.size() != native.inputs.size()) {
+            result.detail = "BUG-138: native repeated press count changed: " + error;
+            return result;
+        }
+        for (size_t i = 0; i < native.inputs.size(); ++i) {
+            const auto& a = native.inputs[i];
+            const auto& b = back->inputs[i];
+            if (a.timeSeconds != b.timeSeconds || a.button != b.button ||
+                a.player2 != b.player2 || a.pressed != b.pressed) {
+                result.detail = "BUG-138: native input order/time/state changed";
+                return result;
+            }
+        }
     }
 
     Macro plain = base;

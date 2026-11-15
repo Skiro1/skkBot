@@ -196,7 +196,9 @@ struct Macro {
                                                   bool subticks = false);
 
 [[nodiscard]] bool validateActions(const std::vector<Action>& actions,
-                                   std::string& outReason);
+                                   std::string& outReason,
+                                   bool allowRepeatedPress = false);
+
 
 struct NormalizeReport {
     std::size_t droppedRelease = 0;

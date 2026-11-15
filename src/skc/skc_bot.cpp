@@ -665,6 +665,20 @@ void Bot::reconcileCaptureRestore(uint32_t frame) {
             const bool rawP2 = handleButtonPlayer2Param(slot == 1,
                                                         controlFlipActive(layer));
             layer->GJBaseGameLayer::handleButton(physicalHeld, button, rawP2);
+            bool streamHeld = false;
+            for (auto it = m_macro.actions.rbegin(); it != m_macro.actions.rend(); ++it) {
+                if (it->button == button && it->player2 == (slot == 1)) {
+                    streamHeld = it->pressed;
+                    break;
+                }
+            }
+            if (streamHeld == physicalHeld) {
+                skkbot2::log::warn(
+                    "[SKC] capture reconciliation repeated command: frame={} "
+                    "p2={} button={} down={} streamHeld={} snapshotHeld={}; "
+                    "preserved for native replay verification",
+                    frame, slot == 1, button, physicalHeld, streamHeld, snapshotHeld);
+            }
             Action action;
             action.frame = frame;
             action.button = static_cast<uint8_t>(button);
@@ -950,7 +964,7 @@ bool Bot::save(const std::filesystem::path& path) {
     m_macro.sortActions();
 
     std::string reason;
-    if (!validateActions(m_macro.actions, reason)) {
+    if (!validateActions(m_macro.actions, reason, true)) {
         skkbot2::log::error(
             "[SKC] SAVE REFUSED - the recording is corrupt and cannot be "
             "replayed: {}. Nothing was written to {}.",
@@ -968,7 +982,6 @@ bool Bot::save(const std::filesystem::path& path) {
     }
 
     m_macroName = skk::pathToUtf8(path.stem());
-
     std::size_t p1 = 0, p2 = 0;
     for (const auto& act : m_macro.actions) {
         if (act.player2) ++p2; else ++p1;
@@ -1001,7 +1014,7 @@ bool Bot::save(const std::filesystem::path& path) {
     }
 
     std::string reason;
-    if (!validateActions(m_macro.actions, reason)) {
+    if (!validateActions(m_macro.actions, reason, true)) {
         skkbot2::log::error(
             "[SKC] LOAD REFUSED - {} decodes but cannot be replayed: {}.",
             skk::pathToUtf8(path.filename()), reason);
@@ -1011,6 +1024,23 @@ bool Bot::save(const std::filesystem::path& path) {
     }
 
     m_macroName = skk::pathToUtf8(path.stem());
+    bool held[2][3] = {};
+    size_t repeatedPresses = 0;
+    uint32_t firstRepeatedFrame = 0;
+    for (const auto& action : m_macro.actions) {
+        const int slot = action.player2 ? 1 : 0;
+        const int button = action.button - 1;
+        if (action.pressed && held[slot][button]) {
+            if (repeatedPresses++ == 0) firstRepeatedFrame = action.frame;
+        }
+        held[slot][button] = action.pressed;
+    }
+    if (repeatedPresses) {
+        skkbot2::log::warn(
+            "[SKC] native repeated press preserved: count={} firstFrame={}; "
+            "no releases inserted, source capture needs verification",
+            repeatedPresses, firstRepeatedFrame);
+    }
     skkbot2::log::info(
         "[SKC] loaded {} actions from {} (tps={}, mode={})",
         m_macro.actions.size(), skk::pathToUtf8(path), m_macro.header.tps,
