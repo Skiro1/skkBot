@@ -5,6 +5,8 @@
 #include "format/codec.hpp"
 #include "logger/logger.hpp"
 
+#include "utils.hpp"
+
 #include <Geode/Geode.hpp>
 #include <algorithm>
 #include <cstring>
@@ -1025,7 +1027,60 @@ std::optional<Macro> loadFromFile(const std::filesystem::path& path) {
         (std::istreambuf_iterator<char>(in)),
         std::istreambuf_iterator<char>());
 
-    return decode(data.data(), data.size());
+    if (auto macro = decode(data.data(), data.size()))
+        return macro;
+
+    Header header;
+    size_t payloadOffset = 0;
+    Candidate cand;
+    if (!parseHeader(data.data(), data.size(), header, payloadOffset, cand))
+        return std::nullopt;
+
+    std::vector<Click> clicks;
+    size_t streamBytes = 0;
+    if (!decodeClicks(data.data() + payloadOffset,
+                      data.size() - payloadOffset, clicks, cand, &streamBytes))
+        return std::nullopt;
+
+    std::vector<Action> actions = clicksToActions(clicks, header.subtickEncoded);
+    NormalizeReport report;
+    normalizeActionStream(actions, report);
+    std::string reason;
+    if (!validateActions(actions, reason)) {
+        skkbot2::log::error(
+            "[SKC] salvage failed - {} still unplayable after normalization: {}",
+            skk::pathToUtf8(path.filename()), reason);
+        return std::nullopt;
+    }
+
+    Macro macro;
+    macro.header = header;
+    macro.platformerKnown = header.platformerKnown;
+    macro.platformerMode = header.platformerMode;
+    macro.cbsMode = header.cbsMode;
+    macro.cosMode = header.cosMode;
+    macro.subtickEncoded = header.subtickEncoded;
+    macro.lockDeltaMode = header.lockDeltaMode;
+    macro.realTimeMode = header.realTimeMode;
+    macro.actions = std::move(actions);
+    macro.sortActions();
+
+    if (streamBytes < data.size() - payloadOffset) {
+        const size_t boundary = payloadOffset + streamBytes;
+        const size_t back = std::min<size_t>(streamBytes, 8u);
+        (void)locateAndParseRngJournal(data.data() + boundary - back,
+                                       data.size() - boundary + back,
+                                       macro.rngJournal);
+    }
+
+    skkbot2::log::warn(
+        "[SKC] SALVAGED {} - decoded but failed validation; normalized "
+        "(dropped {} stray release(s), rebuilt {} flattened tap(s)) and "
+        "accepted. This is a rescue-file shape, usually a practice respawn "
+        "mid-hold; re-verify the replay before trusting it.",
+        skk::pathToUtf8(path.filename()), report.droppedRelease,
+        report.rebuiltTaps);
+    return macro;
 }
 
 bool saveToFile(const std::filesystem::path& path, const Macro& macro) {
