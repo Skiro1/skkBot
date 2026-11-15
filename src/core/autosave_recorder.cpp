@@ -1,4 +1,5 @@
 #include "core/autosave_recorder.hpp"
+#include "core/autosave_write_order.hpp"
 
 #include "skkBot.hpp"
 #include "core/paths.hpp"
@@ -26,10 +27,11 @@ bool g_cachedLoaded = false;
 
 std::atomic<bool> g_skkJob{false};
 std::atomic<bool> g_skcJob{false};
+SnapshotWriteOrder g_skkWriteOrder;
+SnapshotWriteOrder g_skcWriteOrder;
 
 double g_lastSkk = -1.0e9;
 double g_lastSkc = -1.0e9;
-std::size_t g_lastSkcCount = 0;
 
 constexpr double kSkkInterval = 10.0;
 constexpr double kSkcInterval = 5.0;
@@ -105,44 +107,48 @@ std::string skkAutosaveName() {
     return raw + "_autosave";
 }
 
-static void skkWriteSnapshot(std::shared_ptr<SkMacro> snapshot) {
-    std::error_code ec;
-    auto directory = directoryPrepared(ec);
-    bool ok = false;
-    if (!ec) {
-        normalizeSkPersistenceTiming(*snapshot);
-        snapshot->duration = 0.0;
-        double safeFramerate = std::isfinite(snapshot->framerate) &&
-                                       snapshot->framerate > 0.0
-            ? snapshot->framerate
-            : 240.0;
-        for (auto const& input : snapshot->inputs) {
-            double inputTime = input.hasAbsoluteTime()
-                ? input.timeSeconds
-                : static_cast<double>(std::max(0, input.tick)) / safeFramerate;
-            if (!input.hasAbsoluteTime() && std::isfinite(input.cbsTimeOffset) &&
-                input.cbsTimeOffset >= 0.0) {
-                inputTime += input.cbsTimeOffset;
+static void skkWriteSnapshot(std::shared_ptr<SkMacro> snapshot, uint64_t revision) {
+    const bool ran = g_skkWriteOrder.run(revision, snapshot->name, [&]() {
+        std::error_code ec;
+        auto directory = directoryPrepared(ec);
+        bool ok = false;
+        if (!ec) {
+            normalizeSkPersistenceTiming(*snapshot);
+            snapshot->duration = 0.0;
+            double safeFramerate = std::isfinite(snapshot->framerate) &&
+                                           snapshot->framerate > 0.0
+                ? snapshot->framerate
+                : 240.0;
+            for (auto const& input : snapshot->inputs) {
+                double inputTime = input.hasAbsoluteTime()
+                    ? input.timeSeconds
+                    : static_cast<double>(std::max(0, input.tick)) / safeFramerate;
+                if (!input.hasAbsoluteTime() && std::isfinite(input.cbsTimeOffset) &&
+                    input.cbsTimeOffset >= 0.0) {
+                    inputTime += input.cbsTimeOffset;
+                }
+                snapshot->duration = std::max(snapshot->duration, inputTime);
             }
-            snapshot->duration = std::max(snapshot->duration, inputTime);
+            ok = snapshot->saveToPath(directory / skk::stringToPath(snapshot->name + ".skk"));
         }
-        ok = snapshot->saveToPath(directory / skk::stringToPath(snapshot->name + ".skk"));
-    }
-    if (!ok) {
-        skkbot2::log::error("[AUTOSAVE] SKK snapshot to '{}' failed{}",
-                            snapshot->name, ec.message().empty()
-                                ? " (cannot prepare replay directory)"
-                                : " (" + ec.message() + ")");
-    } else {
-        skkbot2::log::info(
-            "[AUTOSAVE] SKK snapshot '{}' (inputs={} frames={})",
-            snapshot->name, snapshot->inputs.size(), snapshot->perFrames.size());
-    }
+        if (!ok) {
+            skkbot2::log::error("[AUTOSAVE] SKK snapshot to '{}' failed{}",
+                                 snapshot->name, ec.message().empty()
+                                     ? " (cannot prepare replay directory)"
+                                     : " (" + ec.message() + ")");
+        } else {
+            skkbot2::log::info(
+                "[AUTOSAVE] SKK snapshot '{}' (inputs={} frames={})",
+                snapshot->name, snapshot->inputs.size(), snapshot->perFrames.size());
+        }
+        return ok;
+    });
+    if (!ran) skkbot2::log::debug("[AUTOSAVE] SKK stale snapshot skipped: revision={}", revision);
 }
 
 static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
     if (!engine->skMode || !engine->activeSk) return;
-    if (engine->activeSk->inputs.empty() &&
+    if (!sync && engine->activeSk->inputs.empty() &&
         engine->activeSk->persistenceAttempts.empty() &&
         engine->activeSk->perFrames.empty()) {
         return;
@@ -156,9 +162,10 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
     snapshot->recordTimestamp = static_cast<int64_t>(std::time(nullptr));
     snapshot->fileFormat = SkFileFormat::SKK3;
     snapshot->name = skkAutosaveName();
+    const auto revision = g_skkWriteOrder.issue();
 
     if (sync) {
-        skkWriteSnapshot(std::move(snapshot));
+        skkWriteSnapshot(std::move(snapshot), revision);
         return;
     }
 
@@ -166,32 +173,36 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
     if (!g_skkJob.compare_exchange_strong(expected, true)) {
         return;
     }
-    std::thread([snapshot = std::move(snapshot)]() mutable {
-        skkWriteSnapshot(std::move(snapshot));
+    std::thread([snapshot = std::move(snapshot), revision]() mutable {
+        skkWriteSnapshot(std::move(snapshot), revision);
         g_skkJob.store(false);
     }).detach();
 }
 
 static void skcWriteSnapshot(std::shared_ptr<skk::skc::Macro> snapshot,
-                             const std::string& name) {
-    std::error_code ec;
-    auto directory = directoryPrepared(ec);
-    bool ok = false;
-    if (!ec) {
-        ok = skk::skc::saveToFile(directory / skk::stringToPath(name + ".skc"), *snapshot);
-    }
-    if (!ok) {
-        skkbot2::log::error("[AUTOSAVE] SKC snapshot '{}' failed ({} actions)",
-                            name, snapshot->actions.size());
-    } else {
-        skkbot2::log::info("[AUTOSAVE] SKC snapshot '{}' ({} actions)",
-                           name, snapshot->actions.size());
-    }
+                             const std::string& name, uint64_t revision) {
+    const bool ran = g_skcWriteOrder.run(revision, name, [&]() {
+        std::error_code ec;
+        auto directory = directoryPrepared(ec);
+        bool ok = false;
+        if (!ec) {
+            ok = skk::skc::saveToFile(directory / skk::stringToPath(name + ".skc"), *snapshot);
+        }
+        if (!ok) {
+            skkbot2::log::error("[AUTOSAVE] SKC snapshot '{}' failed ({} actions)",
+                                 name, snapshot->actions.size());
+        } else {
+            skkbot2::log::info("[AUTOSAVE] SKC snapshot '{}' ({} actions)",
+                                 name, snapshot->actions.size());
+        }
+        return ok;
+    });
+    if (!ran) skkbot2::log::debug("[AUTOSAVE] SKC stale snapshot skipped: revision={}", revision);
 }
 
 static void skcSnapshot(skk::skc::Bot& bot, bool sync = false) {
     std::size_t count = bot.getInputCount();
-    if (count == 0 || count == g_lastSkcCount) return;
+    if (count == 0 && !sync) return;
 
     const std::string rescueName = skcAutosaveName();
     std::shared_ptr<skk::skc::Macro> snapshot =
@@ -199,9 +210,10 @@ static void skcSnapshot(skk::skc::Bot& bot, bool sync = false) {
     snapshot->wireSeedStamp =
         geode::Mod::get()->getSavedValue<bool>("gui_record_seed", true) ? 1 : -1;
 
+    const auto revision = g_skcWriteOrder.issue();
+
     if (sync) {
-        skcWriteSnapshot(std::move(snapshot), rescueName);
-        g_lastSkcCount = count;
+        skcWriteSnapshot(std::move(snapshot), rescueName, revision);
         return;
     }
 
@@ -209,9 +221,8 @@ static void skcSnapshot(skk::skc::Bot& bot, bool sync = false) {
     if (!g_skcJob.compare_exchange_strong(expected, true)) {
         return;
     }
-    g_lastSkcCount = count;
-    std::thread([snapshot = std::move(snapshot), name = rescueName]() {
-        skcWriteSnapshot(std::move(snapshot), name);
+    std::thread([snapshot = std::move(snapshot), name = rescueName, revision]() {
+        skcWriteSnapshot(std::move(snapshot), name, revision);
         g_skcJob.store(false);
     }).detach();
 }
@@ -230,7 +241,6 @@ void tickRecording() {
         }
     } else {
         g_lastSkc = t;
-        g_lastSkcCount = 0;
     }
 
     if (engine && engine->engineMode == MODE_CAPTURE) {

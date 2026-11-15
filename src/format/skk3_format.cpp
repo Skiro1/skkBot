@@ -8,6 +8,7 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#include <tuple>
 
 #include "codec.hpp"
 
@@ -2542,6 +2543,17 @@ HeaderSelfTestResult selfTestHeader() {
             Input input;
             input.timeSeconds = static_cast<double>(frame) * (1.0 / 240.0);
             input.button = 1;
+            input.pressed = pressed;
+            native.inputs.push_back(input);
+        }
+        for (const auto [button, player2, pressed] : {
+                 std::tuple{1, true, true}, std::tuple{2, false, true},
+                 std::tuple{1, true, false}, std::tuple{1, true, false},
+                 std::tuple{1, false, true}}) {
+            Input input;
+            input.timeSeconds = 13668.0 * (1.0 / 240.0);
+            input.button = static_cast<uint8_t>(button);
+            input.player2 = player2;
             input.pressed = pressed;
             native.inputs.push_back(input);
         }

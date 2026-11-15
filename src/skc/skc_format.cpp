@@ -102,6 +102,30 @@ bool isValidHeader(const Header& header) {
 
 std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subticks) {
     std::vector<Click> clicks;
+    struct OrderedClick { Click click; size_t sourceIndex; };
+    std::vector<OrderedClick> orderedClicks;
+    const auto timestamp = [subticks](const Action& action) {
+        return static_cast<uint64_t>(action.frame) * (subticks ? 2u : 1u) +
+            (subticks && action.halfTick ? 1u : 0u);
+    };
+    std::vector<const Action*> timeline;
+    timeline.reserve(actions.size());
+    for (const auto& action : actions) timeline.push_back(&action);
+    std::stable_sort(timeline.begin(), timeline.end(), [&](auto* a, auto* b) {
+        return timestamp(*a) < timestamp(*b);
+    });
+    std::vector<uint64_t> sharedTimes;
+    for (size_t i = 0; i < timeline.size();) {
+        size_t end = i + 1;
+        bool shared = false;
+        while (end < timeline.size() && timestamp(*timeline[end]) == timestamp(*timeline[i])) {
+            shared |= timeline[end]->button != timeline[i]->button ||
+                timeline[end]->player2 != timeline[i]->player2;
+            ++end;
+        }
+        if (shared) sharedTimes.push_back(timestamp(*timeline[i]));
+        i = end;
+    }
     for (uint32_t channel = 0; channel < 8; ++channel) {
         const uint8_t button = static_cast<uint8_t>((channel >> 1) + 1);
         const bool player2 = (channel & 1u) != 0;
@@ -134,7 +158,9 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
             click.hold = 0;
 
             if (head->pressed) {
-                if (i + 1 < events.size() && !events[i + 1]->pressed) {
+                if (i + 1 < events.size() && !events[i + 1]->pressed &&
+                    !std::binary_search(sharedTimes.begin(), sharedTimes.end(),
+                                        timestamp(*events[i + 1]))) {
                     click.kind = ClickKind::Paired;
                     const Action* release = events[i + 1];
                     const uint64_t releaseAt = static_cast<uint64_t>(release->frame) *
@@ -150,12 +176,17 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
                 click.kind = ClickKind::ReleaseOnly;
                 i += 1;
             }
-            clicks.push_back(click);
+            orderedClicks.push_back({click, static_cast<size_t>(head - actions.data())});
         }
     }
 
-    std::stable_sort(clicks.begin(), clicks.end(),
-        [](const Click& lhs, const Click& rhs) { return lhs.delta < rhs.delta; });
+    std::sort(orderedClicks.begin(), orderedClicks.end(),
+        [](const OrderedClick& lhs, const OrderedClick& rhs) {
+            return lhs.click.delta != rhs.click.delta ? lhs.click.delta < rhs.click.delta
+                                                      : lhs.sourceIndex < rhs.sourceIndex;
+        });
+    clicks.reserve(orderedClicks.size());
+    for (const auto& entry : orderedClicks) clicks.push_back(entry.click);
 
     uint32_t previous = 0;
     for (auto& click : clicks) {
@@ -1098,6 +1129,20 @@ bool saveToFile(const std::filesystem::path& path, const Macro& macro) {
 }
 
 bool selfTest() {
+    {
+        Macro ordered;
+        ordered.wireSeedStamp = -1;
+        ordered.actions = {{1, 1, true, false}, {2, 2, true, false},
+                           {10, 2, false, false}, {10, 1, false, false},
+                           {11, 1, true, true}, {11, 1, true, false},
+                           {12, 2, true, false}, {12, 1, false, false}};
+        const auto bytes = encode(ordered);
+        const auto back = decode(bytes.data(), bytes.size());
+        if (!back || back->actions != ordered.actions) {
+            skkbot2::log::error("[SKC] self-test BUG-139: simultaneous input order changed");
+            return false;
+        }
+    }
     for (const uint32_t secondFrame : {13663u, 13664u}) {
         Macro native;
         native.wireSeedStamp = -1;
