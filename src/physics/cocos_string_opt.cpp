@@ -10,6 +10,14 @@
 
 using namespace geode::prelude;
 
+// RobTop's CCString::initWithFormatAndValist allocates 100 KB on the heap every format call.
+// Under high TPS or frequent string formatting, this fragments heap memory and slows down the CPU.
+// Replacing it with a stack buffer of 1024 bytes avoids all heap allocation.
+//
+// Сайт живёт в реестре version_offsets.hpp (kCocosStringInitWithFormat) и
+// резолвится по МОДУЛЕ COCOS (libcocos2d.dll): RVA fast-path с побайтовой
+// сверкой + сигнатурный фолбэк. Хук не вешается на непроверенный байт —
+// если сайт не резолвится, оптимизация просто отключается (fail-closed).
 
 using InitWithFormat = bool (*)(cocos2d::CCString*, const char*, va_list);
 static InitWithFormat original_init = nullptr;

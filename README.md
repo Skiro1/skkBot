@@ -24,6 +24,9 @@ renderer using bundled FFmpeg — no extra downloads needed.
 - **Single macro format `.skk` (SKK3)**: zstd-22 compression, dense wire encoding
   (varint/zigzag/XOR + RLE), per-frame delta layout, checkpoints, persistence,
   triple-RNG boundaries, stored attempt seed, target display FPS
+- **Ultra-compressed `.skc` format**: inputs-only (~1–2 bytes/action) adaptive
+  range coding with LZ phrase prediction, stores the attempt seed for bit-exact
+  RNG, supports playback from mid-level (Recording & Playback)
 - **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output, the codec
   list shows every video encoder available in the build (NVENC, AMF, QSV, libx264,
   libx265, AV1, VP9/VP8, MPEG-4, ProRes, MJPEG, ...); resolution presets (720p–8K),

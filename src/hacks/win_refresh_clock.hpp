@@ -9,6 +9,11 @@
 
 namespace skkbot2::timing {
 
+// Ported directly from Echo bot (Logic/win_refresh_clock.cpp).
+// The screen ticks at a steady rate (e.g. 240Hz/144Hz/60Hz) & shows 1 frame per tick,
+// but GD's raw dt fluctuates and stutters.
+// This queries DwmGetCompositionTimingInfo to count screen ticks since last frame
+// and uses (ticks * tick length) as the dt instead, bounded by QPC to prevent drift.
 
 inline bool g_windows_said_no = false;
 inline unsigned long long g_ticks_last_frame = 0;
@@ -67,6 +72,10 @@ inline double refresh_frame_time(double gd_time) {
 
     double screen_time = static_cast<double>(ticks_this_frame) * seconds_per_tick;
     if (ticks_this_frame == 0) {
+        // Rendering faster than the monitor: no whole tick landed this frame.
+        // Returning 0 here would freeze level time in that frame and then
+        // release it in a burst later (stutter). Use the QPC delta instead so
+        // the average stays 1.0x.
         screen_time = real;
     }
     if (std::abs(screen_time - gd_time) > seconds_per_tick * 2.0) screen_time = gd_time;
@@ -87,7 +96,7 @@ inline void reset_refresh_clock() {
     g_ticks_last_frame = 0;
 }
 
-}
+} // namespace skkbot2::timing
 #else
 namespace skkbot2::timing {
 inline double refresh_frame_time(double gd_time) { return gd_time; }

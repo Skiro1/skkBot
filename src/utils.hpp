@@ -36,6 +36,9 @@ namespace skk {
         return result.unwrap();
     }
 
+    // UTF-8 мост для путей (AGENTS: path.string() на MSVC запрещён — падение
+    // на не-ASCII путях). Geode v6: string::pathToString удалён, используем
+    // wideToUtf8 (WideCharToMultiByte(CP_UTF8) внутри, исключений не бросает).
     inline std::string pathToUtf8(std::filesystem::path const& path) {
 #ifdef GEODE_IS_WINDOWS
         return geode::utils::string::wideToUtf8(path.wstring());

@@ -27,6 +27,8 @@
 namespace skkbot2 {
 namespace render {
 
+// Function-pointer table, filled at runtime via LoadLibraryW + GetProcAddress.
+// No import-lib needed at build time — only the headers at libs/ffmpeg-headers.
 #ifdef GEODE_IS_WINDOWS
 #define FFMPEG_FN(ident) decltype(ident)* ident
 
@@ -77,6 +79,7 @@ struct ff_t {
 
 #undef FFMPEG_FN
 
+// The 7 runtime DLLs already present in resources/libraries/*.dll.
 static const char* const FFMPEG_DLLS[] = {
     "avutil-61.dll",
     "swresample-7.dll",
@@ -148,6 +151,8 @@ inline void ffLogCallback(void* ptr, int level, const char* fmt, va_list vl) {
     }
 }
 
+// Formats an av error code through the loaded table (only valid after a
+// successful ffLoadFunctions call).
 inline std::string ffErrString(ff_t* table, int code) {
     if (!table || !table->av_strerror) return "av-error " + std::to_string(code);
     char buf[128] = {0};
@@ -155,6 +160,17 @@ inline std::string ffErrString(ff_t* table, int code) {
     return buf;
 }
 
+// Windows resolves the IMPORTS of a DLL through the process search path, not
+// through the directory of the DLL that imports it. avcodec-63.dll therefore
+// cannot find avutil-61.dll just because it was opened by its full path.
+//
+// The previous loader relied on FFMPEG_DLLS being ordered dependencies-first and
+// on "already loaded by name" matching, which works only while every file comes
+// from a single, complete, same-version set. One missing or mismatched DLL and
+// the whole table reported "no FFmpeg DLLs could be loaded" with no hint why.
+// Registering the directory as a user search directory makes the dependencies
+// resolvable regardless of order, and makes a user-supplied DLL set work from
+// any folder.
 inline void ffRegisterDllDir(std::filesystem::path const& dir) {
     static std::vector<std::wstring> registered;
     const std::wstring wide = dir.wstring();
@@ -162,11 +178,17 @@ inline void ffRegisterDllDir(std::filesystem::path const& dir) {
         if (seen == wide) return;
     }
     registered.push_back(wide);
+    // LOAD_LIBRARY_SEARCH_USER_DIRS has to be part of the default set for
+    // LoadLibraryExW's flag of the same name to mean anything.
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
                              LOAD_LIBRARY_SEARCH_USER_DIRS);
     AddDllDirectory(wide.c_str());
 }
 
+// Loads all DLLs from the given directory and fills the function table.
+// Returns false and leaves errorMsg set if any required symbol is missing.
+// `errorMsg` names the directory and the first failing DLL with GetLastError()
+// so a user can tell "the folder is wrong" from "the file is not a DLL".
 inline bool ffLoadFunctions(ff_t* table, std::filesystem::path const& dir,
                             std::string& errorMsg) {
     ffRegisterDllDir(dir);
@@ -182,6 +204,8 @@ inline bool ffLoadFunctions(ff_t* table, std::filesystem::path const& dir,
             }
             continue;
         }
+        // LOAD_LIBRARY_SEARCH_USER_DIRS lets the import table resolve the other
+        // FFmpeg DLLs from the directory registered above.
         HMODULE mod = LoadLibraryExW(
             full.wstring().c_str(), nullptr,
             LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -224,6 +248,8 @@ inline bool ffLoadFunctions(ff_t* table, std::filesystem::path const& dir,
     return true;
 }
 
+// Mirrors avcodec-63 symbol layout in the ff_t struct (no-op correctness
+// guard at compile time; layout must match the FFMPEG_SYMBOLS order above).
 static_assert(sizeof(ff_t) >= sizeof(void*) * 32);
 
 #else  // !GEODE_IS_WINDOWS — the renderer is Windows-only (DLL loading).
@@ -238,5 +264,5 @@ inline bool ffLoadFunctions(ff_t*, std::filesystem::path const&,
 }
 #endif
 
-}
-}
+}  // namespace render
+}  // namespace skkbot2

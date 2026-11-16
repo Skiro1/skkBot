@@ -265,6 +265,11 @@ static void draw_entries(unsigned from, unsigned to) {
     }
 }
 
+// --- skkBot2 diagnostics ---------------------------------------------------
+// We cannot run the game ourselves, so every measurement flows into the log
+// (skkbot2.log). Once per second of batched visiting we report how long the
+// batched visit took and how much work it did, plus the first-time state
+// transitions so it is obvious from the log whether batching engaged at all.
 #include "logger/logger.hpp"
 
 static long long qpc_now() {
@@ -276,10 +281,10 @@ static double qpc_to_ms(long long delta) {
 }
 
 struct BatchStats {
-    long long last_ms = 0;
-    long long total_ns = 0;
+    long long last_ms = 0;          // wall time of last batched visit
+    long long total_ns = 0;         // accumulated batched-visit time units
     unsigned long long batched_frames = 0;
-    unsigned long long batch_visits_ms = 0;
+    unsigned long long batch_visits_ms = 0;   // accumulated ms
     long long last_report_qpc = 0;
     bool reported_enabled = false;
 };
@@ -339,6 +344,8 @@ class $modify(EchoBatchGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::visit();
         g_batched_layer = nullptr;
 
+        // Once per second report no matter whether batching engaged: from the
+        // log we need the reason (children count) even when batch stays false.
         long long now = qpc_now();
         if (g_stats.last_report_qpc == 0)
             g_stats.last_report_qpc = now;

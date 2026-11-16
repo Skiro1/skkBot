@@ -1,4 +1,5 @@
 #include "step_trace.hpp"
+#include "core/seam_journal.hpp"
 
 #include "core/paths.hpp"
 #include "skkBot.hpp"
@@ -25,6 +26,10 @@ constexpr size_t kDriftRingSize = 1u << 12;
 
 enum class Mode : uint8_t { None, Record, Playback };
 
+// Cached "gui_step_trace" flag. Game-thread only (the scheduler hook and the
+// per-step hooks all run there). refreshCache() is called once per drawn
+// frame; the per-substep paths read this bool instead of paying a geode
+// getSavedValue JSON lookup 3414 times a second at high TPS.
 bool g_enabledCache = false;
 
 struct DriftProbe {
@@ -57,6 +62,8 @@ struct DriftChecker {
         bool& reported = isSkc ? skcReported : skkReported;
         auto& ring = isSkc ? skc : skk;
 
+        // A new recording establishes a fresh reference. Switching to playback
+        // preserves it; a new playback merely allows a new first-mismatch report.
         if (next == Mode::Record && mode != Mode::Record) {
             for (auto& slot : ring) slot.valid = false;
             reported = false;
@@ -118,6 +125,8 @@ struct Writer {
     uint32_t rows = 0;
     uint32_t attempts = 1;
     Mode mode = Mode::None;
+    int session = -1;
+    uint64_t generation = 0;
     std::chrono::steady_clock::time_point started{};
 
     static void put16(uint8_t* out, uint16_t value) {
@@ -156,6 +165,12 @@ struct Writer {
         buffered = rows = 0;
     }
 
+    // A new ATTEMPT inside the same session restarts the level at frame 0. That
+    // used to call begin() again, which truncated the file and destroyed the
+    // rows of the attempt that just died - exactly the rows a "why did it die at
+    // frame 367" investigation needs. A frame reset is a bookmark now: flush
+    // what we have, note the row index, and keep appending. The frame column in
+    // each row is what tells the attempts apart (frame drops back to 0).
     void markAttempt(int frame) {
         flushRows();
         ++attempts;
@@ -167,6 +182,9 @@ struct Writer {
 
     void begin(Mode next, bool skc = false) {
         close();
+        file.clear();
+        session = ReplayEngine::get()->sessionCounter;
+        generation = ReplayEngine::get()->macroGeneration;
         mode = next;
         attempts = 1;
         started = std::chrono::steady_clock::now();
@@ -180,11 +198,14 @@ struct Writer {
             return;
         }
 
+        // Fixed 16-byte little-endian file header: magic, version, row size,
+        // then the active TPS as float64. The filename identifies mode.
         std::array<uint8_t, 16> header{};
         header[0] = 'S'; header[1] = 'T'; header[2] = 'R'; header[3] = 'C';
         put16(header.data() + 4, kVersion);
         put16(header.data() + 6, static_cast<uint16_t>(kRowBytes));
         putDouble(header.data() + 8, ReplayEngine::get()->runtimeTickRate());
+        // TPS occupies bytes 8..15; mode is encoded by the filename.
         file.write(reinterpret_cast<const char*>(header.data()), header.size());
         geode::log::info("[TRACE] step trace started: {}",
             skk::pathToUtf8(path));
@@ -232,12 +253,136 @@ Writer& skcWriter() {
     return instance;
 }
 
+struct Journal {
+    std::ofstream file;
+    int session = -1;
+    uint64_t generation = 0;
+    uint32_t rows = 0;
+    bool failed = false;
+    bool dirty = false;
+    bool capped = false;
+
+    void finish() {
+        if (!dirty || failed || !file.is_open()) return;
+        seam_journal::Event end;
+        end.kind = seam_journal::Kind::End;
+        append(end);
+        file.flush();
+        dirty = false;
+    }
+    void begin(bool playback, bool force = false) {
+        auto* engine = ReplayEngine::get();
+        const int next = engine->sessionCounter;
+        if (!force && session == next && generation == engine->macroGeneration) return;
+        finish();
+        if (file.is_open()) file.close();
+        file.clear(); session = next; generation = engine->macroGeneration;
+        rows = 0; failed = dirty = capped = false;
+        const auto path = paths::logFile(playback ? "skk-state-playback.bin" : "skk-state-record.bin");
+        file.open(path, std::ios::binary | std::ios::trunc);
+        std::array<uint8_t, 16> header{ 'S', 'K', 'S', 'J' };
+        Writer::put16(header.data() + 4, 1);
+        Writer::put16(header.data() + 6, seam_journal::kRowBytes);
+        Writer::putDouble(header.data() + 8, engine->runtimeTickRate());
+        file.write(reinterpret_cast<char const*>(header.data()), header.size());
+        if (!file) {
+            failed = true;
+            geode::log::error("[SEAM-JOURNAL] не удалось открыть {}", skk::pathToUtf8(path));
+        } else {
+            geode::log::info("[SEAM-JOURNAL] открыт {} session={} generation={} (flat SKK)",
+                skk::pathToUtf8(path), session, generation);
+        }
+    }
+    void append(seam_journal::Event const& event) {
+        if (failed) return;
+        if (rows >= kMaxRows && event.kind != seam_journal::Kind::End) {
+            if (capped) return;
+            capped = true;
+            seam_journal::Event gap;
+            gap.kind = seam_journal::Kind::Gap;
+            // Единственный Gap сверх лимита. Файл без него дал бы ложный PASS.
+            const auto bytes = seam_journal::encode(gap);
+            file.write(reinterpret_cast<char const*>(bytes.data()), bytes.size());
+            dirty = true;
+            geode::log::warn("[SEAM-JOURNAL] достигнут лимит; сверка неполна");
+        } else {
+            const auto bytes = seam_journal::encode(event);
+            file.write(reinterpret_cast<char const*>(bytes.data()), bytes.size());
+            ++rows;
+            dirty = true;
+        }
+        if (event.kind != seam_journal::Kind::Sample || rows % kFlushRows == 0) file.flush();
+        if (!file) {
+            failed = true;
+            geode::log::error("[SEAM-JOURNAL] ошибка записи; сверка неполна");
+        }
+    }
+};
+
+Journal& journal(bool playback) {
+    static Journal record, play;
+    return playback ? play : record;
 }
 
-void record(GJBaseGameLayer* layer, int frame, unsigned batch) {
+seam_journal::Player journalPlayer(PlayerObject* player) {
+    seam_journal::Player p;
+    if (!player) return p;
+    p.x = player->getPositionX(); p.y = player->getPositionY();
+    p.rotation = player->getRotation();
+    p.vy = player->m_yVelocity; p.vyb = player->m_yVelocityBeforeSlope;
+    for (int button = 1; button <= 3; ++button) {
+        auto it = player->m_holdingButtons.find(button);
+        if (it != player->m_holdingButtons.end() && it->second) p.held |= 1u << (button - 1);
+    }
+    p.visual = visualFlagsOf(player);
+    if (player->m_dashRing) p.ring = static_cast<GameObject*>(player->m_dashRing)->m_objectID;
+    p.flags = (player->m_isDead ? 1u : 0u) | (player->m_isOnGround ? 2u : 0u)
+        | (player->m_jumpBuffered ? 4u : 0u) | (player->m_wasJumpBuffered ? 8u : 0u);
+    return p;
+}
+
+void journalEvent(seam_journal::Kind kind, GJBaseGameLayer* layer, int frame, bool playback = false) {
+    auto* engine = ReplayEngine::get();
+    if (!g_enabledCache || !engine->skMode || !engine->activeSk ||
+        engine->canUsePersistenceCapture() || engine->isPersistencePlaybackActive()) return;
+    if (kind == seam_journal::Kind::Sample && !playback) {
+        // STRC сохраняет и corpse-строки; в финальном SKK их нет. Не выдаём
+        // пропущенный capture или дополнительный substep за записанный state.
+        const auto* macro = engine->captureStaging ? engine->captureStaging : engine->activeSk;
+        if (engine->captureDeathPending || engine->levelRestarting || !layer ||
+            !layer->m_player1 || layer->m_player1->m_isDead ||
+            (layer->m_player2 && layer->m_player2->m_isDead) ||
+            macro->perFrames.empty() || macro->perFrames.back().tick != frame) return;
+    }
+    auto& out = journal(playback);
+    out.begin(playback);
+    seam_journal::Event event;
+    event.kind = kind; event.tick = frame;
+    const auto& trace = writer();
+    if (trace.mode == (playback ? Mode::Playback : Mode::Record) &&
+        trace.session == engine->sessionCounter && trace.generation == engine->macroGeneration) {
+        event.traceRow = trace.rows ? trace.rows - (kind == seam_journal::Kind::Sample ? 1 : 0) : 0;
+    } else {
+        event.traceRow = UINT32_MAX; // Trim/Wipe может прийти до первого STRC sample.
+    }
+    if (layer) {
+        event.time = layer->m_gameState.m_levelTime;
+        event.active = (layer->m_player1 ? 1u : 0u)
+            | (layer->m_player2 && layer->m_player2->getParent() ? 2u : 0u);
+        event.p1 = journalPlayer(layer->m_player1);
+        if (event.active & 2u) event.p2 = journalPlayer(layer->m_player2);
+    }
+    out.append(event);
+}
+
+} // namespace
+
+void record(GJBaseGameLayer* layer, int frame, unsigned batch, bool captureStep) {
     auto& out = writer();
     if (!g_enabledCache || !layer) {
         if (out.mode != Mode::None) out.close();
+        journal(false).finish();
+        journal(true).finish();
         return;
     }
     auto* engine = ReplayEngine::get();
@@ -246,15 +391,37 @@ void record(GJBaseGameLayer* layer, int frame, unsigned batch) {
     else if (engine->engineMode == MODE_EXECUTE) mode = Mode::Playback;
     if (mode == Mode::None) {
         if (out.mode != Mode::None) out.close();
+        journal(false).finish();
+        journal(true).finish();
         return;
     }
-    if (out.mode != mode) {
+    if (out.mode != mode || out.session != engine->sessionCounter || out.generation != engine->macroGeneration) {
+        journal(false).finish();
+        journal(true).finish();
         out.begin(mode);
+        if (engine->skMode && !engine->canUsePersistenceCapture() && !engine->isPersistencePlaybackActive())
+            journal(mode == Mode::Playback).begin(mode == Mode::Playback, mode == Mode::Playback);
     } else if (frame <= 1 && out.rows > 2) {
         out.markAttempt(frame);
     }
+    const auto before = out.rows;
     out.append(layer, frame, batch);
+    // batch бывает 0 и при настоящей записи. Фаза capture передана отдельно;
+    // journalEvent проверяет наличие per-frame в activeSk/captureStaging.
+    // Дополнительный substep того же tick не переписывает эталон live-состоянием.
+    if (out.rows != before && (mode == Mode::Playback || captureStep))
+        journalEvent(seam_journal::Kind::Sample, layer, frame, mode == Mode::Playback);
+    if (out.rows != before && out.rows == kMaxRows && engine->skMode &&
+        !engine->canUsePersistenceCapture() && !engine->isPersistencePlaybackActive()) {
+        seam_journal::Event gap;
+        gap.kind = seam_journal::Kind::Gap;
+        journal(mode == Mode::Playback).append(gap);
+    }
 }
+
+void seal(GJBaseGameLayer* layer, int frame) { journalEvent(seam_journal::Kind::Seal, layer, frame); }
+void trim(int frame) { journalEvent(seam_journal::Kind::Trim, nullptr, frame); }
+void wipe() { journalEvent(seam_journal::Kind::Wipe, nullptr, 0); }
 
 void recordSkc(GJBaseGameLayer* layer, int frame, unsigned batch,
                bool recording, bool playback) {
@@ -282,6 +449,8 @@ void checkDrift(GJBaseGameLayer* layer, int frame, bool recording,
 }
 
 void finish() {
+    journal(false).finish();
+    journal(true).finish();
     writer().close();
     skcWriter().close();
 }
@@ -291,7 +460,25 @@ bool enabled() {
 }
 
 void refreshCache() {
-    g_enabledCache = geode::Mod::get()->getSavedValue<bool>("gui_step_trace", false);
+    const bool next = geode::Mod::get()->getSavedValue<bool>("gui_step_trace", false);
+    if (g_enabledCache && !next) {
+        for (bool playback : {false, true}) {
+            auto& out = journal(playback);
+            if (!out.dirty) continue;
+            seam_journal::Event gap;
+            gap.kind = seam_journal::Kind::Gap;
+            out.append(gap);
+        }
+        finish();
+    }
+    g_enabledCache = next;
+    // Stop может происходить на паузе: processCommands тогда не вызывается,
+    // но кадры GUI идут. Закрываем диагностику, не возобновляя игру.
+    if (ReplayEngine::get()->engineMode == MODE_DISABLED) {
+        journal(false).finish();
+        journal(true).finish();
+        writer().close();
+    }
 }
 
-}
+} // namespace skkbot2::step_trace

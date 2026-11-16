@@ -1,4 +1,17 @@
-﻿
+﻿// BUG-120 (B) memory tracker: our own operator new/delete intercept.
+//
+// Goal: catch the DOUBLE-FREE of PointNode-sized (0x40) blocks that page-heap
+// proved (live 01:33: C0000005 write inside PointNode deleting-dtor on a
+// freed block, vtable[0] pointing into our module). Our operator delete sees
+// every delete issued through our TU (GeodeBindings unity dtors), so a
+// repeated free of the same pointer can be attributed to two allocation sites.
+//
+// Design (cheap):
+//  - allocations through our new record the caller return-address (site id);
+//  - frees probe a small open-addressing map (ptr -> site | ALIVE bit, tick);
+//    a SECOND free of the same ptr logs [MEMTRACK] DOUBLE FREE with both site
+//    ids and flushes the log.
+//  - capacity overflow / untracked frees are logged briefly, never fatal.
 
 #include "memtrack.hpp"
 
@@ -19,14 +32,20 @@ namespace skkbot2::memtrack {
 
 namespace {
 
-constexpr size_t kMapSlots = 1u << 17;
+constexpr size_t kMapSlots = 1u << 17; // pow2
 
 struct Entry {
-    std::atomic<uint64_t> ptr;
-    std::atomic<uint64_t> site;
+    std::atomic<uint64_t> ptr;   // key or 0
+    std::atomic<uint64_t> site;  // bit0 = ALIVE (1 = allocated, 0 = freed)
     std::atomic<uint64_t> tick;
-    std::atomic<uint64_t> freeEpoch;
-    void* bt[6];
+    // First-free forensics (BUG-120 B): PointNode blocks are usually
+    // allocated by libcocos (never enters this map via our new), so the
+    // ALIVE bit can never be set by us. Instead the FIRST free records its
+    // own backtrace + epoch; a SECOND free of the same pointer is reported
+    // with BOTH sides' backtraces. Entry keeps ptr on first free; the
+    // replace happens only when the slot is reused for another key.
+    std::atomic<uint64_t> freeEpoch; // global free-order counter at free time
+    void* bt[6];                     // RtlCaptureStackBackTrace frames 1..6
 };
 
 struct State {
@@ -34,7 +53,7 @@ struct State {
     std::atomic<uint64_t> frees;
     std::atomic<uint64_t> doubleFrees;
     std::atomic<uint64_t> misses;
-    std::atomic<uint64_t> epoch;
+    std::atomic<uint64_t> epoch; // total alloc+free counter for recency
     Entry slots[kMapSlots];
 };
 
@@ -82,7 +101,7 @@ Entry* probeFind(uint64_t p) {
     return nullptr;
 }
 
-}
+} // namespace
 
 bool g_tracking = false;
 bool g_trackingInit = false;
@@ -127,6 +146,11 @@ void initModules() {
     }
 }
 
+// BUG-131 (12.11): перехват new/delete сам стал подозреваемым в порче кучи
+// (fail-fast 0xc0000409 при Play; double-free флад при каждой загрузке).
+// Гейт: трекинг включается только при memtrack_enabled=true в сохранении.
+// По умолчанию ВЫКЛ - operator new/delete становятся честным passthrough
+// (malloc/free без трекинга), поведение аллокатора идентично.
 bool trackingEnabled();
 
 void noteAlloc(void* p, void* site) {
@@ -154,6 +178,9 @@ void noteFree(void* p, void* site) {
     g_state.frees.fetch_add(1, std::memory_order_relaxed);
     Entry* e = probeFind((uint64_t)p);
     if (!e) {
+        // Foreign-allocated block (libcocos allocates the PointNodes; our new
+        // never sees them). Record the FIRST free with its backtrace in the
+        // same map so a SECOND free can be matched against it.
         void* bt[6];
         captureBt(bt);
         e = probeReserve((uint64_t)p);
@@ -162,7 +189,7 @@ void noteFree(void* p, void* site) {
             const auto now = std::chrono::steady_clock::
                 now().time_since_epoch().count();
             int64_t last = s_lastUntracked.load(std::memory_order_relaxed);
-            if (now - last > 2000000000LL ) {
+            if (now - last > 2000000000LL /*2s*/) {
                 s_lastUntracked.store(now, std::memory_order_relaxed);
                 skkbot2::log::error(
                     "[MEMTRACK] free-untracked (throttled) ptr={:#x} {}",
@@ -186,13 +213,19 @@ void noteFree(void* p, void* site) {
         captureBt(bt);
         if (e->site.compare_exchange_strong(
                 expect, siteBits(site, false), std::memory_order_acq_rel)) {
+            // First free OK: KEEP the key with the free forensics. Foreign
+            // allocator reuse is filtered by the epoch-recency check below.
             e->freeEpoch.store(epoch, std::memory_order_release);
             for (int i = 0; i < 6; ++i) e->bt[i] = bt[i];
             return;
         }
+        // lost race: another thread freed first; fall through as second free
     }
+    // SECOND free of the same pointer: report only when recent (a much later
+    // free of a reused address is not a double free).
     const uint64_t firstEpoch = e->freeEpoch.load(std::memory_order_acquire);
     if (firstEpoch != 0 && epoch - firstEpoch > 4096) {
+        // Address was reused long ago; refresh this entry as the new free.
         void* bt[6];
         captureBt(bt);
         e->freeEpoch.store(epoch, std::memory_order_release);
@@ -200,6 +233,8 @@ void noteFree(void* p, void* site) {
         return;
     }
     if (firstEpoch == 0) {
+        // Entry still shows alive=0 without a recorded free (fresh slot or
+        // foreign reuse); record as first.
         void* bt[6];
         captureBt(bt);
         e->freeEpoch.store(epoch, std::memory_order_release);
@@ -221,7 +256,7 @@ void noteFree(void* p, void* site) {
         describeSite(bt2[1]), describeSite(bt2[2]), describeSite(bt2[3]),
         describeSite(bt2[4]), describeSite(bt2[5]));
     skkbot2::Logger::get().flush();
-    e->ptr.store(0, std::memory_order_release);
+    e->ptr.store(0, std::memory_order_release); // no repeat spam
 }
 
 void report() {
@@ -248,4 +283,4 @@ std::string describeSite(void* site) {
     return buf;
 }
 
-}
+} // namespace skkbot2::memtrack

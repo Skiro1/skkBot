@@ -15,8 +15,12 @@ namespace {
 
 constexpr uint8_t kMagic[4] = {'T', 'T', 'R', 'L'};
 
+// Predicted from the hook order, not fitted - see the header.
 static constexpr int64_t kFrameShift = 0;
 
+// ToastyReplay's checksum (TtrlCodec.cpp:89-99): reflected CRC-32, poly
+// 0xedb88320, init 0xffffffff, final complement. Identical to zlib's crc32,
+// which is what confirmed it against the real file.
 uint32_t crc32(std::span<const uint8_t> bytes) {
     uint32_t value = 0xffffffffu;
     for (uint8_t byte : bytes) {
@@ -48,7 +52,7 @@ public:
             if (shift == 63 && (byte & 0xfe) != 0) return false;
             value |= static_cast<uint64_t>(byte & 0x7f) << shift;
             if ((byte & 0x80) == 0) {
-                if (shift != 0 && byte == 0) return false;
+                if (shift != 0 && byte == 0) return false;  // non-canonical
                 out = value;
                 return true;
             }
@@ -86,7 +90,7 @@ private:
     size_t m_pos = 0;
 };
 
-}
+}  // namespace
 
 bool skk::ttrl::looksLikeTtrl(std::span<const uint8_t> data) {
     return data.size() >= kMagicSize &&
@@ -103,6 +107,9 @@ bool skk::ttrl::parse(std::span<const uint8_t> data, skk::ttrl::Replay& out,
     if (!looksLikeTtrl(data)) return fail("ttrl: not a TTRL file (magic \"TTRL\")");
     if (data.size() < 25) return fail("ttrl: file is too small to hold a header");
 
+    // Verify the checksum over the whole payload before parsing anything. Every
+    // field after the magic is a varint, so a single misread shifts the rest of
+    // the file silently - this is the check that catches that.
     const size_t payloadSize = data.size() - kChecksumSize;
     uint32_t stored = 0;
     std::memcpy(&stored, data.data() + payloadSize, 4);
@@ -141,6 +148,10 @@ bool skk::ttrl::parse(std::span<const uint8_t> data, skk::ttrl::Replay& out,
         return fail("ttrl: unusable tps " + std::to_string(numerator) + "/" +
                     std::to_string(denominator));
     }
+    // The writer refuses to emit an unreduced fraction, so a non-reduced one
+    // means we are misreading the field rather than meeting a valid file.
+    // Note the check has to be a gcd, not "is either divisible by the other":
+    // 240/1 is perfectly reduced, yet 240 % 1 == 0 is always true.
     if (std::gcd(numerator, denominator) != 1) {
         return fail("ttrl: tps " + std::to_string(numerator) + "/" +
                     std::to_string(denominator) + " is not in lowest terms");
@@ -236,6 +247,9 @@ bool skk::ttrl::parse(std::span<const uint8_t> data, skk::ttrl::Replay& out,
                         " bytes does not fit in the remaining " +
                         std::to_string(reader.remaining()));
         }
+        // Skipped, not parsed - see the header. ToastyReplay replays these on
+        // top of its inputs, so keeping them would make the import prove
+        // nothing about the clicks.
         out.frameFixBytes = frameFixSize;
         if (!reader.skip(static_cast<size_t>(frameFixSize))) {
             return fail("ttrl: truncated inside the frameFix block");
@@ -294,6 +308,8 @@ bool skk::ttrl::toSkcMacro(const skk::ttrl::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

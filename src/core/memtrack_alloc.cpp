@@ -1,3 +1,9 @@
+// Module-local operator new/delete routed through memtrack. Only OUR code's
+// allocations are tracked; the game's allocations are untouched.
+//
+// IMPORTANT: every internally-defined operator must call noteFree/rawFree
+// DIRECTLY - calling ::operator delete from inside our own operator delete
+// recurses infinitely (live failure 01:50).
 #include "memtrack.hpp"
 #include "memtrack_alloc.hpp"
 
@@ -42,4 +48,4 @@ void operator delete[](void* p, std::size_t) noexcept {
     skkbot2::memtrack_alloc::rawFree(p);
 }
 
-}
+} // extern "C++"

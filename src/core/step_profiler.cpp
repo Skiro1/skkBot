@@ -25,20 +25,32 @@ namespace {
 
 std::atomic<unsigned long> g_mainTid{0};
 std::atomic<bool> g_running{false};
+// Старт запрашивается на arm сессии - ДО первого запуска планировщика, когда
+// tid главного потока ещё не захвачен (сессия 23:56: [PROF] not started).
+// Отложенный старт: первый profilerNoteMainThread() из горячего пути
+// подхватывает запрос и запускает сэмплер.
 std::atomic<bool> g_pending{false};
 std::string g_label;
+// Бакеты живут только в потоке сэмплера; stop читает их после join.
+// Ключ = (индекс модуля << 48) | RVA - атрибуция по модулям обязательна:
+// сессия 01:17 (tps=240) показала, что в GeometryDash.exe попадают единицы
+// сэмплов из тысяч - остальное время главный поток проводит В ДРУГИХ
+// модулях (наш DLL, ntdll-ожидания), и без атрибуции мы слепы.
 std::map<unsigned long long, unsigned long long> g_buckets;
 std::thread g_thread;
 std::string g_pendingLabel;
 double g_startWall = 0.0;
 unsigned long long g_samples = 0;
-unsigned long long g_misses = 0;
+unsigned long long g_misses = 0;  // suspend/open неудачи
 
 double nowSec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Список модулей процесса: обновляется раз в ~1s (загрузка DLL может
+// случиться в любой момент сессии). Отсортирован по базе для бинарного
+// поиска диапазона [base, base+size).
 struct ModuleInfo {
     unsigned long long base = 0;
     unsigned long long size = 0;
@@ -75,6 +87,8 @@ void refreshModules() {
               });
 }
 
+// Возвращает индекс модуля, содержащего адрес, или -1 (системные
+// низкоадресные / heap / unknown - попадут в бакет "OTHER").
 int findModule(unsigned long long addr) {
     size_t lo = 0, hi = g_modules.size();
     while (lo < hi) {
@@ -103,6 +117,9 @@ void samplerLoop(unsigned long tid) {
         return;
     }
 
+    // Sleep(1) без timeBeginPeriod ~ 15ms - слишком грубо. С периодом 1ms
+    // сэмплер даёт ~500-1000 точек/с (фактически ~1.9ms: сессия 01:17 дала
+    // 2971 точку за 5.6s) - для топа достаточно.
     timeBeginPeriod(1);
     CONTEXT ctx{};
     while (g_running.load(std::memory_order_relaxed)) {
@@ -125,6 +142,7 @@ void samplerLoop(unsigned long tid) {
         ++g_samples;
         const unsigned long long rip = ctx.Rip;
         const int modIdx = findModule(rip);
+        // Ключ: (модуль+1) << 48 | RVA; -1 -> OTHER (heap/syscall-заглушки).
         const unsigned long long key =
             (static_cast<unsigned long long>(modIdx + 1) << 48) |
             (modIdx >= 0 ? rip - g_modules[modIdx].base : 0);
@@ -139,8 +157,10 @@ struct TopEntry {
     unsigned long long count = 0;
 };
 
-}
+}  // namespace
 
+// Определение ниже, в этом же namespace; нужен ранний прототип для
+// profilerNoteMainThread (определён раньше по файлу).
 void profilerStartNow(const char* label);
 
 bool stepProfilerOptIn() {
@@ -151,6 +171,7 @@ void profilerNoteMainThread() {
     unsigned long expected = 0;
     const unsigned long tid = GetCurrentThreadId();
     const bool captured = g_mainTid.compare_exchange_strong(expected, tid);
+    // Отложенный старт: запрос пришёл с arm'а до первого хода планировщика.
     if ((captured || expected == tid) && g_pending.load(std::memory_order_relaxed)) {
         if (g_pending.exchange(false, std::memory_order_relaxed)) {
             profilerStart(g_pendingLabel.c_str());
@@ -160,6 +181,8 @@ void profilerNoteMainThread() {
 
 void profilerStart(const char* label) {
     if (!stepProfilerOptIn()) return;
+    // Arm сессии может случиться до первого хода планировщика (tid ещё не
+    // захвачен) - тогда запрос откладывается до profilerNoteMainThread().
     const unsigned long tid = g_mainTid.load(std::memory_order_relaxed);
     if (tid == 0) {
         g_pendingLabel = label;
@@ -199,6 +222,8 @@ void profilerStartNow(const char* label) {
 void profilerStopAndReport() {
     bool expected = true;
     if (!g_running.compare_exchange_strong(expected, false)) {
+        // Отложенный запрос, который так и не подхватился (сессия кончилась
+        // до первого хода планировщика) - гасим, чтобы не стартовал попозже.
         g_pending.store(false, std::memory_order_relaxed);
         return;
     }
@@ -211,6 +236,7 @@ void profilerStopAndReport() {
         g_label, dur, g_samples, g_misses, g_buckets.size());
     if (g_samples == 0) return;
 
+    // Имена модулей в узкие строки (ASCII по факту).
     auto moduleName = [&](int idx) -> std::string {
         if (idx < 0 || idx >= static_cast<int>(g_modules.size()))
             return "OTHER";
@@ -221,6 +247,7 @@ void profilerStopAndReport() {
         return s;
     };
 
+    // Сумма по модулям - главный вопрос "куда уходит время".
     {
         std::map<int, unsigned long long> perMod;
         for (const auto& [key, count] : g_buckets) {
@@ -274,4 +301,4 @@ void profilerStopAndReport() {
         "OTHER = heap/syscall stubs (ntdll waits etc.)");
 }
 
-}
+}  // namespace skkbot2::debug

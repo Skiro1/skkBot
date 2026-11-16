@@ -25,22 +25,44 @@ namespace {
     bool g_installAttempted = false;
     bool g_available = false;
 
+    // Game-thread-only shared state (the hooks fire inside the engine update
+    // call wrapped by StepGridEnforcement on that same thread).
     int g_forcedSteps = 0;
     double g_forcedTimestep = 0.0;
 
+    // 0x340B18: "mov [rsp+0x50], r13d" - stores the physics step-loop's initial
+    // counter; the loop runs the counter up to (excluding) 2, so seeding it
+    // with 2-N yields exactly N iterations (negative starts included).
+    // В 2.2091 счётчик переехал с edx на r13d (было 0x237DCE: mov [rbp+0xA0], edx).
 void physStepCountMidhook(safetyhook::Context& ctx) {
+      // Counts the forced physics steps. This is the number that has to be
+      // compared against another renderer, because the two do not step physics
+      // the same way: this hook pins the step loop to exactly g_forcedSteps
+      // iterations of g_forcedTimestep, so one CCScheduler::update advances the
+      // level by g_forcedSteps * g_forcedTimestep - 1/240s at steps=1, NOT by
+      // the dt=1/60 that was handed to the scheduler.
+      //
+      // A render that needs 1/60s per video frame therefore has to call the
+      // scheduler several times, and the loop around it re-runs the per-step
+      // bookkeeping each time. Whether that is where the extra wall time goes
+      // is exactly the open question, so it gets measured rather than argued.
       ++skkbot2::hot::stats().calls[static_cast<size_t>(skkbot2::hot::PhysStep)];
       if (g_forcedSteps > 0) {
           ctx.r13 = 2 - g_forcedSteps;
       }
   }
 
+    // 0x341BC7: post-loop bookkeeping reads xmm9 as the time actually consumed
+    // by the step loop; report exactly N * timestep so the engine's internal
+    // accumulators agree with the enforced grid.
     void restorePhysDtMidhook(safetyhook::Context& ctx) {
         if (g_forcedSteps > 0) {
             ctx.xmm9.f64[0] = g_forcedTimestep * static_cast<double>(g_forcedSteps);
         }
     }
 
+    // Сканирование сигнатур и резолв сайтов живут в реестре
+    // src/version_offsets.hpp (parsePattern/matchesAt/resolve).
 
     size_t getModuleSize(uint8_t* base) {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);

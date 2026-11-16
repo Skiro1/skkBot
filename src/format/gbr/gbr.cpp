@@ -21,6 +21,15 @@ constexpr size_t kMaxStream = 64ull * 1024 * 1024;
 constexpr size_t kMaxActions = 8'000'000;
 constexpr size_t kMaxSubticks = 2'000'000;
 
+// Every imported frame is shifted by this much. One constant, one character.
+//
+// -1 is being TRIED, not derived. The evidence points the other way: this
+// macro's first click sits at 141, exactly where our own working recording of
+// the same level starts, and a -1 shift would move it to 140 and break the one
+// thing that currently matches. So there is a falsifiable prediction attached:
+// if the opening is what matters, the run dies EARLIER than frame 4887. If it
+// dies later, the shift is doing something real despite the start disagreeing.
+// If it dies at 4887 again, the shift changed nothing.
 static constexpr int64_t kFrameShift = -1;
 
 class Reader {
@@ -60,6 +69,9 @@ public:
         std::memcpy(&d, &b, 8);
         return d;
     }
+    // GBR6 strings are uint16-length prefixed, NOT uint32. GBR6_HEADER_BASE is
+    // 36 and the fixed fields before the name are 4+1+1+4+8+8+4+4 = 34: the
+    // constant is what says the prefix is two bytes.
     std::string str() {
         const uint16_t len =
             static_cast<uint16_t>(u8() | (static_cast<uint16_t>(u8()) << 8));
@@ -95,6 +107,12 @@ private:
     bool m_ok = true;
 };
 
+// A stream is (b0, b1) records. Three shapes, told apart by the top bit:
+//   b0 & 0x80  regular input; b0 = 0x80|(p2<<4)|((button&7)<<1)|pressed,
+//              b1 = frame delta, 0xFF meaning "+255 and keep going"
+//   b0 == 0x00  autoclicker: b1 = (hold<<4)|release, then u16 cycles; the
+//              pattern is expanded into press/release pairs here
+//   otherwise   tap: b0 is the hold duration, b1 the gap to the next press
 bool decodeStream(std::span<const uint8_t> data, bool streamIsP2,
                   std::vector<skk::gbr::Action>& out, std::string& outReason) {
     if (data.size() < 2) return true;
@@ -134,7 +152,7 @@ bool decodeStream(std::span<const uint8_t> data, bool streamIsP2,
 
         if (b1 == 0xFF) {
             pending += 255;
-            if (b0 == 0x80) continue;
+            if (b0 == 0x80) continue;  // bare delta run
             if ((b0 & 0x80) == 0) {
                 const uint8_t holdDur = b0 & 0x7F;
                 frame += pending;
@@ -170,7 +188,7 @@ bool decodeStream(std::span<const uint8_t> data, bool streamIsP2,
     return true;
 }
 
-}
+}  // namespace
 
 bool skk::gbr::looksLikeGbr(std::span<const uint8_t> data) {
     return data.size() >= 4 && std::memcmp(data.data(), kMagic, 4) == 0;
@@ -233,6 +251,8 @@ bool skk::gbr::parse(std::span<const uint8_t> data, skk::gbr::Replay& out,
         if (!r.ok()) return fail("gbr: truncated death list");
     }
     if (out.flags & kHasSubtick) {
+        // The deaths block is always written alongside, so a reader can find
+        // where this one starts without guessing.
         if (!(out.flags & kHasDeaths)) r.u32();
         const uint32_t n = r.u32();
         if (n > kMaxSubticks) return fail("gbr: implausible subtick count");
@@ -277,6 +297,11 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
     if (!std::isfinite(replay.tps) || replay.tps <= 1.0f) {
         return fail("gbr: unusable tps " + std::to_string(replay.tps));
     }
+    // Platformer macros are importable now: SKC carries the mode flag and the
+    // buttons (2/3) were already in the action stream. What SKC cannot carry is
+    // a death chain: a macro carrying deaths cannot be played, and silently
+    // dropping them would produce one that dies where the original did not -
+    // with nothing in the log pointing at the cause.
     if (!replay.deaths.empty()) {
         return fail("gbr: replay has " + std::to_string(replay.deaths.size()) +
                     " death(s), first at frame " +
@@ -310,6 +335,8 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
+    // up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;
@@ -322,6 +349,9 @@ bool skk::gbr::toSkcMacro(const skk::gbr::Replay& replay, skc::Macro& out,
         return fail("gbr: " + reason);
     }
 
+    // Sub-ticks are precision SKC cannot hold. Saying so is the difference
+    // between a user who knows their macro is slightly weaker and one who
+    // wonders why it desyncs.
     if (!replay.subticks.empty()) {
         skkbot2::log::warn(
             "[GBR] '{}': dropped {} sub-tick offset(s) (SCBF precision) - SKC "

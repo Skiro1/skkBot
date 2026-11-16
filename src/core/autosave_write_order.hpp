@@ -10,6 +10,8 @@
 
 namespace skkbot2::autosave {
 
+// BUG-140: упорядочиваем запись и защищаем общий временный файл.
+// Старый worker после успешного финального снимка уже ничего не пишет.
 class SnapshotWriteOrder {
 public:
     uint64_t issue() { return ++m_issued; }
@@ -17,6 +19,8 @@ public:
     template <class Write>
     bool run(uint64_t revision, std::string_view destination, Write&& write) {
         std::lock_guard lock(m_mutex);
+        // Разные уровни пишут разные файлы: свежий снимок B не отменяет
+        // единственный ещё не записанный снимок A.
         auto& committed = m_committed[std::string(destination)];
         if (revision <= committed) return false;
         if (std::forward<Write>(write)()) committed = revision;
@@ -29,4 +33,4 @@ private:
     std::unordered_map<std::string, uint64_t> m_committed;
 };
 
-}
+} // namespace skkbot2::autosave

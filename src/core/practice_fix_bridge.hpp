@@ -5,6 +5,7 @@
 #include <vector>
 
 namespace skk::bridge {
+void resolveBrokenObjects(CheckpointStateBundle& bundle, GJBaseGameLayer* layer);
 
 SkPracticeFixCheckpoint bundleToWire(
     CheckpointStateBundle const& bundle,

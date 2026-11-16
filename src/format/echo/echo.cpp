@@ -14,13 +14,19 @@
 namespace {
 
 constexpr size_t kModelSize = 0x486D28;
-constexpr size_t kHashSlots = 1u << 18;
+constexpr size_t kHashSlots = 1u << 18;  // 2^18 u32, 1 MiB - sub_1800F6170:451-461
 constexpr size_t kBaseSize = 4096;
 
+// The decoder is allowed to read past the payload: the writer trims trailing
+// zero bytes and the reference only raises its error once the position passes
+// size + 64 (sub_1800F3530:68).
 constexpr size_t kGrace = 64;
 
 constexpr uint32_t kCounterInit = 0x80000000u;
 
+// dword_180661510, the 33 meaningful entries before the surrounding data stops
+// being the table. Monotonic, saturating at 4094; index 33 onwards is unrelated.
+// Truncating this to the first 24 is what capped a macro at 22 correct records.
 constexpr std::array<int32_t, 33> kFibo = {
     1,    2,    3,    6,    10,   16,   27,   45,   73,   120,  194,
     310,  488,  747,  1101, 1546, 2047, 2549, 2994, 3348, 3607, 3785,
@@ -32,6 +38,8 @@ struct InitRegion {
     size_t start, end, stride, slots;
 };
 
+// From the model constructor, sub_1800F6170. Every eight-byte slot is
+// {u32 counter, u16 move counter}.
 constexpr std::array<InitRegion, 7> kRegions = {{
     {0, 1920, 48, 6},
     {1920, 7680, 80, 10},
@@ -42,6 +50,7 @@ constexpr std::array<InitRegion, 7> kRegions = {{
     {48464, 101200, 32, 4},
 }};
 
+// The two 13184-stride arrays the delta coder walks, 101200 through 4320080.
 constexpr size_t kStrideFrom = 101200;
 constexpr size_t kStrideTo = 4320080;
 constexpr size_t kStrideBlock = 13184;
@@ -52,6 +61,7 @@ constexpr std::array<std::pair<size_t, size_t>, 3> kWeightVectors = {{
     {4320080, 12},
 }};
 
+// sub_1800F74A0:127 - piecewise interpolation over the 128-wide breakpoints.
 int32_t curve(int32_t v) {
     const int32_t seg = v >> 7;
     const int32_t frac = v & 0x7F;
@@ -71,6 +81,7 @@ std::array<int16_t, kBaseSize> buildBase() {
         }
         cursor = top;
     }
+    // sub_1800F7EC0:85-86 patches the end of the ramp to the final index.
     if (cursor < kBaseSize) base[kBaseSize - 1] = 2047;
     return base;
 }
@@ -127,6 +138,7 @@ public:
         for (size_t lane = 0; lane < 4; ++lane) writeI32(off + lane * 4, w[lane]);
     }
 
+    // sub_1800F74A0:120
     int32_t raw(const std::array<int16_t, 3>& b, const std::array<int32_t, 4>& w) const {
         const int64_t sum = static_cast<int64_t>(b[0]) * w[0] +
                             static_cast<int64_t>(b[1]) * w[1] +
@@ -153,6 +165,8 @@ private:
     std::vector<uint8_t> m_buf;
 };
 
+// sub_1800F74A0:121-136. Note the floor is 1, not 2: the decompilation is
+// `v18 = 1; if (v17 >= 2) v18 = v17;`, a clamp to [1, 4095].
 int32_t probability(int32_t raw) {
     if (raw > 2047) return 4095;
     if (raw <= -2047) return 1;
@@ -182,6 +196,8 @@ public:
             m_range = bound;
             outBit = 0;
         }
+        // sub_1800F3530:54-75 - the repeat test is on the range BEFORE the
+        // shift, and it REPEATS while that is still below 0x10000.
         while (m_range <= 0xFFFFFF) {
             const uint32_t before = m_range;
             m_range <<= 8;
@@ -197,6 +213,7 @@ public:
         return !m_failed;
     }
 
+    // The gamma and integer paths split the range exactly in half, quantised.
     bool bit(uint32_t& out) { return decodeBit((m_range >> 1) & 0x7FFF8000u, out); }
 
     bool bits(int count, uint32_t& out) {
@@ -211,6 +228,7 @@ public:
 
     [[nodiscard]] bool failed() const { return m_failed; }
 
+    // The current window, needed by both model updates to scale their bound.
     [[nodiscard]] uint32_t rangeValue() const { return m_range; }
 
 private:
@@ -253,6 +271,9 @@ bool readInteger(RangeDec& st, int width, uint64_t& out) {
     return true;
 }
 
+// sub_1800F74A0. The cap is `<= 0x1d` on all three contexts: the original spells
+// it `< 0x1e` on the first and `<= 0x1d` on the other two, and those are the
+// same bound. Reading the second as `<` caps at 29 and shifts every probability.
 bool svmBit(RangeDec& st, Model& model, const std::array<size_t, 3>& ctxs,
             size_t weightOff, int scale) {
     std::array<int32_t, 4> w{};
@@ -276,6 +297,9 @@ bool svmBit(RangeDec& st, Model& model, const std::array<size_t, 3>& ctxs,
         const size_t off = ctxs[k];
         const uint32_t cur = model.counter(off);
         const uint16_t mv = model.prob(off);
+        // v29 is 0xffffffff on a one and zero on a zero, and the divide is
+        // chosen by the high half of the 64-bit difference - so a one divides
+        // the UNSIGNED 4294967295 - cur, not -1.
         uint32_t inc = 0;
         if (bit) {
             inc = static_cast<uint32_t>(0xFFFFFFFFu - cur) / (mv + 2);
@@ -289,6 +313,9 @@ bool svmBit(RangeDec& st, Model& model, const std::array<size_t, 3>& ctxs,
     const int32_t d = scale * ((bit ? 4096 : 0) - p);
     std::array<int32_t, 4> nw{};
     for (size_t k = 0; k < 3; ++k) {
+        // The SSE form is _mm_cvtsi32_si128(d * (unsigned)base) then
+        // _mm_srai_epi32(..., 10): the product wraps to 32 bits BEFORE the
+        // shift, which is not the same as shifting the 64-bit product.
         const uint32_t prod = static_cast<uint32_t>(d) * static_cast<uint32_t>(b[k]);
         const int32_t shifted = static_cast<int32_t>(prod) >> 10;
         nw[k] = static_cast<int32_t>(static_cast<uint32_t>(w[k]) +
@@ -300,6 +327,9 @@ bool svmBit(RangeDec& st, Model& model, const std::array<size_t, 3>& ctxs,
     return bit != 0;
 }
 
+// The dictionary repeat bit. There is no separate probability field: the
+// adaptive update writes a full u32 at entry+0, so the u16 the coder reads at
+// +2 is the high half of that same word, seeded to 0x80000000 => P(hit) = 0.5.
 bool counterBit(RangeDec& st, Model& model, size_t off) {
     const uint32_t w = model.counter(off);
     const uint32_t p16 = (w >> 16) & 0xFFFFu;
@@ -322,6 +352,7 @@ bool counterBit(RangeDec& st, Model& model, size_t off) {
     return bit != 0;
 }
 
+// sub_1800F7910. a6 is an encoder-side hint and is genuinely dead here.
 uint32_t decodeDelta(RangeDec& st, Model& model, uint32_t a3, uint32_t a4, uint32_t a5) {
     const size_t b0 = 13184u * a3 + 48464;
     const size_t b1 = 13184u * (40u * a3 + a4) + 101200;
@@ -357,6 +388,8 @@ uint32_t decodeDelta(RangeDec& st, Model& model, uint32_t a3, uint32_t a4, uint3
         bool bit;
         uint32_t next;
         if (step > 3) {
+            // v33 is an `unsigned int *`, so the source's `v33 -= 2` is eight
+            // bytes; all three tails step by eight.
             bit = svmBit(st, model, {tailA, tailB, tailC}, wB, 1);
             next = prev;
         } else {
@@ -377,11 +410,17 @@ uint32_t decodeDelta(RangeDec& st, Model& model, uint32_t a3, uint32_t a4, uint3
 uint32_t bucketOf(uint64_t x) {
     if (x < 4) return static_cast<uint32_t>(x);
     if (x >= 0x100000u) return 39;
+    // Index of the highest set bit. x is at least 4 here, and the 0x100000
+    // early-out caps the walk at twenty iterations, so a plain loop beats
+    // depending on a compiler intrinsic.
     int b = 0;
     while ((x >> (b + 1)) != 0) ++b;
     return static_cast<uint32_t>(((x >> (b - 1)) & 1) + 2u * static_cast<uint64_t>(b));
 }
 
+// sub_1800F36E0:396-406. The golden-ratio multiplier appears only on the
+// innermost round; the other three use 0x61C8864680B583EB, which is exactly
+// minus that multiplier modulo 2^64.
 uint32_t hash4(const std::vector<uint64_t>& dct) {
     constexpr uint64_t A = 0x632BE59BD9B4E019ull;
     constexpr uint64_t K = 0x9E3779B97F4A7C15ull;
@@ -395,9 +434,12 @@ uint32_t hash4(const std::vector<uint64_t>& dct) {
     return static_cast<uint32_t>(t >> 46) & (kHashSlots - 1);
 }
 
+// Measured on RAUCHKAMMER 2: runs at zero, dies at minus one. The hook ordering
+// suggests the opposite and is wrong - the header explains why, and why the
+// same reasoning was right for TTRL and RE4 but not here.
 static constexpr int64_t kFrameShift = 0;
 
-}
+}  // namespace
 
 bool skk::echo::looksLikeEcho(std::span<const uint8_t> data) {
     return data.size() >= kMagicSize && std::memcmp(data.data(), "ECH2", 4) == 0;
@@ -435,7 +477,19 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
 
     RangeDec st(data.subspan(kMagicSize));
 
+    // NOTE: nothing is read before the three scalars. The rates table is NOT at
+    // the head - Echo.cpp:936-960 (load_version3, the reader side) reads
+    // fps / end_x / seconds / attempts / input count / clicks / [poses] /
+    // [rates] / [seed] in exactly that order, and write_echo (Echo.cpp:990-1002)
+    // mirrors it. An earlier version of this reader pulled the rates table out
+    // of the head of the stream, which could only ever have worked on the v3
+    // files we happened to test with: v3 is written exactly when rates is empty
+    // (Echo.cpp:1009), so the branch never ran. It is decoded at the tail now,
+    // after the input loop.
 
+    // The three scalars are floats and a double, but they travel through the
+    // integer coder as their raw bit patterns. Verified bit-exact against the
+    // bot's JSON export on all three reference files.
     uint64_t tpsBits = 0, endXBits = 0, secondsBits = 0;
     if (!readInteger(st, 32, tpsBits) || !readInteger(st, 32, endXBits) ||
         !readInteger(st, 64, secondsBits)) {
@@ -490,10 +544,16 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
             }
         }
 
+        // Zero is a valid packed click (release on channel 0 with zero frame
+        // gap). Do not use the payload value as the dictionary-hit sentinel:
+        // Echo's reference tracks this with an explicit `guessed` boolean.
         if (!guessed) {
             uint32_t second = 0, last = 0;
             uint64_t lastDelta = 0;
             if (!dct.empty()) {
+                // The >= 9 byte test gates ONLY `second`. With a single 8-byte
+                // entry the reference still knows the last nibble and the last
+                // delta, and those select the context arrays.
                 if (dct.size() * 8 >= 9) second = static_cast<uint32_t>(dct[dct.size() - 2] & 0xF);
                 last = static_cast<uint32_t>(dct.back() & 0xF);
                 lastDelta = dct.back() >> 4;
@@ -588,13 +648,15 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
                         len = k + 1;
                     }
                     if (len < 4) {
-                        run = 0;
+                        run = 0;  // the cursor is deliberately left alone
                     } else {
                         run = len;
                         cursor = slot;
                     }
                 }
             }
+            // Unconditional: the slot is overwritten even when the search never
+            // ran, because this is a flat direct-mapped table with no probing.
             table[h] = static_cast<uint32_t>(dct.size());
         }
 
@@ -602,6 +664,20 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
         prevDelta[packed & 0xF] = delta;
     }
 
+    // ---- the tail, in the writer's order (Echo.cpp:996-1002, reader :947-959) ----
+    //
+    // clicks -> [poses] -> [rates, v4 only] -> [seed]. Everything the bot needs
+    // from this file is already in out.actions by this point, so the tail is
+    // enrichment, not a requirement.
+    //
+    // Poses are skipped, not decoded. They are written only when the author had
+    // `save_debug` on (Echo.cpp:986) and they ride a SECOND adaptive model -
+    // POSE_FIELDS x 2 independent guess sets, delta + zigzag + code_number
+    // (code_poses, Echo.cpp:358-375). Reconstructing that model purely to throw
+    // the values away is not worth it, and the position data is useless to an
+    // input-only bot anyway. The cost is that rates and seed cannot be reached
+    // on such a file, which is why that case returns a partial success instead
+    // of pretending the tail was empty.
     bool tailComplete = true;
     const char* tailReason = nullptr;
 
@@ -609,6 +685,11 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
         tailComplete = false;
         tailReason = "carries position samples; rates and seed were not read";
     } else if (out.version == 4) {
+        // Rates are DELTA coded (code_rates, Echo.cpp:589-610): a gamma gap from
+        // the previous entry (the first is from 0), then the 32-bit float
+        // pattern XORed against the previous entry's pattern. Reading them as
+        // absolute frame / absolute bits - as this reader used to - yields
+        // garbage on the very first entry.
         uint64_t count = 0;
         if (!readGamma(st, count)) {
             tailComplete = false;
@@ -647,6 +728,9 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
         }
     }
 
+    // Metadata flags we act on by not understanding them. Each one changes what
+    // the macro expects from the run, so saying so is better than replaying it
+    // as if it were vanilla.
     std::vector<std::string> notes;
     if (out.flags & kFlagUnrounded) notes.push_back("recorded with velocity unrounding");
     if (out.flags & kFlagSilicateVariance) notes.push_back("expects Silicate variance numbering");
@@ -654,6 +738,9 @@ bool skk::echo::parse(std::span<const uint8_t> data, Replay& out,
         notes.push_back((out.flags & kFlagLdm) ? "expects low detail mode"
                                                : "expects high detail mode");
     }
+    // The table itself is read and kept in Replay::rates, but SKC has one tps
+    // per macro, so toSkcMacro can only honour the starting rate. Say so here:
+    // the loss is otherwise silent and the macro drifts from the first change.
     if (!out.rates.empty())
         notes.push_back(
             "carries an fps-change table; only the starting rate is kept");
@@ -697,6 +784,9 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
 
     for (const auto& a : replay.actions) {
+        // Zero, measured. The hook body has Echo apply inputs after the vanilla
+        // processCommands, which read like GDH's RE4 and predicted -1; the game
+        // says otherwise, so the measurement wins.
         const int64_t shifted = static_cast<int64_t>(a.frame) + kFrameShift;
         if (shifted < 0 || shifted > 0xFFFFFFFFll) {
             return fail("echo: frame " + std::to_string(a.frame) + " shifted by " +
@@ -706,6 +796,8 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
+    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
+    // up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

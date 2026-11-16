@@ -8,7 +8,15 @@ using namespace geode::prelude;
 #define SWEEP_MARGIN 8.f
 
 namespace skk::phys {
-    static int g_nearMoversState = -1;
+    // OPT-IN, default OFF. This filter narrows the live `collisionCheckObjects`
+    // list to objects inside a swept box around the player. It is our own
+    // heuristic, not something Echo or silicate do (both REPLACE the whole
+    // collision routine instead), so a wrong margin silently drops a real
+    // collision: the object is never checked, the player flies through it and
+    // the attempt diverges from the recording. Until a drift=0 run proves the
+    // margin safe on real levels it must not be on by default.
+    // Enable with the saved value `perf_near_movers = true` (or the setter).
+    static int g_nearMoversState = -1;  // -1 = not read from settings yet
     static std::vector<GameObject*> g_near;
 
     bool nearMoversEnabled() {

@@ -89,6 +89,8 @@ static PlayerStateBundle capturePlayerState(PlayerObject* player, bool isPlatfor
 void SkMacro::recordAction(std::vector<SkInput>& target, int tick, int button, bool player2, bool pressed, float offset, double cbsTimeOffset) {
     SkInput input;
     input.tick = std::max(0, tick);
+    // Rewind self-heal (see recordPerFrame): checkpoint respawn restarts the
+    // tick clock; drop the future tail to keep on-disk order valid.
     if (!target.empty() && input.tick < target.back().tick) {
         size_t dropped = 0;
         while (!target.empty() && target.back().tick >= input.tick) {
@@ -106,6 +108,11 @@ void SkMacro::recordAction(std::vector<SkInput>& target, int tick, int button, b
     double safeFramerate = std::isfinite(framerate) && framerate > 0.0 ? framerate : 240.0;
     double tickDuration = 1.0 / safeFramerate;
     input.timeSeconds = static_cast<double>(std::max(0, tick)) / safeFramerate;
+    // Defensive guard: cbsTimeOffset is a within-tick phase and must be < 1
+    // tick duration.  A garbage baseline (tickStartTimestamp still zeroed by
+    // resetTimingTracking) inflates it to the entire accumulated game clock,
+    // breaking timeSeconds monotonicity and producing an on-disk "unsorted
+    // inputs" rejection.  Reject the offset when it exceeds a full tick.
     if (std::isfinite(cbsTimeOffset) && cbsTimeOffset >= 0.0 && cbsTimeOffset < tickDuration) {
         input.timeSeconds += cbsTimeOffset;
     } else if (std::isfinite(offset) && offset > 0.0f) {
@@ -126,6 +133,7 @@ void SkMacro::recordAction(int tick, int button, bool player2, bool pressed, flo
 void SkMacro::recordAnchor(std::vector<PlaybackAnchor>& target, int tick, PlayerObject* p1, PlayerObject* p2, bool isPlatformer, bool isDual) {
     PlaybackAnchor anchor;
     anchor.tick = std::max(0, tick);
+    // Rewind self-heal (see recordPerFrame).
     if (!target.empty() && anchor.tick < target.back().tick) {
         while (!target.empty() && target.back().tick >= anchor.tick) {
             target.pop_back();
@@ -159,10 +167,15 @@ void SkMacro::recordAnchor(int tick, PlayerObject* p1, PlayerObject* p2, bool is
     recordAnchor(anchors, tick, p1, p2, isPlatformer, isDual);
 }
 
+// v2 per-frame visual orientation flag bits: now shared via skk_format.hpp
+// (kVisual* constants, vehicleModeBits, visualFlagsOf).
 
 void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerObject* p1, PlayerObject* p2) {
     SkPerFrame frame;
     frame.tick = std::max(0, tick);
+    // Rewind self-heal: a tick going backwards means the run restarted
+    // (checkpoint respawn / practice). Drop the stale tail so the stream
+    // stays monotonic on disk (readers hard-reject unsorted per-frames).
     if (!target.empty() && frame.tick < target.back().tick) {
         size_t dropped = 0;
         while (!target.empty() && target.back().tick >= frame.tick) {
@@ -184,6 +197,14 @@ void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerOb
             frame.p1RingId = static_cast<GameObject*>(p1->m_dashRing)->m_objectID;
         }
     }
+    // P2 liveness gate (BUG-21): in a 2P/dual level GD keeps m_player2
+    // allocated but DORMANT until it actually joins — spawnPlayer2() parents
+    // it into the layer, removePlayer2() detaches it. A dormant P2 sits at
+    // (0,0) and never moves. Recording it as hasPlayer2=true poisons the
+    // stream: on playback, once a dual portal activates the LIVE P2, the
+    // pre-phy pin/reconcile yank it back to the recorded (0,0) — a
+    // 14000px TELEPORT-SPIKE that kills it. GD's own liveness signal is
+    // the parenting, so mirror it here.
     if (p2 && p2->getParent() != nullptr) {
         frame.hasPlayer2 = true;
         auto pos = p2->getPosition();
@@ -197,6 +218,8 @@ void SkMacro::recordPerFrame(std::vector<SkPerFrame>& target, int tick, PlayerOb
             frame.p2RingId = static_cast<GameObject*>(p2->m_dashRing)->m_objectID;
         }
     }
+    // BUG-04 study: reporting lives on the playback side (live-vs-recorded
+    // mismatches), not here - the naive ud!=gravNeg check was a false positive.
     if (!target.empty() && target.back().tick == frame.tick) {
         target.back() = std::move(frame);
     } else {
@@ -216,6 +239,16 @@ void SkMacro::recordPerFrame(int tick, PlayerObject* p1, PlayerObject* p2) {
 }
 
 void SkMacro::truncateAfter(int tick) {
+    // Inputs: remove >= tick (inclusive).  After truncation closeSeamHoldEdges
+    // re-adds a synthetic release for any dangling hold, then syncPhysicalHolds
+    // re-presses whatever the user is still holding — both at `tick`.  Using
+    // > tick left those fresh seam inputs in the stream; every subsequent death
+    // appended another release+press pair at the boundary tick, inflating the
+    // input count by +2 per death loop (BUG: inputs never decrease on respawn).
+    //
+    // PerFrames / anchors: keep > tick (exclusive) so the boundary frame and
+    // anchor survive for captureResealBoundaryFrame to rewrite to the respawn
+    // position (BUG-06 seam seal).
     while (!inputs.empty() && inputs.back().tick >= tick) {
         inputs.pop_back();
     }
@@ -225,6 +258,11 @@ void SkMacro::truncateAfter(int tick) {
     while (!perFrames.empty() && perFrames.back().tick > tick) {
         perFrames.pop_back();
     }
+    // Журнал идёт в порядке откатов, а не обязательно по возрастанию tick.
+    // Сохраняем префикс/сам boundary, удаляем отменённое RNG-будущее.
+    std::erase_if(rngBoundaries, [tick](SkRngBoundary const& boundary) {
+        return boundary.tick > tick;
+    });
 }
 
 std::vector<uint8_t> SkMacro::serialize() const {
@@ -233,6 +271,11 @@ std::vector<uint8_t> SkMacro::serialize() const {
 
 std::vector<uint8_t> SkMacro::serializeSKK3() const {
     auto macro3 = skk::skk3::fromSkMacro(*this);
+    // "Save Seed" (MACRO BOT, Settings): when OFF the setup seed stays out
+    // of the file. Only the serialized bytes are gated - the in-memory seed
+    // the session keeps is untouched (pinSetupSeedBeforeReset keeps using it,
+    // and re-saving with the toggle back ON writes it again). With empty
+    // variance/persistentItems the whole variance section drops.
     const bool seedInFile =
         wireSeedStamp != 0 ? wireSeedStamp > 0
                            : geode::Mod::get()->getSavedValue<bool>(
@@ -353,6 +396,7 @@ bool SkMacro::persistToDirectory(std::filesystem::path const& directory) {
         return false;
     }
 
+    // One rule for both engines: an exact name+extension match gets _1.
     pending.name = ReplayStorage::makeUniqueReplayNameInDirectory(
         directory,
         pending.name,

@@ -4,6 +4,9 @@
 
 namespace skk::skc {
 
+// ---------------------------------------------------------------------------
+// RangeEncoder
+// ---------------------------------------------------------------------------
 
 void RangeEncoder::encode(uint32_t cumLow, uint32_t cumHigh, uint32_t total) {
     const uint64_t range = static_cast<uint64_t>(m_high) - m_low;
@@ -12,12 +15,17 @@ void RangeEncoder::encode(uint32_t cumLow, uint32_t cumHigh, uint32_t total) {
 
     while (true) {
         if (m_high < 0x80000000u) {
+            // Both ends in the lower half: E1, output a zero.
             emitBit(0);
         } else if (m_low >= 0x80000000u) {
+            // Both ends in the upper half: E2, output a one and subtract the
+            // high bit so the range fits back into 32 bits.
             emitBit(1);
             m_low -= 0x80000000u;
             m_high -= 0x80000000u;
         } else if (m_low >= 0x40000000u && m_high < 0xC0000000u) {
+            // Straddling the middle: E3. The bit is undecided, so remember it
+            // and narrow around the centre.
             ++m_pending;
             m_low -= 0x40000000u;
             m_high -= 0x40000000u;
@@ -33,12 +41,16 @@ void RangeEncoder::encode(uint32_t cumLow, uint32_t cumHigh, uint32_t total) {
 void RangeEncoder::emitBit(uint8_t bit) {
     m_bits.push_back(bit);
     while (m_pending > 0) {
+        // A pending E3 bit resolves to the opposite of the bit that finally
+        // settled the range.
         m_bits.push_back(bit ^ 1u);
         --m_pending;
     }
 }
 
 std::vector<uint8_t> RangeEncoder::finish() {
+    // One more bit identifies the current half, which flushes any pending E3
+    // stack through emitBit.
     ++m_pending;
     if (m_low < 0x40000000u) emitBit(0);
     else emitBit(1);
@@ -56,6 +68,9 @@ std::vector<uint8_t> RangeEncoder::finish() {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// RangeDecoder
+// ---------------------------------------------------------------------------
 
 RangeDecoder::RangeDecoder(const uint8_t* data, size_t size)
     : m_data(data), m_size(size) {
@@ -65,8 +80,12 @@ RangeDecoder::RangeDecoder(const uint8_t* data, size_t size)
 
 uint32_t RangeDecoder::readBit() {
     if (m_bitPos >= m_size * 8u) {
+        // Past the end the stream is implicitly zero-padded; the encoder pads the
+        // same way, so the decoder can never need a bit that is not there.
         return 0;
     }
+    // The encoder packs bits MSB-first, so the decoder must walk bits, not
+    // bytes: bit i lives in byte (i >> 3) at position (7 - (i & 7)).
     const uint8_t byte = m_data[m_bitPos >> 3];
     const uint32_t bit = (byte >> (7u - (m_bitPos & 7u))) & 1u;
     ++m_bitPos;
@@ -86,6 +105,7 @@ void RangeDecoder::remove(uint32_t cumLow, uint32_t cumHigh, uint32_t total) {
 
     while (true) {
         if (m_high < 0x80000000u) {
+            // E1: no adjustment.
         } else if (m_low >= 0x80000000u) {
             m_low -= 0x80000000u;
             m_high -= 0x80000000u;
@@ -104,6 +124,9 @@ void RangeDecoder::remove(uint32_t cumLow, uint32_t cumHigh, uint32_t total) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SymbolModel
+// ---------------------------------------------------------------------------
 
 SymbolModel::SymbolModel(uint32_t symbolCount, uint32_t contextCount,
                          uint32_t countScale, uint32_t rowBudget)
@@ -137,6 +160,8 @@ uint32_t SymbolModel::decode(RangeDecoder& dec, uint32_t ctx) {
 
     const uint32_t target = dec.decodeTarget(total);
 
+    // Walk the cumulated counts to find the symbol whose interval contains the
+    // target. A linear scan is right here: the alphabets are tiny (<=257).
     uint32_t cum = 0;
     uint32_t symbol = 0;
     for (; symbol < m_symbolCount; ++symbol) {
@@ -165,6 +190,9 @@ void SymbolModel::update(uint32_t ctx, uint32_t symbol) {
         m_counts_[base + s] = std::max(1u, m_counts_[base + s] / 2u);
 }
 
+// ---------------------------------------------------------------------------
+// ValueModel — magnitude-split
+// ---------------------------------------------------------------------------
 
 ValueModel::ValueModel(uint32_t shift, uint32_t countScale, uint32_t rowBudget, bool mix)
     : m_shift(shift < kShiftMin ? kShiftMin : (shift > kShiftMax ? kShiftMax : shift)),
@@ -187,6 +215,9 @@ void ValueModel::encode(RangeEncoder& enc, uint32_t value, uint64_t* bucketBits,
     const uint32_t offset =
         value < 256u ? (value & (m_width - 1u)) : m_escape;
 
+    // 1) which bucket. The mixer is a drop-in for the plain chooser: same one
+    // symbol, same cost if it does not help, and it only needs to know which
+    // bucket the previous value fell in.
     if (m_mixer) {
         m_mixer->encode(enc, bucket, m_prevBucket);
         m_prevBucket = bucket;
@@ -207,6 +238,7 @@ void ValueModel::encode(RangeEncoder& enc, uint32_t value, uint64_t* bucketBits,
     if (bucketBits) *bucketBits += enc.bitsProduced() - mark0;
     const uint64_t mark1 = (bucketBits || offsetBits) ? enc.bitsProduced() : 0;
 
+    // 2) which offset inside that bucket
     const size_t base = static_cast<size_t>(bucket) * m_symbolsPerBucket;
     uint32_t offLow = 0;
     for (uint32_t o = 0; o < offset; ++o) offLow += m_offsets_[base + o];
@@ -222,7 +254,22 @@ void ValueModel::encode(RangeEncoder& enc, uint32_t value, uint64_t* bucketBits,
         m_offsets_[base + offset] += m_countScale;
     }
 
+    // 3) escape: raw bytes through a uniform alphabet
     if (offset == m_escape) {
+        // A value that does not fit in 16 bits needs four bytes, not two.
+        // Writing two used to truncate it SILENTLY: at 240 tps a 72000-frame
+        // gap between two presses on one channel reloaded with that press 6464
+        // frames in, and validateActions still passed because the frames stayed
+        // monotonic and the button states stayed legal. The file simply differed
+        // from the macro that produced it, which is the one thing this format
+        // exists not to do.
+        //
+        // The wide flag costs one bit on the escape path only, and the escape is
+        // the rare path by construction: it is chosen precisely when the value
+        // does not fit the bucket/offset model. Per AGENTS the format version is
+        // not preserved across codec changes, so files saved before this need to
+        // be re-saved; there is no way to shave the bit out of the three knob
+        // bytes, they are all spent.
         const bool wide = value >= 0x10000u;
         enc.encode(wide ? 1u : 0u, wide ? 2u : 1u, 2u);
         const uint8_t low = static_cast<uint8_t>(value & 0xFFu);
@@ -240,6 +287,7 @@ void ValueModel::encode(RangeEncoder& enc, uint32_t value, uint64_t* bucketBits,
 }
 
 uint32_t ValueModel::decode(RangeDecoder& dec, uint32_t prevValue) {
+    // 1) bucket
     uint32_t bucket;
     if (m_mixer) {
         bucket = m_mixer->decode(dec, m_prevBucket);
@@ -269,6 +317,7 @@ uint32_t ValueModel::decode(RangeDecoder& dec, uint32_t prevValue) {
         }
     }
 
+    // 2) offset inside the bucket
     const size_t base = static_cast<size_t>(bucket) * m_symbolsPerBucket;
     uint32_t offTotal = 0;
     for (uint32_t o = 0; o < m_symbolsPerBucket; ++o) offTotal += m_offsets_[base + o];
@@ -296,6 +345,7 @@ uint32_t ValueModel::decode(RangeDecoder& dec, uint32_t prevValue) {
     if (offset != m_escape)
         return (bucket << m_shift) | offset;
 
+    // 3) escape: reverse of the uniform byte encode
     const uint32_t wideTarget = dec.decodeTarget(2);
     dec.remove(wideTarget, wideTarget + 1, 2);
     const bool wide = wideTarget == 1;
@@ -310,4 +360,4 @@ uint32_t ValueModel::decode(RangeDecoder& dec, uint32_t prevValue) {
     return value;
 }
 
-}
+} // namespace skk::skc

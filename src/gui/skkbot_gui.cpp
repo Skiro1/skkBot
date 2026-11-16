@@ -12,6 +12,8 @@
 #include <Geode/Geode.hpp>
 #include <Geode/binding/PauseLayer.hpp>
 #include <imgui.h>
+// kNoPadWithHalfSpacing (see gui/beta_widgets.hpp) - pulled in from there
+// rather than from imgui_internal.h, which clashes with geode::prelude.
 #include "gui/beta_widgets.hpp"
 #include <imgui-cocos.hpp>
 
@@ -60,25 +62,49 @@ void Gui::init() {
     showSettings = false;
     showFeatures = true;
     showMacroList = false;
+    // ПО УМОЛЧАНИЮ все кейбинды NONE (запрос 03.11.2026), кроме Open
+    // Menu — он вернулся на Tab (0x09) по просьбе пользователя.
+    // Stored-значение, равное старому дефолту (0xA5 right-alt, NONE
+    // предыдущего коммита), считается «не выбором пользователя» и
+    // мигрирует (тот же приём, что и миграция G -> C ниже). Привязка —
+    // вручную через KEYBINDS (capture), а снять — правый клик по
+    // пилюле или Delete во время capture.
     menuKeybind = mod->getSavedValue<int>("menu_keybind", 0x09);
     if (menuKeybind == 0xA5 || menuKeybind == 0) {
         menuKeybind = 0x09;
         mod->setSavedValue("menu_keybind", 0x09);
     }
     stepForwardKeybind = mod->getSavedValue<int>("keybind_step_forward", 0);
+    // Слитая миграция «G -> C» (19.10): и старый G (0x47), и прежний
+    // дефолт C (0x43) считаются «не выбором» — снимаются в NONE.
     if (stepForwardKeybind == 0x47 || stepForwardKeybind == 0x43) {
         stepForwardKeybind = 0;
         mod->setSavedValue("keybind_step_forward", 0);
     }
+    // Keybind table. Menu и StepForward двух легаси-полей выше; остальное
+    // читает свои saved-ключи. ПО УМОЛЧАНИЮ ВСЁ НЕТ (запрос 03.11.2026):
+    // ни один бинд не задаётся автоматически — Menu/StepForward/ResetLevel/
+    // Hitboxes тоже NONE (0). У остальных stored-значение появляется
+    // ТОЛЬКО по явному capture, так что миграции не требуют — а снять
+    // привязку можно правым кликом по пилюле (drawKeybindSection) или
+    // Delete во время capture.
+    // Transport-клавиши и assist-тогглы — действия, которые пользователь
+    // выбирает сам: пред-назначенные буквы молча крадут клавиши у игры
+    // или других модов. Строки остаются в KEYBINDS, так что привязать —
+    // один клик. legacyDef хранит superseded-дефолт (0 = нет).
     static const struct {
         Bind bind;
         const char* label;
         int def;
         int group;
         const char* saveKey;
-        int legacyDef;
+        int legacyDef;  // superseded default to migrate away from, 0 = none
     } kBindDefs[] = {
         { Bind::Menu,        "Open Menu",  0x09, 0, "menu_keybind",           0xA5 },
+        // "Reset Level" is GDH's own name for it (src/interface/imgui/windows/
+        // shortcuts.cpp:143, bind id "shortcut::reset_level"); its implementation
+        // there is a bare PlayLayer::resetLevel() (src/core/shortcuts.hpp:29-30).
+        // R was Record's old default; Record is now unbound, so the key is free.
         { Bind::ResetLevel,   "Reset Level", 0, 0, "keybind_reset_level",    0x52 },
         { Bind::Record,      "Record",      0,   1, "keybind_record",         0x52 },
         { Bind::Play,        "Play",        0,   1, "keybind_play",           0x50 },
@@ -111,12 +137,27 @@ void Gui::init() {
         showFeatures = false;
     }
 
+    // Features window settings.
     engine->tickRate = 240.0;
     tpsEnabled = mod->getSavedValue<bool>("gui_tps_enabled", false);
     tpsValue = std::clamp(mod->getSavedValue<double>("gui_tps_value", 240.0), 1.0, 1000000.0);
     engine->tickRate = tpsEnabled ? tpsValue : 240.0;
+    // FPS: off by default so an existing install keeps the frame pacing it has.
+    // 0 is the special "follow TPS" value, so the clamp floor is 0 here rather
+    // than 1 - a negative number would be a third meaning nobody asked for.
     fpsEnabled = mod->getSavedValue<bool>("gui_fps_enabled", false);
     fpsValue = std::clamp(mod->getSavedValue<double>("gui_fps_value", 0.0), 0.0, 1000.0);
+    // LOCK FPS: the row and the checkbox are gone (19.10.2026). The step planner
+    // already advances the level exactly one frame per frame drawn whenever FPS
+    // equals TPS - dt == 1/fps == 1/tps == timestep, so the carry grows by one
+    // timestep and planSteps returns 1. Outside that case the toggle made
+    // playback run slower than real time, which is not what this bot is for.
+    //
+    // The saved key is cleared rather than merely ignored: leaving a "true" in
+    // the user's file after removing the control that could un-set it is the
+    // Дефолт тайминга — Real Time (решение 06.11): SKK-плейбэк по умолчанию
+    // едет в честном реальном времени; Lock Delta — осознанный выбор пользователя.
+    // Saved-ключ решает: если пользователь явно кликал пилюлю, его выбор живёт.
     lockDelta = mod->getSavedValue<bool>("gui_timing_lock_delta", false);
     realTime = mod->getSavedValue<bool>("gui_timing_real_time", true);
     if (realTime) lockDelta = false;
@@ -130,22 +171,32 @@ void Gui::init() {
         mod->getSavedValue<bool>("gui_layout_regular_bg", false);
     engine->layoutModeDefaultArt =
         mod->getSavedValue<bool>("gui_layout_default_art", false);
+    // Safe Mode is a single master toggle, default OFF, and it always freezes
+    // attempts AND jumps. The per-effect switches (gui_safe_mode_freeze_*) and
+    // Auto Save Mod (gui_auto_save_mod) were removed — those saved values are
+    // simply ignored now, so nothing has to be migrated or deleted on disk.
     engine->safeMode = mod->getSavedValue<bool>("gui_safe_mode", false);
     speedhackValue =
         std::max(0.01, mod->getSavedValue<double>("gui_speedhack_value", 1.0));
     engine->gameSpeed = speedhackEnabled ? speedhackValue : 1.0;
+    // RNG seed is fixed (100) in the engine now - no saved value, no widget.
     engine->collisionBypass = mod->getSavedValue<bool>("gui_noclip", false);
     engine->noclipPlayer1 = mod->getSavedValue<bool>("gui_noclip_p1", true);
     engine->noclipPlayer2 = mod->getSavedValue<bool>("gui_noclip_p2", true);
     engine->noclipDeathFlash = mod->getSavedValue<bool>("gui_noclip_flash", false);
 
+    // HITBOX OVERLAY — visual-only collision-box debug draw (see
+    // src/hacks/hitboxes.cpp). Off by default; toggled from the RECORD tab.
     engine->showHitboxes = mod->getSavedValue<bool>("gui_hitboxes", false);
     engine->hitboxFill = mod->getSavedValue<bool>("gui_hitbox_fill", false);
 
+    // TRAJECTORY overlay (RECORD tab) — off by default, simulates future player trajectory
     engine->showTrajectory = mod->getSavedValue<bool>("gui_trajectory", false);
     engine->trajectoryBothSides = mod->getSavedValue<bool>("gui_trajectory_both_sides", false);
     engine->pathLength = std::clamp(mod->getSavedValue<int>("gui_trajectory_length", ReplayEngine::kTrajectoryLengthDefault), 10, 1200);
 
+    // WAVE TRAIL FIX — always-on visual-only trail rework (drag-fix +
+    // draw-fix). Defaults to on, like the reference mods.
     engine->waveTrailFix = mod->getSavedValue<bool>("gui_wavetrail", true);
     engine->waveTrailDragFix = mod->getSavedValue<bool>("gui_wavetrail_drag", true);
     engine->waveTrailDrawFix = mod->getSavedValue<bool>("gui_wavetrail_draw", true);
@@ -160,15 +211,21 @@ void Gui::init() {
     AccuracyMode accMode = sanitizeAccuracyMode(acc);
     engine->selectedAccuracyMode = accMode;
     engine->cosEnabled = mod->getSavedValue<bool>("gui_cos", false);
+    // Mirror the game's actual live CBS / COS state if available
     engine->syncAccuracyFromGame();
 
+    // Settings window.
     auto& logger = skkbot2::Logger::get();
     logger.setFileLogging(mod->getSavedValue<bool>("gui_file_logging", false));
     logger.setSplitFiles(mod->getSavedValue<bool>("gui_split_logs", false));
     logger.setLevel(static_cast<skkbot2::Logger::Level>(
         std::clamp(mod->getSavedValue<int>("gui_log_level", 4), 0, 4)));
+    // Persistence mode is temporarily locked OFF (feature incomplete);
+    // saved value intentionally ignored until it's re-enabled. Existing
+    // chain files still play back fine - only new capture stays linear.
     engine->setPersistenceMode(false);
 
+    // Window positions.
     mainPos = ImVec2(mod->getSavedValue<float>("gui_main_x", 20.0f),
                      mod->getSavedValue<float>("gui_main_y", 20.0f));
     featuresPos = ImVec2(mod->getSavedValue<float>("gui_features_x", 352.0f),
@@ -181,6 +238,8 @@ void Gui::init() {
         }
     }
 
+    // Тип движка из сохранёнки (парковка SKK снята 09.11 — см. Notes в
+    // docs/Трекер Реализации.md).
     macroBotType = static_cast<MacroBotType>(
         std::clamp(mod->getSavedValue<int>("gui_macro_bot_type", 0), 0, 1)
     );
@@ -208,6 +267,9 @@ void Gui::saveSettings() {
     mod->setSavedValue("gui_noclip_flash", engine->noclipDeathFlash);
     mod->setSavedValue("gui_hitboxes", engine->showHitboxes);
     mod->setSavedValue("gui_hitbox_fill", engine->hitboxFill);
+    // Trajectory was MISSING here: it was only ever written by the beta GUI's
+    // toggle, so a save round-trip silently dropped it and the on-screen state
+    // could diverge from what the menu shows after a reload.
     mod->setSavedValue("gui_trajectory", engine->showTrajectory);
     mod->setSavedValue("gui_trajectory_both_sides", engine->trajectoryBothSides);
     mod->setSavedValue("gui_trajectory_length", engine->pathLength);
@@ -265,6 +327,8 @@ void Gui::selectMacroInList(std::string const& name) {
     refreshMacroList();
     selectedMacro = -1;
     for (int i = 0; i < static_cast<int>(macros.size()); ++i) {
+        // Callers pass a bare stem (macroName), while the list keys carry the
+        // format suffix, so compare on the stem part.
         if (ReplayEngine::macroEntryStem(macros[i]) == name) {
             selectedMacro = i;
             break;
@@ -318,6 +382,8 @@ void Gui::startRender() {
         return;
     }
     auto* engine = ReplayEngine::get();
+    // SKC playback counts as a running macro. The renderer is engine-agnostic;
+    // the old MODE_EXECUTE-only gate rejected a perfectly valid SKC playback.
     auto& guiRef = skkbot2::gui::get();
     const bool skcOn = guiRef.macroBotType == Gui::MacroBotType::SKC;
     auto& skcBot = skk::skc::Bot::get();
@@ -359,6 +425,7 @@ void Gui::startRender() {
     skkbot2::Logger::get().info("Render started -> {} ({}x{}@{}fps)",
         renderer.lastOutputPath(), render.width, render.height, render.fps);
     if (skcOn) {
+        // Single-line CCLabelBMFont: keep it short enough to fit.
         Notification::create(
             "SKC: no death chain - restart from frame 0",
             NotificationIcon::Info, NOTIFICATION_LONG_TIME
@@ -370,8 +437,14 @@ void Gui::drawRenderWindow() {
     auto& renderer = skkbot2::render::Renderer::get();
     auto* engine = ReplayEngine::get();
 
+    // Load FFmpeg the first time the window opens (7 DLLs, ~160 MB total —
+    // do not block mod load with it).
     if (!renderer.isFFmpegLoaded()) {
         if (renderer.loadFFmpeg()) {
+            // If the user has no saved encoder, use libx264. It is in the build
+            // on every machine, so the default is the same everywhere instead of
+            // depending on which GPU happens to be installed; the hardware
+            // encoders stay available to pick on purpose.
             if (renderEncoder.empty()) {
                 const auto& encoders = renderer.availableEncoders();
                 const char* kPref[] = {
@@ -394,6 +467,7 @@ void Gui::drawRenderWindow() {
 
     const bool ffLoaded = renderer.isFFmpegLoaded();
     const bool recording = renderer.isRecording();
+    // A render has run this session and is no longer active — "done" state.
     const bool done = !recording && renderer.renderStartWall() > 0.0 &&
                       renderer.mEncodedFrames.load() > 0;
     const uint64_t encoded = renderer.mEncodedFrames.load();
@@ -403,11 +477,14 @@ void Gui::drawRenderWindow() {
     const double sinceStart =
         renderer.renderStartWall() > 0.0 ? now - renderer.renderStartWall() : 0.0;
 
+    // Size/position are set by draw() on open (flush left of the main menu,
+    // same height); the user may still resize the window freely afterwards.
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 300), ImVec2(1400, 1100));
     if (ImGui::Begin("Video Render", &showRender, ImGuiWindowFlags_NoCollapse)) {
         renderPos = ImGui::GetWindowPos();
         renderDragged = ImGui::IsWindowFocused() &&
                         ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        // One-shot notification on the transition recording -> done.
         if (renderWasRecording && !recording &&
             renderer.renderStartWall() > 0.0) {
             Notification::create("Render finished", NotificationIcon::Success)
@@ -472,6 +549,7 @@ void Gui::drawRenderWindow() {
         float paneW = ImGui::GetWindowContentRegionMax().x -
                       ImGui::GetWindowContentRegionMin().x;
 
+        // --- Left pane: live preview + progress ---------------------------
         ImGui::BeginChild("##render_left", ImVec2(paneW * 0.55f, 0), true);
         {
             ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -508,6 +586,7 @@ void Gui::drawRenderWindow() {
                 ImGui::PopStyleColor();
             }
 
+            // Progress against the estimated macro length.
             uint64_t total = 0;
             if (engine->activeSk && !engine->activeSk->inputs.empty()) {
                 double macroSecs =
@@ -533,6 +612,7 @@ void Gui::drawRenderWindow() {
                           static_cast<unsigned long long>(encoded));
             ImGui::TextUnformatted(pbuf);
 
+            // Elapsed / ETA line.
             if (recording) {
                 double eta = progress > 0.01f
                     ? sinceStart / progress * (1.0 - progress)
@@ -546,6 +626,7 @@ void Gui::drawRenderWindow() {
                 ImGui::TextUnformatted(tim);
             }
 
+            // Parameter line.
             const char* encName = renderer.encoderUsed().empty()
                 ? (renderEncoder.empty() ? "libx264" : renderEncoder.c_str())
                 : renderer.encoderUsed().c_str();
@@ -558,6 +639,9 @@ void Gui::drawRenderWindow() {
             ImGui::TextUnformatted(pbuf);
 
             ImGui::Separator();
+            // Always open the videos DIRECTORY, never /select on the output
+            // file: a failed render deletes the file, and Explorer with a
+            // missing /select target falls back to "Documents".
             if (!renderer.lastOutputPath().empty()) {
                 ImGui::TextWrapped("Output: %s",
                                    renderer.lastOutputPath().c_str());
@@ -575,7 +659,16 @@ void Gui::drawRenderWindow() {
 
         ImGui::SameLine();
 
+        // --- Right pane: output settings + Start/Stop ---------------------
+        // Wheel is read BEFORE the child window opens: value widgets inside
+        // step from the captured delta. The raw event is consumed right AFTER
+        // BeginChild — ImGui applies child scroll in Begin(), so zeroing any
+        // earlier (before this call) silently disabled pane scrolling.
         const float wheelDelta = ImGui::GetIO().MouseWheel;
+        // Step values ONLY when the pane's wheel is locked to value-stepping
+        // (a value was hovered last frame); otherwise the event belongs to
+        // scrolling. renderScrollLocked is one frame behind hover, which just
+        // means the very first hover frame scrolls instead of stepping.
         const float stepWheel = renderScrollLocked ? wheelDelta : 0.0f;
         bool anyValueHovered = false;
         ImGui::BeginChild("##render_right", ImVec2(0, 0), true,
@@ -660,6 +753,8 @@ void Gui::drawRenderWindow() {
                     "ac3", "libvorbis", "flac",
                 };
                 {
+                    // Combo shows only codecs present in the bundled FFmpeg
+                    // (hasAudioCodec queries avcodec_find_encoder_by_name).
                     std::string preview = render.audioCodec;
                     if (preview.empty()) preview = "aac";
                     bool open = ImGui::BeginCombo("Codec", preview.c_str());
@@ -725,6 +820,9 @@ void Gui::drawRenderWindow() {
             if (ImGui::IsItemHovered()) {
                 anyValueHovered = true;
                 if (stepWheel != 0.0f) {
+                    // Step +-0.001 per wheel event (sign-based, like TPS):
+                    // multi-detent wheels report 2-3 per event and would
+                    // otherwise skip values.
                     render.fadeIn = std::clamp(
                         render.fadeIn + (wheelDelta > 0.0f ? 0.001 : -0.001),
                         0.0, 5.0);
@@ -746,6 +844,8 @@ void Gui::drawRenderWindow() {
             }
             ImGui::EndDisabled();
 
+            // Persist hover state until the next window draw (controls the
+            // NoScrollWithMouse lock applied on the BeginChild above).
             renderScrollLocked = anyValueHovered;
 
             if (changed) {
@@ -760,6 +860,8 @@ void Gui::drawRenderWindow() {
                 rGui.macroBotType == Gui::MacroBotType::SKC &&
                 (rSkcBot.getState() == skk::skc::State::Playback ||
                  rSkcBot.isPlaybackArmed());
+            // Same fix as the beta GUI: this gate is what actually disabled the
+            // button under SKC, so startRender() was never reached.
             const bool canStart = !recording && ffLoaded && PlayLayer::get() &&
                                   (engine->engineMode == MODE_EXECUTE ||
                                    rSkcPlaying);
@@ -787,6 +889,10 @@ void Gui::drawRenderWindow() {
     ImGui::End();
 }
 
+// Applies skkBot2's simple, compact dark styling. Runs every frame at the
+// start of draw() so the palette always reflects the current styling. We keep
+// the default ImGui look with modestly rounded corners so the UI stays light,
+// simple and compact.
 static void applyTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 8.0f;
@@ -833,8 +939,12 @@ void Gui::applyCursorForOpenState() {
 }
 
 void Gui::draw() {
+    // Keep the system mouse visible while the menu is open, restoring GD's
+    // original cursor state (hidden during gameplay) when it closes.
     applyCursorForOpenState();
 
+    // Beta GUI routing: the beta shell draws (or clears) itself and takes over
+    // completely; the classic windows below only run when it is disabled.
     if (useBetaGui) {
         beta_gui::render(open);
         return;
@@ -842,6 +952,9 @@ void Gui::draw() {
     beta_gui::render(false);
     if (!open) return;
 
+    // On the very first time the menu appears in this session, show only the
+    // main tab; sub-windows are opened via their buttons afterwards. Closing
+    // and reopening the menu keeps whatever sub-windows were open.
     if (!wasMenuOpen) {
         showFeatures = false;
         showSettings = false;
@@ -866,6 +979,9 @@ void Gui::draw() {
     ImGui::SetNextWindowSizeConstraints(ImVec2(320, 300), ImVec2(540, 720));
     ImGui::Begin("skkBot2", &open, ImGuiWindowFlags_NoCollapse);
 
+    // Record / Play toggle buttons, mirroring the old skkBot pair. The buttons
+    // also reflect a queued Record/Play (pressed while outside a level) and an
+    // armed playback that is waiting for the next attempt.
     bool recordQueued = isSkc
         ? (bot.getPendingAction() == skk::skc::PendingAction::Record)
         : (engine->pendingAction == ReplayEngine::PendingAction::Record);
@@ -876,6 +992,7 @@ void Gui::draw() {
         ? (playQueued || bot.isPlaybackArmed())
         : (playQueued || engine->pendingPlaybackStart);
 
+    // Status line - colored like the old skkBot.
     const char* statusStr = "Disabled";
     ImVec4 statusColor = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
     if (capturing) {
@@ -972,6 +1089,8 @@ void Gui::draw() {
     } else if (executing) {
         statusHint = inLevel ? "Playing - press Stop to halt." : "Playback queued - enter the level to start.";
     } else if (macroBotType == MacroBotType::SKC) {
+        // SKC lives in its own bot engine: the ReplayEngine pending* fields
+        // above never reflect it, so the hint has to read the SKC bot state.
         auto& bot = skk::skc::Bot::get();
         if (bot.isPlaybackArmed()) {
             statusHint = "Playback armed - takes over on the next attempt.";
@@ -995,6 +1114,11 @@ void Gui::draw() {
 
     ImGui::Separator();
 
+    // Counters + progress bar. Playback is main-first: when the macro owns a
+    // clean main timeline the persistence death-chain is NOT played (it only
+    // re-enacts recorded deaths), so the headline number must show what will
+    // actually run, with the chain broken out separately. During capture the
+    // pending attempt feeds the chain bucket until it is promoted on Stop.
     size_t mainInputs = 0;
     size_t chainInputs = 0;
     if (engine->activeSk) {
@@ -1032,6 +1156,9 @@ void Gui::draw() {
 
     ImGui::Separator();
 
+    // Macro name + Save/Load/Clear/List. The name box is user-controlled
+    // only - no automatic seeding (recordings keep the auto level name
+    // inside the macro; typing a name here overrides it on Save).
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##macroname", "Macro name", macroName, sizeof(macroName));
 
@@ -1064,6 +1191,8 @@ void Gui::draw() {
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
+    // Loading replaces activeSk - lethal mid-recording (Toasty refuses all
+    // macro-load operations while capturing for exactly this reason).
     ImGui::BeginDisabled(capturing || recordQueued || executing || playArmed || saveBusy);
     if (ImGui::Button("Load", ImVec2(btnW, 0))) {
         if (macroName[0] == '\0') {
@@ -1098,6 +1227,10 @@ void Gui::draw() {
 
     ImGui::Separator();
 
+    // Macro info line: always show the live level name + ID (ID can't be
+    // negative; clamp to 0). Independent of record/play state so it doesn't
+    // flicker or lose the ID mid-session. Warn when the active macro was
+    // recorded elsewhere - GDH has no check at all and silently desyncs.
     if (auto* pl = PlayLayer::get(); pl && pl->m_level) {
         int lvlId = static_cast<int>(pl->m_level->m_levelID);
         ImGui::Text("Level: %s (ID: %d)",
@@ -1133,6 +1266,12 @@ void Gui::draw() {
     mainDragged = ImGui::IsWindowFocused() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
     ImGui::End();
 
+    // When the main menu is dragged, carry every open sub-window along so the
+    // whole set moves as a unit, while each window stays independently
+    // draggable on its own. Delta-based so previously-moved windows keep their
+    // relative offset. The Render window is intentionally NOT carried: it
+    // remembers and keeps its own position (recorded in drawRenderWindow), so
+    // moving the main menu doesn't magnet it again.
     ImVec2 mainDelta = ImVec2(mainPos.x - prevMainPos.x, mainPos.y - prevMainPos.y);
     prevMainPos = mainPos;
     if (mainDragged) {
@@ -1155,6 +1294,8 @@ void Gui::draw() {
     }
 
     if (showSettings) {
+        // Flag is read inside the window (first-open positioning) and only set
+        // to true AFTER drawing so the opening frame can still act on it.
         drawSettingsWindow();
         settingsWasOpenLast = true;
     } else {
@@ -1172,6 +1313,11 @@ void Gui::draw() {
     }
     if (showRender) {
         if (!renderWasOpenLast && !renderPosUserSet) {
+            // Position the render window flush beside the main menu: left
+            // when there is room, otherwise right.  Width adapts to what
+            // fits on the chosen side; height matches the main menu. This
+            // only happens on the FIRST open; after that the window keeps
+            // whatever position the user dragged it to.
             ImGuiViewport* vp = ImGui::GetMainViewport();
             float mainRight = mainPos.x + mainWindowWidth;
             float screenRight = vp->WorkPos.x + vp->WorkSize.x;
@@ -1197,6 +1343,8 @@ void Gui::draw() {
             ImGui::SetNextWindowSize(ImVec2(rw, rh), ImGuiCond_Always);
             renderPosUserSet = true;
         } else if (!renderWasOpenLast) {
+            // Not the first open: restore the window's own saved position
+            // instead of magnetizing it back next to the main menu.
             ImGui::SetNextWindowPos(renderPos, ImGuiCond_Always);
         }
         renderWasOpenLast = true;
@@ -1206,6 +1354,9 @@ void Gui::draw() {
         renderScrollLocked = false;
     }
 
+    // Save on drag END (edge), not every frame of the drag: while dragging the
+    // positions are already in the in-memory state, and writing ~45 saved keys
+    // per frame to disk was pure IO churn. settingsDirty still saves instantly.
     static bool wasMainDragged = false, wasFeaturesDragged = false,
                 wasRenderDragged = false;
     const bool anyDragging = mainDragged || (featuresWasOpenLast && featuresDragged) ||
@@ -1220,6 +1371,9 @@ void Gui::draw() {
     wasFeaturesDragged = featuresWasOpenLast && featuresDragged;
     wasRenderDragged = renderWasOpenLast && renderDragged;
 
+    // Features is drawn dead-last so that the wheel-consume inside
+    // drawFeaturesWindow (used to step TPS/speed/RNG without the window
+    // scrolling) can't eat the scroll of any other window this frame.
     if (showFeatures) {
         if (!featuresWasOpenLast) {
             ImGui::SetNextWindowPos(ImVec2(mainPos.x + mainWindowWidth + 12.0f, mainPos.y), ImGuiCond_Always);
@@ -1236,6 +1390,10 @@ void Gui::drawFeaturesWindow() {
     auto* engine = ReplayEngine::get();
     ImGui::SetNextWindowSize(ImVec2(400, 440), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(370, 300), ImVec2(570, 820));
+    // Scroll lock is applied from the previous frame's hover state (the wheel
+    // scroll of a window happens during NewFrame, before this draw runs):
+    // hovering a value widget locks the window scroll so the wheel steps the
+    // value instead; moving the mouse off re-enables normal scrolling.
     ImGuiWindowFlags featuresFlags = ImGuiWindowFlags_NoCollapse;
     if (featuresScrollLocked) {
         featuresFlags |= ImGuiWindowFlags_NoScrollWithMouse;
@@ -1252,11 +1410,24 @@ void Gui::drawFeaturesWindow() {
     }
 
     const float wheelDelta = ImGui::GetIO().MouseWheel;
+    // Consume the wheel so the native widgets don't double-step. Safe to zero
+    // globally here because window scroll already happened in NewFrame.
     ImGui::GetIO().MouseWheel = 0.0f;
 
     bool anyValueHovered = false;
 
     if (ImGui::CollapsingHeader("Core", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // While a replay owns the clock (beginReplayAccuracyEnvironment applies
+        // the macro's declared TPS on PLAY), the row shows that LIVE rate with
+        // the toggle ON, and turning the toggle off hands the rate back to the
+        // menu's own value (dropPlaybackTickRateOverride) without disturbing
+        // the replay's accuracy. Outside that, only WRITE engine->tickRate on
+        // an actual edit — writing it every frame (as the old
+        // `engine->tickRate = tpsOn ? tpsValue : 240.0` did) stomps the
+        // macro-declared TPS: a macro recorded at 360 TPS would silently fall
+        // back to 240 the moment the GUI redraws, and so would every render
+        // started while the TPS toggle was off.
+        // SKC playback locks this too, same as the beta GUI.
         const bool isPlaying = engine->engineMode == MODE_EXECUTE ||
             (skkbot2::gui::get().macroBotType == Gui::MacroBotType::SKC &&
              skk::skc::Bot::get().getState() == skk::skc::State::Playback);
@@ -1291,6 +1462,7 @@ void Gui::drawFeaturesWindow() {
             if (ImGui::IsItemHovered() && tpsEnabled) {
                 anyValueHovered = true;
                 if (wheelDelta != 0.0f) {
+                    // Coarse quarter-Hz steps; Shift makes the step 0.001 Hz.
                     tpsValue = std::clamp(
                         tpsValue + (wheelDelta > 0.0f
                             ? (ImGui::GetIO().KeyShift ? 0.001 : 0.25)
@@ -1307,13 +1479,30 @@ void Gui::drawFeaturesWindow() {
         }
         ImGui::TextDisabled("Base: %.0f Hz", ReplayEngine::kBaseTickRate);
 
+        // FPS, directly under TPS for the same reason the beta GUI puts it
+        // there: the two are one decision - TPS sets the LENGTH of a step, FPS
+        // sets how many steps the display gets to run per frame. Unlike TPS it
+        // stays live during playback, because changing the frame rate moves
+        // steps between frames and never touches the step itself.
+        //
+        // 0 is the special value and means "follow TPS": one physics step per
+        // drawn frame. The consequence is written out under the slider rather
+        // than next to the value, where it crowded the number.
         ImGui::SetNextItemWidth(-60.0f);
+        // Locked only while RECORDING; editable during playback, same rule as
+        // the beta GUI. The rate is a display decision, not part of the
+        // recorded input, so changing it mid-run is legitimate; during a
+        // capture it is locked because the macro's stored fps is taken at the
+        // start and a value changed halfway would describe neither half.
         const auto& skcNow = skk::skc::Bot::get();
         const bool fpsRecording = skcNow.isEnabled()
             ? (skcNow.getState() == skk::skc::State::Record)
             : (engine->engineMode == MODE_CAPTURE);
         const bool fpsLocked = fpsRecording;
         const bool fpsMacro = skkbot2::fps::macroHolds();
+        // What the macro put in force. 0 means "follow tps" - showing the tick
+        // rate here would push a pinned number back on the next frame, which
+        // the module reads as a hand edit and then honours over the macro.
         const double macroFpsV =
             skkbot2::fps::target() > 0.0 ? skkbot2::fps::target() : 0.0;
         const bool macroFpsOn = skkbot2::fps::enabled();
@@ -1333,17 +1522,26 @@ void Gui::drawFeaturesWindow() {
             if (ImGui::Checkbox("##fps_enable", &fpsToggle)) {
                 edited = true;
             }
+            // Only a real edit touches the saved setting: writing the macro's
+            // mirrored number into fpsValue would make it the menu's value
+            // after the session, which endMacro() restores over.
             if (edited) {
                 fpsValue = fpsSlider;
                 fpsEnabled = fpsToggle;
                 settingsDirty = true;
             }
+            // Pushed every frame: the module tells a mirror from an edit by
+            // comparing against what the macro set, so the push has to happen
+            // for that comparison to exist.
             skkbot2::fps::setEnabled(fpsToggle);
             skkbot2::fps::setTarget(fpsSlider <= 0.0 ? skkbot2::fps::kFollowTps
                                                       : fpsSlider);
         } else {
             ImGui::Text("FPS: %.3f  (recording)", fpsSlider);
         }
+        // One line, same fact as the beta GUI's suffix: how many physics steps
+        // this frame rate asks for at the current tick rate. With FPS at 0 the
+        // display follows TPS and this reads 1, which is the whole story.
         {
             const double rate = engine->runtimeTickRate();
             const double shown = fpsSlider;
@@ -1354,8 +1552,11 @@ void Gui::drawFeaturesWindow() {
             }
         }
 
+        // LOCK FPS used to live here. See the load path for why it is gone and
+        // why the module is still fed an explicit false.
 
         ImGui::Separator();
+        // Effective game speed: 1.0 while disabled, the slider value when on.
         if (speedhackEnabled) {
             engine->gameSpeed = speedhackValue;
         } else {
@@ -1372,6 +1573,8 @@ void Gui::drawFeaturesWindow() {
         if (ImGui::IsItemHovered() && speedhackEnabled) {
             anyValueHovered = true;
             if (wheelDelta != 0.0f) {
+                // Round to 2 decimals so stepping from 0.99 lands exactly on
+                // 1.00 (float 0.99 + 0.01 would otherwise read as 1.01).
                 speedhackValue = std::max(0.01,
                     std::round((speedhackValue + 0.01 * static_cast<double>(wheelDelta)) * 100.0) / 100.0);
                 engine->gameSpeed = speedhackValue;
@@ -1424,6 +1627,8 @@ void Gui::drawFeaturesWindow() {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Noclip", ImGuiTreeNodeFlags_DefaultOpen)) {
         bool anyNoclip = engine->collisionBypass;
+        // Label must differ from the CollapsingHeader("Noclip") above to avoid
+        // an ImGui ID conflict; ## keeps the visible text but makes the ID unique.
         if (ImGui::Checkbox("Noclip##master", &anyNoclip)) {
             engine->collisionBypass = anyNoclip;
             settingsDirty = true;
@@ -1456,6 +1661,7 @@ void Gui::drawFeaturesWindow() {
         ImGui::Text("Acc: %.2f%%", engine->noclipAccuracyPercent());
     }
 
+    // Persist hover state until the next window draw (controls scroll locking).
     featuresScrollLocked = anyValueHovered;
 
     ImGui::End();
@@ -1474,6 +1680,9 @@ void Gui::drawSettingsWindow() {
     settingsPos = ImGui::GetWindowPos();
     settingsWindowWidth = ImGui::GetWindowWidth();
 
+    // Align the window's right edge 12px left of the main menu on its opening
+    // frame. Done after Begin so the real window width is used (the stored
+    // width is stale on the very first open, which used to offset it further).
     if (!settingsWasOpenLast) {
         ImGui::SetWindowPos(ImVec2(mainPos.x - settingsWindowWidth - 12.0f, mainPos.y));
     }
@@ -1486,6 +1695,8 @@ void Gui::drawSettingsWindow() {
                                        : "Classic menu interface.");
     }
 
+    // Every bind renders from the shared table so this legacy window and the
+    // Beta KEYBIND section can never drift apart.
     if (ImGui::CollapsingHeader("Keybinds", ImGuiTreeNodeFlags_DefaultOpen)) {
         int lastGroup = -1;
         for (int i = 0; i < kBindCount; ++i) {
@@ -1513,6 +1724,7 @@ void Gui::drawSettingsWindow() {
     }
 
     if (ImGui::CollapsingHeader("Persistence", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Toggle hidden while the mode is incomplete (see forced-off in load).
         ImGui::TextDisabled("Persistence mode: temporarily unavailable.");
         ImGui::TextDisabled("Re-enabled once chain capture is verified.");
     }
@@ -1567,6 +1779,8 @@ void Gui::drawMacroListWindow() {
         for (int i = 0; i < static_cast<int>(macros.size()); ++i) {
             ImGui::PushID(i);
             bool selected = (i == selectedMacro);
+            // The list key is "<stem> [<ext>]"; showing it verbatim is what tells a
+            // same-named SKK/SKC pair apart. Displayed as-is.
             const char* label = macros[i].empty() ? "<unnamed>" : macros[i].c_str();
             if (ImGui::Selectable(label, &selected,
                                   kNoPadWithHalfSpacing)) {
@@ -1577,10 +1791,14 @@ void Gui::drawMacroListWindow() {
 
         ImGui::Separator();
 
+        // Loading/deleting during capture: loading would replace the
+        // in-progress activeSk; blocked like Toasty does.
         ImGui::BeginDisabled(selectedMacro < 0 || capturing);
         if (ImGui::Button("Load Selected", ImVec2(145, 0))) {
             if (selectedMacro >= 0 &&
                 selectedMacro < static_cast<int>(macros.size())) {
+                // Split the key: the stem drives loadMacroIntoMemory's file
+                // resolution, the extension tells it WHICH same-named file.
                 const std::string entry = macros[selectedMacro];
                 const std::string nm = ReplayEngine::macroEntryStem(entry);
                 const std::string ex = ReplayEngine::macroEntryExt(entry);
@@ -1601,6 +1819,7 @@ void Gui::drawMacroListWindow() {
             if (selectedMacro >= 0 &&
                 selectedMacro < static_cast<int>(macros.size())) {
                 namespace fs = std::filesystem;
+                // Delete only the selected format, not both same-named files.
                 const std::string delEntry = macros[selectedMacro];
                 const std::string delStem = ReplayEngine::macroEntryStem(delEntry);
                 const std::string delExt = ReplayEngine::macroEntryExt(delEntry);
@@ -1623,8 +1842,13 @@ void Gui::drawMacroListWindow() {
     ImGui::End();
 }
 
+// Shared bind metadata, kept in one place: the KEYBIND rows, the capture
+// persistence and the global key handler all read this.
 static constexpr Gui::BindInfo kBindRows[Gui::kBindCount] = {
     { Gui::Bind::Menu,        "Open Menu",   0x09, 0 },
+    // Right under Open Menu: both are menu-level actions rather than gameplay
+    // assists, and Reset Level only makes sense from inside a level.
+    // Defaults mirror kBindDefs (init()); the `k` field is display-only.
     { Gui::Bind::ResetLevel,  "Reset Level", 0,    0 },
     { Gui::Bind::Record,      "Record",      0,    1 },
     { Gui::Bind::Play,        "Play",        0,    1 },
@@ -1637,6 +1861,9 @@ static constexpr Gui::BindInfo kBindRows[Gui::kBindCount] = {
     { Gui::Bind::LayoutMode,  "Layout Mode", 0,    2 },
 };
 
+// Saved-value key per bind, index-aligned with the Bind enum. Menu and
+// StepForward keep their legacy keys because existing installs already store
+// them there.
 static constexpr const char* kBindSaveKeys[Gui::kBindCount] = {
     "menu_keybind", "keybind_reset_level",
     "keybind_record", "keybind_play", "keybind_step_forward",
@@ -1654,6 +1881,8 @@ void Gui::persistBind(Bind b) {
     if (i < 0 || i >= kBindCount) return;
     const int key = bindKeys[i];
     Mod::get()->setSavedValue(kBindSaveKeys[i], key);
+    // Keep the legacy fields in sync so any code still reading them (and the old
+    // ImGui settings window) sees the same values.
     if (b == Bind::Menu) menuKeybind = key;
     if (b == Bind::StepForward) stepForwardKeybind = key;
 }
@@ -1674,6 +1903,8 @@ bool Gui::transportAllowedFor(Bind b) const {
     const bool renderBusy = skkbot2::render::Renderer::get().isRecording();
     const bool saveBusy = !isSkc && engine->macroSaveBusy();
     const bool listOpen = showMacroList;
+    // The frame stepper drives CCScheduler::update by hand, so playback and
+    // recording cannot share it with it.
     const bool stepperOn = FrameStepper::get().isEnabled();
     const bool hasInputs = isSkc ? bot.hasInputs() : engine->hasMacroInputs();
 
@@ -1684,6 +1915,8 @@ bool Gui::transportAllowedFor(Bind b) const {
         return !recActive && !renderBusy && !saveBusy && !listOpen && !stepperOn &&
                (hasInputs || playActive);
     }
+    // Step keys only make sense while an attempt is running; the stepper's own
+    // guard also rejects them, but gating here avoids consuming the key.
     return true;
 }
 
@@ -1715,6 +1948,12 @@ bool Gui::runBind(Bind b) {
                 return true;
             }
 
+            // STOP path first, deliberately NOT gated. The menu button does the
+            // same: it checks `recActive` before its own enabled state, so a
+            // hotkey must be able to stop what it started. Gating the stop on
+            // saveBusy / renderBusy / stepperOn would make a recording
+            // impossible to stop from the keyboard the moment a background save
+            // or the stepper went active.
             if (engine->engineMode == MODE_CAPTURE) {
                 if (engine->pendingAction == ReplayEngine::PendingAction::Record) {
                     engine->clearPendingAction();
@@ -1738,6 +1977,8 @@ bool Gui::runBind(Bind b) {
             if (PlayLayer::get()) {
                 startRecording(macroName);
             } else if (skk::gameplay::asEditor()) {
+                // captureTick is gated on PlayLayer, so a queued record would
+                // fire in an unrelated later level. Refuse instead of queueing.
                 skkbot2::log::info("RECORD is only available in gameplay levels, not in the editor");
             } else {
                 engine->queueRecord(macroName);
@@ -1751,6 +1992,7 @@ bool Gui::runBind(Bind b) {
                 auto& bot = skk::skc::Bot::get();
                 if (bot.getState() == skk::skc::State::Playback || bot.isPlaybackArmed() ||
                     bot.getPendingAction() == skk::skc::PendingAction::Play) {
+                    // STOP path, ungated and first, same reasoning as RECORD.
                     bot.stop();
                     skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
                     return true;
@@ -1769,6 +2011,7 @@ bool Gui::runBind(Bind b) {
             const bool playActive = engine->engineMode == MODE_EXECUTE ||
                                     engine->pendingPlaybackStart ||
                                     engine->pendingAction == ReplayEngine::PendingAction::Play;
+            // STOP path first and ungated, same reasoning as RECORD above.
             if (playActive) {
                 skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
                 engine->haltExecution();
@@ -1789,6 +2032,9 @@ bool Gui::runBind(Bind b) {
             if (PlayLayer::get()) {
                 armPlayback(macroName);
             } else if (skk::gameplay::asEditor()) {
+                // The engine decides where it is: requestExecutionStart arms in
+                // build mode and the playtest-start hook aligns; already in a
+                // playtest it takes over in place. Never queue for a future level.
                 armPlayback(macroName);
             } else {
                 engine->queuePlayback(macroName);
@@ -1796,6 +2042,11 @@ bool Gui::runBind(Bind b) {
             return true;
         }
 
+        // NOTE: Bind::StepForward and Bind::StepToggle have no case here —
+        // handleKey() handles both directly (with the stepGate check) and
+        // returns before runBind() is reached; runBind() is only called from
+        // handleKey's generic edge path below. Keep them out so the stepGate
+        // rule cannot be bypassed by a future call site.
 
         case Bind::Hitboxes:
             engine->showHitboxes = !engine->showHitboxes;
@@ -1808,6 +2059,8 @@ bool Gui::runBind(Bind b) {
         case Bind::Speedhack: {
             speedhackEnabled = !speedhackEnabled;
             Mod::get()->setSavedValue("gui_speedhack_enabled", speedhackEnabled);
+            // Same one-liner the Speed row uses: when the switch is off the game
+            // speed is pinned to 1.0 regardless of the slider value.
             engine->gameSpeed = speedhackEnabled ? speedhackValue : 1.0;
             skkbot2::Logger::get().info("skkBot2: hotkey Speedhack -> {} ({:.2f}x)",
                                         speedhackEnabled ? "on" : "off", engine->gameSpeed);
@@ -1872,12 +2125,14 @@ bool Gui::runBind(Bind b) {
 }
 
 bool Gui::handleKey(int key, bool down, bool repeat) {
+    // While capturing a new keybind: the next key (or Esc to cancel) sets it.
+    // Single armed slot (kbWaiting) instead of the old per-row bool pair.
     if (kbWaiting >= 0) {
         if (down && !repeat) {
-            if (key == 0x1B) {
+            if (key == 0x1B) { // Escape = cancel
                 kbWaiting = -1;
                 skkbot2::Logger::get().info("skkBot2: keybind capture cancelled");
-            } else if (key == 0x2E) {
+            } else if (key == 0x2E) { // Delete = unbind the armed row
                 const int idx = kbWaiting;
                 bindKeys[idx] = 0;
                 persistBind(static_cast<Bind>(idx));
@@ -1891,30 +2146,40 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
                 persistBind(static_cast<Bind>(idx));
                 kbWaiting = -1;
                 heldBind = -1;
+                // Right-Alt / AltGr can emit several Press events for a single
+                // physical press; lock the toggle until this key is released so
+                // capturing it doesn't immediately close the menu.
                 toggleLockKey = key;
                 skkbot2::Logger::get().info("skkBot2: keybind captured: {} = {}",
                                             kBindRows[idx].label, keyName(key));
             }
         }
-        return true;
+        return true; // consume the key so it doesn't reach the game
     }
 
+    // Releasing the just-captured key clears the toggle lock.
     if (!down && key == toggleLockKey) {
         toggleLockKey = -1;
         return false;
     }
 
+    // Menu toggle. Checked first and matched by INDEX, not by key value, so a
+    // duplicate binding elsewhere can never steal the menu open.
     if (down && !repeat) {
         const int menuIdx = static_cast<int>(Bind::Menu);
         if (bindKeys[menuIdx] != 0 && key == bindKeys[menuIdx]) {
             if (key == toggleLockKey) {
-                return true;
+                return true; // still the same physical press that just captured
             }
             open = !open;
             return true;
         }
     }
 
+    // Every other bind dispatches through the shared table. Step keys are
+    // consumed only while an attempt is actually running: the handler also runs
+    // while the pause menu is up, and a keypress there used to queue frames that
+    // fired the instant the level resumed.
     const bool stepBind = (key == bindKeys[static_cast<int>(Bind::StepForward)] ||
                            key == bindKeys[static_cast<int>(Bind::StepToggle)]);
     bool stepGate = true;
@@ -1930,10 +2195,16 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
         const int bound = bindKeys[i];
         if (bound == 0 || key != bound) continue;
 
+        // StepForward is the one bind that behaves differently on press vs hold:
+        // a press owes exactly one step, holding repeats.
         if (b == Bind::StepForward) {
             if (!stepGate) return true;
             auto& stepper = FrameStepper::get();
-            stepper.setKeyHoldState(down, true);
+            // Hold semantics are the point here: setKeyHoldState(down=true) arms
+            // the stepper's own repeat timer, so every OS repeat advances the
+            // level by one step. This bind therefore wants the repeats and is
+            // intentionally exempt from the heldBind edge guard below.
+            stepper.setKeyHoldState(down, /*forward=*/true);
             if (down && !repeat) {
                 stepper.stepForward();
             }
@@ -1944,6 +2215,7 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
                 heldBind = -1;
                 return true;
             }
+            // Same heldBind edge rule as the plain toggles below.
             if (!down) {
                 heldBind = -1;
                 return true;
@@ -1956,12 +2228,29 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
             return true;
         }
 
+        // Edge detection via heldBind, which means "this bind's key is physically
+        // down RIGHT NOW" and is therefore cleared on release (-1).
+        //
+        // The previous version assigned heldBind = i on RELEASE. That left the
+        // bind looking held, so the next press of the same key was swallowed by
+        // the `repeat && heldBind == i` guard whenever cocos coalesced the
+        // second press into an Action::Repeat — exactly what happens when the
+        // two presses are close together. Result: RECORD started, and pressing R
+        // again within the repeat window did nothing. PLAY only appeared to work
+        // because its presses were far enough apart to arrive as Action::Press.
+        //
+        // Clearing on release makes all three cases correct:
+        //   press (heldBind=-1)  -> fires
+        //   hold  (heldBind==i) -> repeat guard swallows it
+        //   release(heldBind=-1) -> re-arms
+        // The `repeat` flag is never consulted, so a coalesced second press
+        // still fires.
         if (!down) {
             heldBind = -1;
             return true;
         }
         if (heldBind == i) {
-            return true;
+            return true;  // same physical hold, no new edge
         }
         heldBind = i;
         runBind(b);
@@ -1973,6 +2262,8 @@ bool Gui::handleKey(int key, bool down, bool repeat) {
 
 const char* Gui::keyName(int key) {
     switch (key) {
+        // 0 means "unbound". The ASSISTS rows ship unbound, so this must read
+        // as a word rather than fall through to the hex dump at the bottom.
         case 0x00: return "NONE";
         case 0x08: return "Backspace";
         case 0x09: return "Tab";
@@ -2037,7 +2328,7 @@ const char* Gui::keyName(int key) {
         case 0x59: return "Y";
         case 0x5A: return "Z";
         case 0x5B: return "Win";
-        case 0x5C: return "Win";
+        case 0x5C: return "Win";      // right windows key
         case 0x5D: return "Menu";
         case 0x60: return "Num 0";
         case 0x61: return "Num 1";
@@ -2057,12 +2348,12 @@ const char* Gui::keyName(int key) {
         case 0x6F: return "Num /";
         case 0x90: return "Num Lock";
         case 0x91: return "Scroll Lock";
-        case 0xA0: return "Shift";
-        case 0xA1: return "Shift";
-        case 0xA2: return "Ctrl";
-        case 0xA3: return "Ctrl";
-        case 0xA4: return "Alt";
-        case 0xA5: return "Alt";
+        case 0xA0: return "Shift";    // Left Shift
+        case 0xA1: return "Shift";    // Right Shift
+        case 0xA2: return "Ctrl";     // Left Control
+        case 0xA3: return "Ctrl";     // Right Control
+        case 0xA4: return "Alt";      // Left Alt
+        case 0xA5: return "Alt";      // Right Alt
         case 0xB8: return "+";
         case 0xBA: return ";";
         case 0xBC: return ",";
@@ -2078,7 +2369,7 @@ const char* Gui::keyName(int key) {
         case 0x0B3: return "Play/Pause";
         default: break;
     }
-    if (key >= 0x70 && key <= 0x87) {
+    if (key >= 0x70 && key <= 0x87) { // F1..F24
         static thread_local char fbuf[8];
         std::snprintf(fbuf, sizeof(fbuf), "F%d", key - 0x70 + 1);
         return fbuf;
@@ -2089,6 +2380,9 @@ const char* Gui::keyName(int key) {
 }
 
 void registerKeybind(int key) {
+    // Kept as a no-op: the KEYBINDS screen owns all bind registration now
+    // (Gui::persistBind + handleKey capture); nothing registers binds from
+    // outside the GUI anymore.
     static_cast<void>(key);
 }
 

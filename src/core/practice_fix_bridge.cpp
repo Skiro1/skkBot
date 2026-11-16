@@ -165,9 +165,18 @@ SkPracticeFixCheckpoint bundleToWire(
         copyFullP2ToWire(bundle.fullP2, w);
     }
 
-    for (auto* obj : bundle.brokenObjects) {
-        if (obj) {
-            w.brokenObjectUIDs.push_back(static_cast<int32_t>(obj->m_objectID));
+    if (bundle.hasWireBrokenObjects) {
+        w.brokenObjectUIDs = bundle.wireBrokenObjectKeys;
+    } else if (auto* pl = PlayLayer::get(); pl && pl->m_objects) {
+        // m_objectID — тип блока, не идентичность. Отрицательный ключ задаёт
+        // индекс в неизменном массиве объектов уровня; positive legacy — тип.
+        for (auto* obj : bundle.brokenObjects) {
+            for (unsigned i = 0; obj && i < pl->m_objects->count(); ++i) {
+                if (pl->m_objects->objectAtIndex(i) == obj) {
+                    w.brokenObjectUIDs.push_back(-1 - static_cast<int32_t>(i));
+                    break;
+                }
+            }
         }
     }
 
@@ -186,6 +195,9 @@ CheckpointStateBundle wireToBundle(
     bundle.seedState = wire.seedState;
     bundle.shakeRandomState = wire.shakeRandomState;
     bundle.teleportRandomState = wire.teleportRandomState;
+    bundle.rng.fastRandState = wire.seedState;
+    bundle.rng.shakeState = wire.shakeRandomState;
+    bundle.rng.teleportState = wire.teleportRandomState;
     bundle.persistentItems = wire.persistentItems;
     bundle.variance = wire.variance;
     for (int i = 0; i < 6; ++i) bundle.clickReleased[i] = wire.clickReleased[i];
@@ -193,30 +205,48 @@ CheckpointStateBundle wireToBundle(
     bundle.hasFullState = true;
     copyWireToFullP1(wire, bundle.fullP1);
     copyWireToFullP2(wire, bundle.fullP2);
+    // Reduced P2 несёт собственный isSecondPlayer; complete P2 в wire нет.
+    bundle.hasFullPlayer2 = (wire.p2_flags1 & (1ull << 30)) != 0;
 
-    if (auto* pl = PlayLayer::get()) {
-        int resolved = 0;
-        int unresolved = 0;
-        for (int32_t uid : wire.brokenObjectUIDs) {
-            bool found = false;
-            if (pl->m_objects) {
-                auto* arr = pl->m_objects;
+    bundle.hasWireBrokenObjects = true;
+    bundle.wireBrokenObjectKeys = wire.brokenObjectUIDs;
+    return bundle;
+}
+
+void resolveBrokenObjects(CheckpointStateBundle& bundle, GJBaseGameLayer* pl) {
+    if (!bundle.hasWireBrokenObjects || !pl) return;
+    bundle.brokenObjects.clear();
+    int resolved = 0;
+    int unresolved = 0;
+    for (int32_t uid : bundle.wireBrokenObjectKeys) {
+        bool found = false;
+        if (pl->m_objects) {
+            auto* arr = pl->m_objects;
+            if (uid < 0) {
+                const auto index = static_cast<uint32_t>(-1ll - uid);
+                if (index < arr->count()) {
+                    auto* obj = static_cast<GameObject*>(arr->objectAtIndex(index));
+                    if (obj) { bundle.brokenObjects.push_back(obj); found = true; }
+                }
+            } else {
+                GameObject* match = nullptr;
+                bool ambiguous = false;
                 for (unsigned i = 0; i < arr->count(); ++i) {
                     auto* obj = static_cast<GameObject*>(arr->objectAtIndex(i));
                     if (obj && obj->m_objectID == uid) {
-                        bundle.brokenObjects.push_back(obj);
-                        found = true;
-                        break;
+                        if (match) { ambiguous = true; break; }
+                        match = obj;
                     }
                 }
+                // Старый файл не различает одинаковые блоки: не отключаем
+                // случайный первый объект и явно сообщаем потерю покрытия.
+                if (match && !ambiguous) { bundle.brokenObjects.push_back(match); found = true; }
             }
-            if (found) ++resolved; else ++unresolved;
         }
-        skkbot2::log::debug("P1 bridge: wireToBundle tick={} brokenUIDs={} resolved={} unresolved={}",
-            wire.tick, wire.brokenObjectUIDs.size(), resolved, unresolved);
+        if (found) ++resolved; else ++unresolved;
     }
-
-    return bundle;
+    skkbot2::log::info("[CK] broken resolve tick={} keys={} resolved={} unresolved={}",
+        bundle.tick, bundle.wireBrokenObjectKeys.size(), resolved, unresolved);
 }
 
 std::vector<SkPracticeFixCheckpoint> captureRestorePointsToWire(

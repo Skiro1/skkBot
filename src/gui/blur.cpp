@@ -38,13 +38,25 @@ GLuint g_snapshot = 0;
 int    g_snapW    = 0;
 int    g_snapH    = 0;
 bool   g_failed   = false;
+// True once the snapshot has been taken for the current frame. The capture is a
+// full-screen copy, so it is deferred until a blur region actually asks for the
+// pixels - see captureSnapshot() for why that is still a pristine frame.
 bool   g_snapDirty = true;
+// Whether g_snapshot has storage yet. glCopyTexImage2D allocates it as a side
+// effect, glCopyTexSubImage2D does not - and reallocating every frame is the
+// expensive variant.
 bool   g_snapStorage = false;
 
+// Device tilt (parallax input), -1..1. Fed from CMMotionManager on Apple
+// platforms, stays zero elsewhere (and on desktop).
 float g_parX = 0.f;
 float g_parY = 0.f;
 
+// BUG-132 diagnostics (13.11): flat red/green mask tint in the final pass.
 bool g_debugTint = false;
+// BUG-132 decisive probe: screen-px bias added to the blur mask's corner
+// radius (DIAG 4 = +8, DIAG 5 = -8). Sign of the notch's response measures
+// the mask/chrome arc mismatch directly.
 float g_debugRoundBias = 0.0f;
 
 #if defined(__APPLE__)
@@ -83,14 +95,14 @@ void pollParallax() {
     g_parX = std::clamp((float)(roll / 1.2), -1.0f, 1.0f);
     g_parY = std::clamp((float)(pitch / 1.2), -1.0f, 1.0f);
 }
-}
+} // anonymous namespace
 #else
 namespace {
 void pollParallax() {
     g_parX = 0.f;
     g_parY = 0.f;
 }
-}
+} // anonymous namespace
 #endif
 
 struct BlurProgram {
@@ -166,9 +178,18 @@ const char* kUpsampleShader =
     "uniform float u_lens;\n"
     "uniform vec2 u_parallax;\n"
     "uniform float u_gloss;\n"
+    //  Corner fix (BUG: dark corner nubs at all four window edges): the final
+    //  pass now runs with a REPLACING blend, so it also writes the pixels the
+    //  rounded SDF mask covers with 0 — those must show the PRISTINE backdrop
+    //  (the intermediate chain passes deposit opaquely into sub-rects anchored
+    //  at the region's corner and cannot be erased by SRC_ALPHA blending).
+    //  u_snap is the per-frame game snapshot; u_snapUV0/u_snapUVS map the
+    //  region quad's [0..1] v_uv onto that snapshot's sub-rect.
     "uniform sampler2D u_snap;\n"
     "uniform vec2 u_snapUV0;\n"
     "uniform vec2 u_snapUVS;\n"
+    //  1.0 when the snapshot sub-rect is valid (sizes match) and the replace
+    //  composite should sample it; 0.0 falls back to the old alpha blend.
     "uniform float u_replace;\n"
     "uniform float u_debug;\n"
     "uniform float u_liquid;\n"
@@ -197,6 +218,11 @@ const char* kUpsampleShader =
     "    float d = hash21(i + vec2(1.0, 1.0));\n"
     "    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n"
     "}\n"
+    //  Liquid field: low-frequency billowed noise (feTurbulence fractalNoise,
+    //  baseFrequency 0.01 -> a couple of large slow-cresting blobs over the
+    //  panel), two octaves so the crests carry a finer ripple. This single
+    //  field drives BOTH the wave displacement of the sampled backdrop and a
+    //  top-left-light specular sheen (feDisplacementMap + feSpecularLighting).
     "float liquidField(vec2 uv, float t) {\n"
     "    vec2 p = uv * 2.2 + vec2(t * 0.040, t * 0.023);\n"
     "    float n = vnoise(p);\n"
@@ -211,6 +237,9 @@ const char* kUpsampleShader =
     "    float edge = 0.0;\n"
     "    vec2 inwardDir = vec2(0.0);\n"
     "    vec3 rimCol = vec3(0.0);\n"
+    //  Liquid field (feTurbulence): two independently-seeded low-freq noise
+    //  values drive the X and Y wave displacement (feDisplacementMap uses the
+    //  R/G channels), a third pair of samples feed the specular sheen gradient.
     "    float liqX = 0.5;\n"
     "    float liqY = 0.5;\n"
     "    float liqDx = 0.5;\n"
@@ -225,11 +254,26 @@ const char* kUpsampleShader =
     "    if (u_mask > 0.5) {\n"
     "        float d = sdfDist(v_uv);\n"
     "        mask = 1.0 - smoothstep(-1.0, 1.0, d);\n"
+    //  BUG-126: boundary feather. The SDF mask only gives ~1 px of AA, so the
+    //  straight top/bottom/left/right border of the blur region shows a hard
+    //  cut between blurry pixels (full alpha) and the raw backdrop (no glass)
+    //  — reads as an ugly line/band "hugging" the panel edge. Feather the
+    //  mask over ~2.5 px INSIDE every straight boundary so the glass melts
+    //  into the background with zero visible seam. The rounded SDF corners
+    //  already fade over their own arc; both masks compose.
     "        float bordPx = min(min(v_uv.x, 1.0 - v_uv.x) * u_size.x,\n"
     "                             min(v_uv.y, 1.0 - v_uv.y) * u_size.y);\n"
     "        mask *= smoothstep(0.0, 6.0, bordPx);\n"
+    //  Edge-focused glass (hyprglass / iOS): refraction lives in a thin band
+    //  right at the rim with a Gaussian falloff — Snell's law bends most at the
+    //  glancing angles (the exact boundary) and the bend dies out quickly toward
+    //  the panel centre, so the middle of the glass stays flat and clean.
+    //  The dome lens is only a faint interior magnifier, also fading at the rim.
     "        float bezel = max(u_refractBand, 1.0);\n"
     "        edge = exp(-pow(abs(d) / bezel, 2.0));\n"
+    //  Fresnel: reflection grows toward the glancing rim (Schlick, glass/air
+    //  f0 ~ 0.04), so transmission collapses at the very edge — the Snell
+    //  shimmer must die there too, peaking instead just inside the rim.
     "        float fresnelR = 0.04 + 0.96 * pow(edge, 5.0);\n"
     "        float transmit = 1.0 - fresnelR;\n"
     "        vec2 toCentrePx = (vec2(0.5) - v_uv) * u_size;\n"
@@ -246,6 +290,9 @@ const char* kUpsampleShader =
     "        }\n"
     "        sampleUV = v_uv + baseOffset + domeUV;\n"
     "        sampleUV += u_parallax * (2.0 + 22.0 * edge) / u_size;\n"
+    //  Liquid wave displacement (feDisplacementMap scale 150): the backdrop is
+    //  pushed along the noise crests — subtle in the clean centre, full ripple
+    //  near the rim (where the glass is thickest, like a lens slab).
     "        vec2 liqWave = (vec2(liqX, liqY) - 0.5) * mix(0.30, 1.0, edge);\n"
     "        sampleUV += liqWave * u_liquid / u_size;\n"
     "    }\n"
@@ -259,6 +306,11 @@ const char* kUpsampleShader =
     "    sum += texture2D(u_tex, sampleUV + vec2(-u_halfpixel.x, -u_halfpixel.y)) * 2.0;\n"
     "    vec3 col = (sum / 12.0).rgb;\n"
     "    if (u_mask > 0.5) {\n"
+    //  Colour fidelity: the glass body must read as the same backdrop, only
+    //  slightly altered — a "psychophysical" check of Цветопередача. The HDR
+    //  recolor is therefore scaled by `edge`: an honest, near-identical centre
+    //  and a ramp up to the strong tint only at the rim, where the refraction/
+    //  Fresnel/chroma make the edge itself a "glass object".
     "        // Rim dark-leak fix (user report 08.11: dark fringe hugging the\n"
     "        // rounded boundary): the inward refraction/parallax/liquid sample\n"
     "        // displacement is strongest at the rim, so shards of the dark\n"
@@ -284,30 +336,71 @@ const char* kUpsampleShader =
     "        float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
     "        col = mix(vec3(luma), col, vec3(1.0 + 0.50 * hdrBoost));\n"
     "        col = clamp(col * (1.0 + 0.22 * hdrBoost) + vec3(0.03 * hdrBoost), 0.0, 1.0);\n"
+    //  Chromatic aberration at the rim: red and blue refract on a slightly wider
+    //  path than green, mimicking dispersion of the curved glass edge.
     "        if (u_chroma > 0.001) {\n"
     "            vec2 chroma = inwardDir * edge * u_chroma * 10.0 / u_size;\n"
     "            float cw = u_chroma * edge;\n"
     "            col.r = mix(col.r, texture2D(u_tex, sampleUV + chroma).r, cw);\n"
     "            col.b = mix(col.b, texture2D(u_tex, sampleUV - chroma).b, cw);\n"
     "        }\n"
+    //  Fresnel reflection (Отражение): reflectance R = f0 + (1-f0)·(1-cosθ)^5
+    //  climbs toward glancing angles, so the rim stops transmitting and reads
+    //  as a soft neutral mirror streak instead of a coloured glow.
     "        float reflectR = 0.04 + 0.96 * pow(edge, 5.0);\n"
     "        float mirror = reflectR * u_fresnel * 0.12;\n"
     "        vec3 reflectCol = vec3(dot(col, vec3(0.2126, 0.7152, 0.0722))) * 0.5 + vec3(0.10);\n"
     "        col = mix(col, reflectCol, mirror);\n"
+    //  Tyndall effect (Эффект Тиндаля): Rayleigh volume-scattering of the
+    //  colloid body — milky frosted haze deepest in the middle of the glass,
+    //  slightly cool because short wavelengths scatter hardest. Rim stays clear.
     "        float frost = u_gloss * (1.0 - edge) * 0.08;\n"
     "        col = mix(col, vec3(0.90, 0.92, 0.97), frost);\n"
+    //  Refractometry + spectroscopy (Beer–Lambert): n = n0 + a·C, but the
+    //  absorption I = I0·exp(−ε·C·l) grows with the chord length, so the rim
+    //  of the slab is a little deeper and tinted.
+    //  Refractometry (Beer–Lambert) kept but nearly neutral: the glass body
+    //  must NOT darken the backdrop (BUG-117 — the old 0.035 absorption stacked
+    //  with the dark glass base into "too many shades of dark"). A whisper of
+    //  rim-only tint remains so the slab still reads as glass.
     "        col *= exp(-0.008 * edge * 1.4);\n"
+//  Pseudo-random dithering: breaks up banding on the HDR gradients.
     "        col += (randNoise(gl_FragCoord.xy * 1e-3) - 0.5) * u_noise;\n"
+    //  Liquid specular sheen (feSpecularLighting): a soft white glint that
+    //  slides over the crests of the liquid field, lit from above-left like the
+    //  macOS point light (x=-200, y=-200, z=300). Applies to the whole pane,
+    //  slightly stronger at the rim where the surface curves.
     "        vec3 liqN = normalize(vec3(-(liqDx - liqX) * 14.0, -(liqDy - liqY) * 14.0, 1.0));\n"
     "        vec3 liqL = normalize(vec3(-0.35, -0.35, 0.87));\n"
     "        vec3 liqH = normalize(liqL + vec3(0.0, 0.0, 1.0));\n"
     "        float liqSpec = pow(max(dot(liqN, liqH), 0.0), 48.0);\n"
     "        col += vec3(1.0) * liqSpec * u_sheen * mix(0.55, 1.0, edge);\n"
     "        col *= 1.0 - (pow(v_uv.y, 2.0) * edge * edge * 0.03);\n"
+    //  Edge-banding kill (2nd rim blend, user report 08.11: the dark band
+    //  PROTRUDES along ALL FOUR edges, not just the corners - so it is not
+    //  the corner mask at all, it is the rim styling itself: the Fresnel
+    //  mirror pushes neutral-grey across the whole Gaussian edge band
+    //  (bezel up to ~34 px), the chroma smear pulls dark sample colours in,
+    //  and the Beer-Lambert rim tint darkens on top). Re-blend ALL of that
+    //  styling away near the silhouette: within ~0.5 px of the boundary the
+    //  fragment shows the pure undisplaced blur, ramping back to styled
+    //  glass over the next ~8 px. The glass centre keeps its look.
     "        float rf2 = clamp((-rimD - 0.5) / 8.0, 0.0, 1.0);\n"
     "        col = mix(rimCol, col, rf2);\n"
         "        col = clamp(col, 0.0, 1.0);\n"
     "    }\n"
+    //  Corner fix: on the final pass (u_replace > 0.5) we use GL_ONE/GL_ZERO\n"
+    //  blending so every pixel in the quad is overwritten. Outside the rounded\n"
+    //  SDF mask we paste the pristine snapshot instead of leaving intermediate\n"
+    //  Kawase chain artifacts that SRC_ALPHA blending could not erase.\n"
+    //  Corner fix: on the final pass (u_replace > 0.5) we use GL_ONE/GL_ZERO\n"
+    //  blending so every pixel in the quad is overwritten. Outside the rounded\n"
+    //  SDF mask we paste the pristine snapshot. RESTORED 13.11 (BUG-132): the
+    //  experiment of emitting the blurred colour outside the mask (commit
+    //  82b77a9) left the corner chunk as glass WITHOUT the dark shell wash —
+    //  a bright unwashed fringe that read as a punched-out corner. The paste
+    //  makes the chunk show the RAW pristine backdrop, i.e. exactly what the
+    //  background would be without the panel — a seamless rounded corner.\n"
     "    if (u_replace > 0.5) {\n"
     "        vec3 snapCol = texture2D(u_snap, u_snapUV0 + v_uv * u_snapUVS).rgb;\n"
     "        vec3 finalCol = mix(snapCol, col, mask);\n"
@@ -315,6 +408,19 @@ const char* kUpsampleShader =
     "    } else {\n"
     "        gl_FragColor = vec4(col, u_alpha * mask);\n"
     "    }\n"
+    //  BUG-132 diagnostics: flat tint showing the mask geometry. Red = outside
+    //  the rounded SDF mask (pasted / rounded-away zone), green = full glass,
+    //  smooth red->green gradient across the ~1px AA band and the 6px feather.
+    //  BUG-132 diagnostics, v2: the tint now SHOWS CONTENT instead of flat
+    //  fills, so one screenshot answers both open questions:
+    //    mask > 0.9           -> flat bright GREEN (glass fully opaque);
+    //    0.05 < mask <= 0.9   -> flat MAGENTA (the AA band + 6px feather);
+    //    mask <= 0.05         -> the PRISTINE SNAPSHOT as-is — exactly what
+    //                            the paste shows in normal mode. If the notch
+    //                            is visible here, the paste content itself is
+    //                            wrong (stale capture / shadow strokes in the
+    //                            snapshot); if it is clean backdrop, the
+    //                            notch cannot come from the paste.
     "    if (u_debug > 0.5) {\n"
     "        vec3 dcol = texture2D(u_snap, u_snapUV0 + v_uv * u_snapUVS).rgb;\n"
     "        if (mask > 0.9) dcol = vec3(0.05, 1.0, 0.15);\n"
@@ -408,9 +514,25 @@ bool ensureTexture() {
     return true;
 }
 
+// Grab the whole freshly-rendered game frame into g_snapshot.
+//
+// This is a full-screen copy - at 2560x1440 GL_RGB that is 11 MB moved per
+// call - and it used to run on EVERY frame from newFrame(), including while the
+// menu was closed and nothing was blurred. That is pure waste, and on a weak GPU
+// a per-frame full-screen texture reallocation is exactly the kind of thing that
+// shows up as "the game is heavier with skkBot2 loaded than with a light bot".
+//
+// So the copy is deferred to the first blur region of the frame, which is still
+// correct: ImGui does not execute draw commands as they are submitted. The
+// commands are recorded during gui.draw() and run later in RenderDrawData, still
+// before swapBuffers, so the backbuffer at that moment is the untouched game
+// frame - the same argument the old call site made, just evaluated later.
 void captureSnapshot() {
     g_snapDirty = false;
     if (!g_snapshot) return;
+    // Once per frame at most, and only when something is actually blurred - but
+    // a full-screen copy is exactly the kind of cost that has to be measured
+    // rather than assumed, so it is timed here.
     skkbot2::hot::Timed skkbot2Timing(skkbot2::hot::BlurSnap);
 
     GLint viewport[4] = { 0, 0, 0, 0 };
@@ -423,6 +545,9 @@ void captureSnapshot() {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
 
     glBindTexture(GL_TEXTURE_2D, g_snapshot);
+    // SubImage when the size is unchanged: no storage reallocation. CopyImage
+    // only has to run when the window was resized (or on the very first frame),
+    // and it is the call that gives the texture its storage.
     if (g_snapStorage && fbW == g_snapW && fbH == g_snapH) {
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, fbW, fbH);
     } else {
@@ -441,6 +566,7 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
     const size_t index = (size_t)(intptr_t)cmd->UserCallbackData;
     if (index >= g_regions.size()) return;
 
+    // First region of the frame: take the snapshot now, not back in newFrame().
     if (g_snapDirty) captureSnapshot();
 
     if (!ensurePrograms() || !ensureTexture()) return;
@@ -554,6 +680,12 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     };
 
+    // Source the Kawase chain from the per-frame pristine snapshot instead of
+    // the live backbuffer. The snapshot was taken at the very start of the
+    // imgui frame, before any GL geometry was emitted, so the content under the
+    // glass is always this frame's real game pixels — never our own window,
+    // never a partially-updated mid-render buffer, no matter how fast the
+    // window is being dragged. Sample the sub-rect via UVs into the snapshot.
     const bool useSnap = g_snapshot && g_snapW == fbW && g_snapH == fbH;
 
     const float snX = (float)px0 / (float)fbW;
@@ -568,10 +700,19 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
     };
 
     int levels = 1 + (int)(region.radius * 0.5f);
+    // Clamp raised 3 -> 6 (BUG-118): the Solid glass look needs the backdrop
+    // dissolved into pure colour fields. 6 levels sample down to ~1/32
+    // resolution - the requested "a hair stronger" over the 5-level pass.
+    // The guard below keeps the chain from shrinking the working texture
+    // below 8 px, so tiny regions still bail out early.
     levels = std::clamp(levels, 1, 6);
     while (levels > 1 && (std::min(pw, ph) >> levels) < 8)
         levels--;
 
+    // BUG-126: Solid-mode corner diagnosis — once per second, only while the
+    // menu paints blur regions (no traffic when the menu is closed). Real
+    // numbers: SDF corner radius in FB px, Kawase level count, snapshot /
+    // replace corner status on this machine.
     {
         static double sLastCornerLog = 0.0;
         const double nowS = ImGui::GetTime();
@@ -593,6 +734,8 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
 
     glBlendFunc(GL_ONE, GL_ZERO);
 
+    // Bind the snapshot for the first (base) downsample: the shader samples at
+    // v_uv, and the region quad maps 1:1 to the snapshot's sub-rect.
     const auto bindBase = [&] {
         glBindTexture(GL_TEXTURE_2D, g_snapshot);
         g_down.program->use();
@@ -601,6 +744,8 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
             glUniform2f(g_down.locHalfpixel, 0.5f / (float)fbW, 0.5f / (float)fbH);
     };
 
+    // Snap (viewport) mismatch fallback: copy the region straight from the
+    // live backbuffer, as the pre-snapshot versions did.
     if (!useSnap) {
         glBindTexture(GL_TEXTURE_2D, g_texture);
         glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, px0, py0, pw, ph, 0);
@@ -657,6 +802,10 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         if (g_up.locSheen >= 0) glUniform1f(g_up.locSheen, 0.10f);
         if (g_up.locTime >= 0) glUniform1f(g_up.locTime, std::fmod(static_cast<float>(ImGui::GetTime()), 100.0f));
 
+        // Corner fix: on the final upsample pass, switch to REPLACE blending
+        // and feed the pristine snapshot so the shader can paste it into the
+        // corners that the SDF mask rounds away. Without this, intermediate
+        // Kawase chain artifacts remain visible as dark nubs at all four edges.
         const bool useReplace = last && g_snapshot != 0;
         if (useReplace) {
             if (g_up.locSnap >= 0) glUniform1i(g_up.locSnap, 1);
@@ -666,7 +815,7 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, g_snapshot);
             glActiveTexture(GL_TEXTURE0);
-            glBlendFunc(GL_ONE, GL_ZERO);
+            glBlendFunc(GL_ONE, GL_ZERO); // full replace
         } else {
             if (g_up.locReplace >= 0) glUniform1f(g_up.locReplace, 0.0f);
             glBlendFunc(last ? GL_SRC_ALPHA : GL_ONE, last ? GL_ONE_MINUS_SRC_ALPHA : GL_ZERO);
@@ -681,12 +830,19 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         curH = nextH;
     }
 
+    // Restore the caller's active texture unit BEFORE rebinding its texture:
+    // previousTexture was captured on that unit, and the chain forced the
+    // state to unit 0 (glActiveTexture(GL_TEXTURE0) above).
     glActiveTexture(previousActiveTexture);
     glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)previousArray);
     glBindVertexArray((GLuint)previousVao);
     glUseProgram((GLuint)previousProgram);
 
+    // Restore the full 4-factor blend state. The chain sets glBlendFunc,
+    // which writes the same factors into BOTH the RGB and ALPHA slots; a
+    // plain glBlendFunc(restore) on alpha-only reads leaked cocos2d's
+    // premultiplied srcRGB (GL_ONE) into GL_SRC_ALPHA.
     glBlendFuncSeparate(static_cast<GLenum>(previousBlendSrcRGB),
                         static_cast<GLenum>(previousBlendDstRGB),
                         static_cast<GLenum>(previousBlendSrcAlpha),
@@ -696,13 +852,16 @@ void renderRegion(const ImDrawList*, const ImDrawCmd* cmd) {
         glEnable(GL_SCISSOR_TEST);
 }
 
-}
+} // anonymous namespace
 
 namespace skkbot2::gui::blur {
 
 void newFrame() {
     pollParallax();
     g_regions.clear();
+    // Mark this frame's pixels as not captured yet, and copy nothing here. If
+    // no region ends up blurred this frame, no copy happens at all - which is
+    // the normal case, since the menu is closed almost all the time.
     g_snapDirty = true;
     if (!g_failed) {
         if (!ensurePrograms() || !ensureTexture()) return;
@@ -731,4 +890,4 @@ void submit(ImDrawList* list, ImVec2 min, ImVec2 max, float rounding, float radi
     list->AddCallback(renderRegion, (void*)(intptr_t)(g_regions.size() - 1));
 }
 
-}
+} // namespace skkbot2::gui::blur

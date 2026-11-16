@@ -29,6 +29,9 @@ public:
         float rotationTolerance = 0.1f,
         float velocityTolerance = 0.01f
     );
+    // Structural divergence only (mode flags / gravity orientation / death):
+    // used when the per-frame stream owns position+velocity, so GD keeps its
+    // own visual state machines (dash-ring hold, spider flip) intact.
     static bool needsModeReconciliation(
         PlayerObject* player,
         PlayerStateBundle const& state

@@ -1,5 +1,26 @@
 ﻿#pragma once
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Реестр версионно-хрупких мест (version-fragile binary sites).
+//
+// Единая точка правды для всех «голых» адресов GD/cocos: RVA, байтовые
+// сигнатуры, семантика и происхождение. При выходе нового билда GD правится
+// ТОЛЬКО эта таблица — весь остальной код резолвит сайты через
+// skk::offsets::resolve().
+//
+// Правила (см. AGENTS.md, раздел «Реестр офсетов и портирование»):
+//  - хук никогда не вешается на непроверенный байт: быстрый путь — RVA с
+//    побайтовой сверкой сигнатуры, медленный — поиск сигнатуры ТОЛЬКО по
+//    исполняемым секциям модуля;
+//  - data-глобалы RNG (sig == nullptr) верифицируются автоматически при
+//    старте через imul-скан (verifyDataGlobals); field-offsets — ручная
+//    перепроверка при апдейте (офсеты полей сигнатуры не имеют);
+//  - все RVA даны для Windows-билда GD 2.2091 и проверены по байтам
+//    GeometryDash.exe / libcocos2d.dll (сверка по сигнатурам).
+//
+// Как выведено: IDA/декомпилят 2.2091 + байты из живых бинарей
+// (см. docs/Баги.md, docs/Референсы - Изучение.md, docs/Трекер Реализации.md).
+// ─────────────────────────────────────────────────────────────────────────────
 
 #include <Geode/Geode.hpp>
 #include <logger/logger.hpp>
@@ -19,15 +40,29 @@
 namespace skk::offsets {
 
 struct Site {
-    const char* name;
-    uintptr_t rva;
-    const char* sig;
-    const char* semantics;
-    const char* source;
-    const char* module;
+    const char* name;      // стабильный идентификатор
+    uintptr_t rva;         // известный RVA; 0 = только сигнатура
+    const char* sig;       // hex-паттерн, '?' = wildcard; nullptr = data-глобал
+    const char* semantics; // что делает это место в GD
+    const char* source;    // как выведен RVA / сигнатура
+    const char* module;    // "gd" (GeometryDash.exe) или "cocos" (libcocos2d.dll)
 };
 
+// ── Таблица сайтов ──────────────────────────────────────────────────────────
 
+// TPS bypass: call [rax+disp] перед store счётчика ожидаемых тиков
+// (внешний цикл физики). RVA указывает на НАЧАЛО сигнатуры (0x3408D9);
+// сам патч-сайт (store счётчика, IDA: 0x3408DF) = RVA + 6 — так его и
+// использует physicsbypass.cpp (buildExpectedTicksPatch). В 2.2091 на
+// патч-сайте та же инструкция `movss xmm0,[rsi+330h]` (F3 0F 10 86 30 03 00 00).
+// Окно «старой математики» = 0x42 байт (до store `mov [rsp+var_17C],edi`
+// на 0x340921); счётчик в 2.2091 считается в edi (в 2.2081 был r11d и
+// окно 0x43) — трамплин в physicsbypass.cpp учитывает это.
+//
+// ВАЖНО: в physicsbypass.cpp есть ВТОРОЙ ensureExpectedTicksPatch с другой
+// сигнатурой ("F3 0F 58 C8 0F 57 C0 66 0F 3A 0A C1 0B ...") — это Intel-Mac
+// ветка (#else у #ifdef GEODE_IS_WINDOWS), на Windows НЕ компилируется и в
+// реестре не нужен (RVA этого билда — Windows-only).
 inline constexpr Site kTpsExpectedTicks{
     "tps.expected_ticks",
     0x3408D9,
@@ -37,6 +72,11 @@ inline constexpr Site kTpsExpectedTicks{
     "gd",
 };
 
+// Step-grid: запись начального счётчика внутреннего цикла шагов — мидхук сеет
+// принудительное число шагов. В 2.2091 счётчик переехал с edx на r13d:
+// "mov [rsp+0x50], r13d" (44 89 6C 24 50); r13 засеивается из setz по байту
+// [rsi+0x38F0] (half-tick split), цикл do{...}while(r13d<2) — та же математика
+// «сеем 2−N, получаем N итераций», что и в 2.2081.
 inline constexpr Site kStepGridStepCount{
     "step_grid.step_count",
     0x340B18,
@@ -46,6 +86,10 @@ inline constexpr Site kStepGridStepCount{
     "gd",
 };
 
+// Step-grid: пост-цикловое чтение фактически потреблённого времени (xmm9).
+// В 2.2091 сравнение идёт с xmm12 (был xmm14): 41 0F 2F C4 вместо 41 0F 2F C6.
+// xmm9 = var_148 загружается на 0x34186D, корректируется на 0x34188C и
+// потребляется на 0x341BF4 (cvtsd2ss → sub_140366180) — семантика сайта та же.
 inline constexpr Site kStepGridRestoreDt{
     "step_grid.restore_dt",
     0x341BC7,
@@ -55,6 +99,7 @@ inline constexpr Site kStepGridRestoreDt{
     "gd",
 };
 
+// RNG: точка после inline-LCG телепорт-портала (rax держит усечённые 15 бит).
 inline constexpr Site kRngTeleport{
     "rng.teleport_lcg",
     0x31604A,
@@ -64,6 +109,7 @@ inline constexpr Site kRngTeleport{
     "gd",
 };
 
+// RNG: четыре сайта вызова rand() для тряски камеры (Silicate-подход).
 inline constexpr Site kRngShake1{
     "rng.shake_rand_1",
     0x34808A,
@@ -97,6 +143,7 @@ inline constexpr Site kRngShake4{
     "gd",
 };
 
+// Диагностика: GameManager::toggleGameVariable (трассировщик ключей опций).
 inline constexpr Site kToggleGameVariable{
     "diag.toggle_game_variable",
     0x27E770,
@@ -106,6 +153,14 @@ inline constexpr Site kToggleGameVariable{
     "gd",
 };
 
+// ВНИМАНИЕ: этот сайт живёт в МОДУЛЕ COCOS (libcocos2d.dll), а не в GD exe!
+// Резолвить через resolve(site, cocosBase, cocosSize), где cocosBase =
+// geode::base::getCocos(). RVA/сигнатура — из libcocos2d.dll, лежащей рядом
+// с GeometryDash.exe 2.2091.
+// CCString::initWithFormatAndValist: пролог + mov ecx,0x19000 (100 KB
+// буфер, который мы и убираем) + call malloc (disp замаскирован).
+// В 2.2091 изменился assignment регистров: 48 8B E9 49 8B F8 (mov rbp,rcx;
+// mov rdi,r8) и 48 8B F2 (mov rsi,rdx) — был 48 8B F9 49 8B F0 ... 48 8B EA.
 inline constexpr Site kCocosStringInitWithFormat{
     "cocos.ccs_string_init_with_format",
     0x107A0,
@@ -116,8 +171,18 @@ inline constexpr Site kCocosStringInitWithFormat{
     "cocos",
 };
 
+// ── Data-глобалы RNG (верифицируются автоматически через imul-скан) ─────────
 
+// GD+0x90BF68 = primary RNG (GameToolbox::fast_rand: s = 214013*s + 2531011,
+// т.е. 0x343FD/0x269EC3). Верификация: в .text ищутся rip-относительные
+// `imul rax,[rip+disp32],0x343FD` (байты 48 69 mod(rip) disp32 FD 43 03 00),
+// для каждой вычисляется цель = конец инструкции + disp32; глобал считается
+// подтверждённым, если его RVA встречается среди целей.
 inline constexpr uintptr_t kRngPrimaryGlobalRva = 0x90BF68;
+// GD+0x90BFF0 = teleport RNG (inline LCG портала). Перекрёстная проверка:
+// перед сайтом мидхука rng.teleport_lcg (0x31604A) стоит
+// `add eax,0x269EC3; mov [rip+disp],rax`, сохраняющий ровно в 0x90BFF0;
+// imul-сайт (0x316039, конец = 0x316044) указывает туда же.
 inline constexpr uintptr_t kRngTeleportGlobalRva = 0x90BFF0;
 
 inline constexpr Site kRngPrimaryGlobal{
@@ -137,8 +202,16 @@ inline constexpr Site kRngTeleportGlobal{
     "gd",
 };
 
+// ── Field-offsets (офсеты полей объектов; без сигнатуры: перепроверять
+//    вручную при апдейте, биндинги офсеты полей не экспортируют) ─────────────
 
+// GJBaseGameLayer + 0x3358 (13144): байтовый pause/frozen-флаг (0 = пауза).
+// 2.2091: поле сдвинулось с 0x3258 на +0x100 — сверено с началом
+// GJBaseGameLayer::update (0x3407AD/0x3407D6: cmp byte [rsi+0x3358],0;
+// физика идёт при != 0, как и в 2.2081 sub_140237850:205/220).
 inline constexpr uintptr_t kFieldPauseFlagOffset = 13144;
+// GJBaseGameLayer + 0x33A4 (13220): int32 счётчик resume-grace (>=2 = grace).
+// 2.2091: сдвиг с 0x32A4 тоже +0x100 (0x34078F: cmp dword [rsi+0x33A4],0).
 inline constexpr uintptr_t kFieldResumeGraceCtrOffset = 13220;
 
 inline constexpr Site kFieldPauseFlag{
@@ -158,6 +231,21 @@ inline constexpr Site kFieldResumeGraceCtr{
     "gd",
 };
 
+// ── UILayer keyDown/handleAction (BUG-105b, 05.11) ──────────────────────────
+//
+// UILayer 2.2091 — ромб: `class UILayer : CCLayerColor, CCKeyboardDelegate`,
+// CCKeyboardDelegate приходит дважды (через CCLayer-цепочку на +0x158 и
+// напрямую на +0x220). Ванильный CCKeyboardDispatcher вызывает методы через
+// подобъект +0x158 (vtable 0x140834998: slot0=keyDown 0x6711b0 напрямую,
+// slot2=handleAction 0x6713c0 напрямую), и реализации ожидают this=+0x158.
+// Geode при вызове оригинала из $modify подставляет this прямого базового
+// подобъекта (+0x220) → handleAction читает [this+0x100]=[UILayer+0x320] за
+// пределами объекта (0x290) → краш на любом игровом keybind-действии
+// (10001..10030: прыжок и пр.), а keyDown читает [UILayer+0x2E8] — мусор
+// кучи (краши Escape 0xFFFF..FF). Поэтому оригиналы вызываются НАПРЯМУЮ
+// (replay_engine.cpp, MacroUiInputWall) с валидированным this+0x158.
+// keyDown 2.2091 обрабатывает только Escape: форвардит action 10009
+// (пауза) через vtable по [this+0xc8] = [UILayer+0x220].
 inline constexpr Site kUiLayerKeyDown{
     "uilayer.key_down",
     0x6711b0,
@@ -206,6 +294,7 @@ inline constexpr const Site* kSites[] = {
     &kCocosDispatchToTopDelegate,
 };
 
+// ── Сканер (общий для всех пользователей реестра) ───────────────────────────
 
 inline void parsePattern(std::string_view text, std::vector<uint8_t>& bytes,
                          std::vector<bool>& mask) {
@@ -241,6 +330,7 @@ inline bool matchesAt(const uint8_t* addr, std::string_view sig) {
     return true;
 }
 
+// Размер PE-модуля по заголовку (работает и для GD exe, и для cocos dll).
 inline size_t moduleSizeOf(uint8_t* base) {
 #ifdef GEODE_IS_WINDOWS
     if (!base) return 0;
@@ -253,7 +343,13 @@ inline size_t moduleSizeOf(uint8_t* base) {
 #endif
 }
 
+// ── Верификация data-глобалов через imul-скан ───────────────────────────────
 
+// Диапазоны исполняемых секций PE-модуля (для медленного пути резолва и
+// imul-скана: работаем только по коду, случайное совпадение в .data/.rdata
+// не должно приводить к хуку на данные или ложной верификации). Если
+// заголовок нечитаем — пустой вектор, вызывающий код откатывается на скан
+// всего модуля.
 inline std::vector<std::pair<size_t, size_t>> executableSections(uint8_t* base, size_t size) {
     std::vector<std::pair<size_t, size_t>> out;
 #ifdef GEODE_IS_WINDOWS
@@ -275,8 +371,18 @@ inline std::vector<std::pair<size_t, size_t>> executableSections(uint8_t* base, 
     return out;
 }
 
+// GameToolbox::fast_rand: s = 214013*s + 2531011 (0x343FD/0x269EC3). Компилятор
+// кодирует умножение как `imul r64, [rip+disp32], 0x343FD` —
+// байты: 48 69 <modrm c mod=00,rm=101> disp32 FD 43 03 00 (11 байт).
+// Цель ссылки = (адрес инструкции + 11) + disp32. Собираем все цели в .text:
+// если RVA глобала встречается среди целей — глобал подтверждён байтами.
+// В 2.2091: 0x90BF68 ← 6 сайтов, 0x90BFF0 ← 1 сайт (0x316039), также
+// находятся 0x90BFA8/0x90BFD8/0x90C080/0x90C088 (другие LCG-потоки GD).
 inline bool verifyDataGlobals(const Site& site, uint8_t* base, size_t size) {
     if (!base || size == 0 || site.sig != nullptr) return false;
+    // Паттерн imm32 0x343FD в конце imul: сканируем грубо (быстрее и проще,
+    // чем полный дизасемблер): ищем FD 43 03 00, затем проверяем байты
+    // imul перед disp32. Скан только по исполняемым секциям (как в resolve).
     static constexpr uint8_t kImm[4] = {0xFD, 0x43, 0x03, 0x00};
     const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(base);
     auto ranges = executableSections(base, size);
@@ -285,6 +391,7 @@ inline bool verifyDataGlobals(const Site& site, uint8_t* base, size_t size) {
         if (len < 11) continue;
         for (size_t i = start; i + 11 <= start + len; ++i) {
             if (std::memcmp(base + i, kImm, 4) != 0) continue;
+            // imm32 на i; disp32 на i-4; перед ним modrm: 48 69 <mod=00,rm=101>
             if (i < 7) continue;
             const uint8_t rex = base[i - 7];
             const uint8_t op = base[i - 6];
@@ -300,9 +407,14 @@ inline bool verifyDataGlobals(const Site& site, uint8_t* base, size_t size) {
     return false;
 }
 
+// Резолв сайта: быстрый путь — RVA с побайтовой сверкой; медленный — поиск
+// сигнатуры по исполняемым секциям модуля. Несколько совпадений: берём
+// ближайшее к известному RVA и помечаем неоднозначность. Хук не вешается на
+// непроверенный байт — при отсутствии и RVA-совпадения, и сигнатуры сайт
+// считается не найденным (fail-closed у вызывающего кода).
 inline std::optional<uintptr_t> resolve(const Site& site, uint8_t* base, size_t size) {
     if (!base || size == 0) return std::nullopt;
-    if (site.sig == nullptr) return std::nullopt;
+    if (site.sig == nullptr) return std::nullopt;  // data-глобал: без сигнатуры не резолвим
 
     if (site.rva != 0 && site.rva + 32 < size &&
         matchesAt(base + site.rva, site.sig)) {
@@ -315,6 +427,8 @@ inline std::optional<uintptr_t> resolve(const Site& site, uint8_t* base, size_t 
     const size_t patLen = bytes.size();
     if (size < patLen) return std::nullopt;
 
+    // Диапазоны скана: исполняемые секции; при невозможности разобрать
+    // заголовок — весь модуль (поведение прежнее, но с warn).
     std::vector<std::pair<size_t, size_t>> ranges = executableSections(base, size);
     if (ranges.empty()) {
         skkbot2::log::warn(
@@ -359,6 +473,10 @@ inline std::optional<uintptr_t> rvaOf(const Site& site, uint8_t* base, size_t si
     return *addr - reinterpret_cast<uintptr_t>(base);
 }
 
+// Отчёт при старте: печатает статус каждого сайта. Возвращает число
+// проблемных. GD-сайты резолвятся по модулю игры, cocos-сайты — по
+// libcocos2d.dll. Data-глобалы RNG верифицируются imul-сканом (не
+// подтверждён = проблема); field-offsets печатаются как ручные.
 inline int logReport() {
     auto* gdBase = reinterpret_cast<uint8_t*>(geode::base::get());
     auto* cocosBase = reinterpret_cast<uint8_t*>(geode::base::getCocos());
@@ -382,6 +500,8 @@ inline int logReport() {
             continue;
         }
         if (site->sig == nullptr) {
+            // data-глобалы RNG верифицируются автоматически через imul-скан;
+            // field-offsets (офсеты полей) — только ручная перепроверка.
             const bool isField = std::string_view(site->name).starts_with("field.");
             if (isField) {
                 skkbot2::log::info(
@@ -418,4 +538,4 @@ inline int logReport() {
     return problems;
 }
 
-}
+}  // namespace skk::offsets

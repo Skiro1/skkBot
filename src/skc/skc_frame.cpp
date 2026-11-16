@@ -15,4 +15,4 @@ void FrameClock::reset() {
     m_frame = 0;
 }
 
-}
+} // namespace skk::skc

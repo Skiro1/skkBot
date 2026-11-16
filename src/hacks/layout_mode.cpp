@@ -1,4 +1,27 @@
-﻿
+﻿// Layout Mode — strips a level down to its gameplay layout ("blueprint mode"):
+// decorations and colour triggers disappear, every object loses its authored
+// colours and glow, and the background / ground / line / middleground are
+// repainted to a flat palette so only the geometry and hitboxes read.
+//
+// Reversible Architecture (Echo/Gucci/Toasty pattern):
+// - NEVER drop objects in addObject: all objects are added to PlayLayer so GD's
+//   level state, trigger dispatch, and object indices are completely preserved.
+// - Dynamic toggle: can be turned ON/OFF anytime during gameplay without breaking
+//   level objects or leaving permanent visual glitches.
+// - Comprehensive decoration coverage: 5..4385 ID sets from Echo/Eclipse/Toasty/GDH
+//   plus trigger IDs, pulse/opacity effect suppression, gradient command suppression,
+//   custom shaders suppression, and glitter particle toggle.
+// - 2.2 Object Stripe / Line Artifact Fix:
+//   * Explicitly hides m_glowSprite on all objects (and hooks GameObject::addGlow so newly
+//     created glow sprites in 2.2 don't batch-render as stretched stripes).
+//   * Never blindly forces setChildColor on 2.2 composite objects with decorative child sprites;
+//     only sets color on solid object and its direct color sprites.
+//   * Suppresses 2.2 line/middleground strip artifacts and custom particle effects.
+// - All modified objects (hidden decorations, glow/color overrides, glowSprite visibility)
+//   have their original state remembered and fully restored when toggled OFF or exiting level.
+// - Full color restoration: original ColorAction states and sprite colors are saved
+//   on ON and restored on OFF, followed by re-evaluation so the level's real colors
+//   immediately return without needing a level reload.
 
 #include <Geode/Geode.hpp>
 #include <Geode/binding/AudioLineGuideGameObject.hpp>
@@ -33,6 +56,7 @@ using namespace geode::prelude;
 
 namespace skk::layout_mode {
 
+// Flat "blueprint" palette.
 constexpr int kBackground = 1000;
 constexpr int kGround     = 1001;
 constexpr int kLine       = 1002;
@@ -45,6 +69,9 @@ const ccColor3B kGroundColor{0, 102, 255};
 const ccColor3B kLineColor{255, 255, 255};
 const ccColor3B kMiddleColor{40, 125, 255};
 
+// Engine-driven palette: the GUI exposes R/G/B fields for background and
+// ground (the constants above are only the fallback defaults). Line stays
+// white, middleground follows the background channel like every reference.
 inline GLubyte paletteByte(int v) {
     return static_cast<GLubyte>(std::clamp(v, 0, 255));
 }
@@ -62,6 +89,9 @@ inline ccColor3B engineGroundColor() {
             paletteByte(engine->layoutModeGroundG),
             paletteByte(engine->layoutModeGroundB)};
 }
+// "Use Regular Background" (Echo layout.cpp / Silicate PlayLayer.cpp): keep
+// the authored background + middleground channels (1000/1013/1014) and the
+// middleground layer visible while everything else flattens.
 inline bool regularBgOn() {
     auto* engine = ReplayEngine::get();
     return engine && engine->layoutModeRegularBg;
@@ -72,6 +102,8 @@ bool on() {
     return engine && engine->layoutMode;
 }
 
+// Well-known visual/color triggers that should be hidden in layout mode
+// (from Echo, GDH, and GucciBot catalogs).
 const std::unordered_set<int>& triggerHideIds() {
     static const std::unordered_set<int> ids{
         29, 30, 32, 33, 104, 105, 221, 717, 718, 743, 744, 899, 900, 915,
@@ -83,6 +115,7 @@ const std::unordered_set<int>& triggerHideIds() {
     return ids;
 }
 
+// Comprehensive decoration IDs catalog (from GDH / Eclipse / Toasty catalog)
 const std::unordered_set<int>& decorationHideIds() {
     static const std::unordered_set<int> ids{
         5, 15, 16, 17, 18, 19, 20, 21, 41, 48, 49, 50, 51, 52, 53, 54, 60, 73, 80, 85, 86, 87, 97, 106, 107, 110, 113, 114, 115, 120,
@@ -246,6 +279,7 @@ const std::unordered_set<int>& decorationHideIds() {
     return ids;
 }
 
+// Checkpoint / player coins / essential gameplay objects that must NEVER be hidden as decoration
 bool isGameplayException(int objectId) {
     return objectId == 38 || objectId == 44 || objectId == 747 || objectId == 749;
 }
@@ -300,6 +334,7 @@ bool isExplicitGameplayObject(GameObject* object) {
         case GameObjectType::SoloPortal:
             return true;
         case GameObjectType::Modifier:
+            // Specific 2.2 modifier rings/speed triggers
             switch (object->m_objectID) {
                 case 200:
                 case 201:
@@ -319,16 +354,19 @@ bool shouldHideObject(GameObject* object) {
     if (!object) return false;
     if (isGameplayException(object->m_objectID)) return false;
 
+    // Check triggers first
     if (triggerHideIds().contains(object->m_objectID) || object->m_isTrigger) {
         return true;
     }
 
+    // 2.2 guideline / audio line guide
     if (object->m_objectID == 3032 ||
         typeid(*object) == typeid(AudioLineGuideGameObject) ||
         object->m_isUIObject) {
         return true;
     }
 
+    // Check comprehensive decoration IDs or GD Decoration type
     if (object->m_objectType == GameObjectType::Decoration ||
         object->m_isDecoration ||
         object->m_isDecoration2 ||
@@ -342,6 +380,7 @@ bool shouldHideObject(GameObject* object) {
         return false;
     }
 
+    // 2.2 guideline/middleground/extra non-gameplay objects
     if (object->m_objectType == GameObjectType::Modifier ||
         object->m_objectType == GameObjectType::Special ||
         object->m_objectType == GameObjectType::EnterEffectObject) {
@@ -387,11 +426,14 @@ struct SavedColorAction {
     float currentOpacity = 1.0f;
 };
 
+// Global state tracking for reversibility
 static std::unordered_map<GameObject*, HiddenObjectOriginalState> s_hiddenObjectsState;
 static std::unordered_map<GameObject*, ObjectOriginalState> s_modifiedSolidObjects;
 static std::unordered_map<int, SavedColorAction> s_originalColorActions;
 static std::unordered_map<size_t, std::pair<ccColor3B, float>> s_originalSpriteColors;
 static bool s_isStyled = false;
+// Tracks whether the styling pass ran with Default Art: drives the live
+// toggle transition (restyle on → hide originals, off → restore them).
 static bool s_artApplied = false;
 
 void paintColors(PlayLayer* play) {
@@ -404,11 +446,15 @@ void paintColors(PlayLayer* play) {
     constexpr std::array<int, 6> ids{
         kBackground, kGround, kGroundAlt, kLine, kMiddle, kMiddleAlt
     };
+    // Regular BG keeps the authored background/middleground channels: their
+    // ColorActions and sprites are left untouched (no repaint, no opacity
+    // override), exactly like Silicate's regularBG gate.
     const auto bgChannel = [regularBg](int id) {
         return regularBg && (id == kBackground || id == kMiddle ||
                              id == kMiddleAlt);
     };
 
+    // Save original ColorAction states once when activating
     if (s_originalColorActions.empty()) {
         for (int id : ids) {
             auto* action = effects->getColorAction(id);
@@ -447,6 +493,7 @@ void paintColors(PlayLayer* play) {
         }
     }
 
+    // Also paint and override m_colorActionSpriteVector channels
     auto& sprites = effects->m_colorActionSpriteVector;
     if (s_originalSpriteColors.empty() && !sprites.empty()) {
         for (size_t id = 1; id < sprites.size(); ++id) {
@@ -486,9 +533,18 @@ void paintColors(PlayLayer* play) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Default Art (Echo layout.cpp): every block / slope / spike / saw is redrawn
+// as the standard GD object sized to its REAL hitbox, on a dedicated art layer
+// just below the player z-order. The original sprites are hidden persistently
+// (blocks/slopes/spikes) or suppressed per-frame (saws). Purely visual.
+// ---------------------------------------------------------------------------
 
 bool defaultArtOn();
 
+// Objects replaced by the art layer. Solid/Slope always; hazard spikes (no
+// radius) too; saws (radius > 0) keep their original styled sprite and are
+// suppressed per-frame by the draw pass instead.
 bool replacedByDefaultArt(GameObject* object) {
     if (!object || !on() || !defaultArtOn()) return false;
     switch (object->m_objectType) {
@@ -506,9 +562,9 @@ bool replacedByDefaultArt(GameObject* object) {
 struct ArtPiece {
     CCSpriteFrame* frame = nullptr;
     float width = 0.f, height = 0.f, radius = 0.f;
-    bool twoHalves = false;
+    bool twoHalves = false;  // saw is drawn as two half-turn sprites
     CCSpriteFrame* fillFrame = nullptr;
-    int batch = 0;
+    int batch = 0;  // 0 = blocks, 1 = slopes, 2 = spikes/saws
 };
 
 struct ArtState {
@@ -542,6 +598,8 @@ static ArtState& artState(PlayLayer* play) {
                            false, frameOf("triangle_a_04_001.png"), 1};
         g_art = state;
     }
+    // Calibrate the spike body and the saw radius against the level's own
+    // vanilla objects (IDs 8 / 88): their authored hitboxes define the scale.
     if (play && state.measuredLevel != play && play->m_objects) {
         state.measuredLevel = play;
         bool spike = false, saw = false;
@@ -574,6 +632,9 @@ struct ArtNodes {
 };
 
 static ArtNodes g_artNodes;
+// Originals hidden by the art layer + their captured colour channels, so the
+// refresh (toggle OFF) can put them back and the draw pass can skip solids the
+// level itself made invisible.
 static std::unordered_set<GameObject*> s_artHidden;
 static std::unordered_map<GameObject*, std::pair<int, int>> s_artChannels;
 
@@ -594,6 +655,9 @@ void resetDefaultArt() {
     s_artChannels.clear();
 }
 
+// Toggle Default Art OFF while Layout Mode stays ON: put the hidden originals
+// back, drop the art nodes, and force a fresh styling pass so the blueprint
+// recolour returns immediately.
 void refreshDefaultArt(PlayLayer* play) {
     for (auto* obj : s_artHidden) {
         auto it = s_hiddenObjectsState.find(obj);
@@ -653,6 +717,7 @@ void drawDefaultArt(PlayLayer* play) {
         return;
     }
 
+    // (Re)create the three art containers below the player z-order.
     if (!g_artNodes.nodes[0] || g_artNodes.play != play) {
         resetDefaultArt();
         g_artNodes.play = play;
@@ -791,6 +856,8 @@ void drawDefaultArt(PlayLayer* play) {
         if (object->m_colorSprite) object->m_colorSprite->setVisible(false);
         if (object->m_glowSprite) object->m_glowSprite->setVisible(false);
 
+        // Palette: gameplay solids read blue (the ground colour), hazards and
+        // slope fills read black — consistent with the blueprint styling.
         ccColor3B color = solidCol;
         if (hazard) color = black;
 
@@ -808,6 +875,8 @@ void drawDefaultArt(PlayLayer* play) {
             rotX = rotY = 0.f;
             flipX = flipY = false;
         }
+        // Rotations that are whole 90° steps become scale swaps: the block
+        // sprite is square, so a quarter-turn is just a transpose.
         if (piece == &art.block && rotX == rotY) {
             const float turns = rotX / 90.f;
             const float nearest = std::round(turns);
@@ -836,6 +905,8 @@ void drawDefaultArt(PlayLayer* play) {
         if (piece->twoHalves) drawSprite(piece->frame, 180.f, color);
     };
 
+    // Walk only the sections on screen (the same buckets GD's own visibility
+    // culling uses), plus GD's moving-objects list.
     auto& sections = play->m_sections;
     auto& sizes = play->m_sectionSizes;
     const float xFactor =
@@ -866,6 +937,7 @@ void drawDefaultArt(PlayLayer* play) {
     for (int i = 0; i < moving; ++i)
         drawObjectArt(play->m_calcNonEffectObjects[static_cast<std::size_t>(i)]);
 
+    // Park the pooled sprites the frame did not use.
     for (int batch = 0; batch < 3; ++batch)
         for (std::size_t i = g_artNodes.used[batch];
              i < g_artNodes.pools[batch].size(); ++i)
@@ -875,10 +947,12 @@ void drawDefaultArt(PlayLayer* play) {
 void applyLayout(PlayLayer* play) {
     if (!play || !play->m_objects) return;
 
+    // Toggle OFF transition: restore all objects and colors
     if (!on()) {
         if (!s_isStyled) return;
         resetDefaultArt();
 
+        // 1. Restore hidden objects completely
         for (const auto& [obj, orig] : s_hiddenObjectsState) {
             if (obj) {
                 obj->m_isHide = orig.isHide;
@@ -902,6 +976,7 @@ void applyLayout(PlayLayer* play) {
         }
         s_hiddenObjectsState.clear();
 
+        // 2. Restore modified solid/gameplay objects
         for (const auto& [obj, orig] : s_modifiedSolidObjects) {
             if (obj) {
                 obj->m_isHide = orig.isHide;
@@ -930,16 +1005,19 @@ void applyLayout(PlayLayer* play) {
                 obj->setColor(orig.color);
                 obj->setChildColor(orig.color);
 
+                // Re-evaluate object colors through GD's internal coloring pipeline
                 play->manualUpdateObjectColors(obj);
             }
         }
         s_modifiedSolidObjects.clear();
 
+        // 3. Restore middleground visibility
         play->toggleMGVisibility(true);
         if (play->m_middleground) {
             play->m_middleground->setVisible(true);
         }
 
+        // 4. Restore original ColorAction states
         if (play->m_effectManager) {
             for (const auto& [id, orig] : s_originalColorActions) {
                 auto* action = play->m_effectManager->getColorAction(id);
@@ -952,6 +1030,7 @@ void applyLayout(PlayLayer* play) {
             }
             s_originalColorActions.clear();
 
+            // 5. Restore original sprite action colors
             auto& sprites = play->m_effectManager->m_colorActionSpriteVector;
             for (const auto& [id, orig] : s_originalSpriteColors) {
                 if (id < sprites.size() && sprites[id]) {
@@ -961,10 +1040,12 @@ void applyLayout(PlayLayer* play) {
             }
             s_originalSpriteColors.clear();
 
+            // Force full recalculation of colors in effect manager
             play->m_effectManager->calculateBaseActiveColors();
             play->m_effectManager->processColors();
         }
 
+        // 6. Reset m_keyPulses and gradient layers
         std::fill(play->m_keyPulses.m_bits.begin(), play->m_keyPulses.m_bits.end(), 0u);
         play->resetGradientLayers();
 
@@ -974,8 +1055,12 @@ void applyLayout(PlayLayer* play) {
         return;
     }
 
+    // Toggle ON: paint colors every frame
     paintColors(play);
 
+    // Live Default Art toggle: switching it while Layout Mode is already
+    // styled forces a fresh styling pass (hide originals → art takes over),
+    // or restores the hidden originals back to the blueprint recolour.
     if (s_isStyled) {
         const bool artOn = defaultArtOn();
         if (artOn && !s_artApplied) {
@@ -987,8 +1072,14 @@ void applyLayout(PlayLayer* play) {
         }
     }
 
+    // Middleground follows Regular BG every frame, so a live toggle of the
+    // option while Layout Mode is already styled flips the layer too
+    // (Silicate hides/shows MG through the same gate).
     const bool keepMG = regularBgOn();
 
+    // If objects are already styled, keep middleground hidden, run the
+    // Default Art draw pass (it owns the per-frame suppression + pooled
+    // sprites), and return.
     if (s_isStyled) {
         play->toggleMGVisibility(keepMG);
         if (play->m_middleground) {
@@ -1003,6 +1094,7 @@ void applyLayout(PlayLayer* play) {
     s_hiddenObjectsState.clear();
     s_modifiedSolidObjects.clear();
 
+    // Hide middleground layer
     play->toggleMGVisibility(keepMG);
     if (play->m_middleground) {
         play->m_middleground->setVisible(keepMG);
@@ -1046,6 +1138,10 @@ void applyLayout(PlayLayer* play) {
                 obj->m_particle->setVisible(false);
             }
         } else if (replacedByDefaultArt(obj)) {
+            // Default Art: hide the original sprite entirely — the per-frame
+            // art pass draws the standard object in its place, scaled to the
+            // real hitbox. Capture the colour channels BEFORE wiping them so
+            // the draw pass can still skip solids the level made invisible.
             s_artChannels[obj] = {obj->m_activeMainColorID,
                                   obj->m_activeDetailColorID};
 
@@ -1063,7 +1159,7 @@ void applyLayout(PlayLayer* play) {
             s_artHidden.insert(obj);
 
             obj->m_isHide = true;
-            obj->setVisible(true);
+            obj->setVisible(true);  // keeps object ticking for culling buckets
             obj->setOpacity(0);
             if (obj->m_glowSprite) {
                 obj->m_glowSprite->setVisible(false);
@@ -1072,6 +1168,7 @@ void applyLayout(PlayLayer* play) {
                 obj->m_colorSprite->setVisible(false);
             }
         } else {
+            // Solid/gameplay object: capture original state
             ObjectOriginalState orig;
             orig.isHide = obj->m_isHide;
             orig.isVisible = obj->isVisible();
@@ -1099,6 +1196,7 @@ void applyLayout(PlayLayer* play) {
 
             s_modifiedSolidObjects[obj] = orig;
 
+            // Apply blueprint styling
             obj->m_isHide = false;
             obj->setVisible(true);
             obj->m_hasNoGlow = true;
@@ -1121,6 +1219,8 @@ void applyLayout(PlayLayer* play) {
                           obj->m_objectType == GameObjectType::AnimatedHazard;
             ccColor3B blueprintColor = hazard ? ccColor3B{0, 0, 0} : groundCol;
             obj->setColor(blueprintColor);
+            // In 2.2, many objects have decorative multi-part children (e.g. outline trims).
+            // Only set child color if there is no decorative child that forms line stripes.
             if (!obj->m_hasCustomChild) {
                 obj->setChildColor(blueprintColor);
             }
@@ -1130,6 +1230,7 @@ void applyLayout(PlayLayer* play) {
         }
     }
 
+    // Invalidate active enter/gradient effects to prevent stretched 2.2 line artifacts
     play->resetGradientLayers();
 
     skkbot2::Logger::get().info("skkBot2: Layout Mode styled {} objects ({} hidden, {} solid styled, {} default art)",
@@ -1147,7 +1248,7 @@ void clearState() {
     resetDefaultArt();
 }
 
-}
+}  // namespace skk::layout_mode
 
 class $modify(LayoutModePlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool dontCreateObjects) {
@@ -1171,12 +1272,15 @@ class $modify(LayoutModePlayLayer, PlayLayer) {
     }
 
     void addObject(GameObject* obj) {
+        // ALWAYS pass through to PlayLayer so GD's object list, triggers, and indices
+        // are never corrupted or lost!
         PlayLayer::addObject(obj);
 
         if (!skk::layout_mode::on() || !obj) {
             return;
         }
 
+        // If layout mode is already active at load time, hide decoration/triggers right away
         if (skk::layout_mode::shouldHideObject(obj)) {
             skk::layout_mode::HiddenObjectOriginalState orig;
             orig.isHide = obj->m_isHide;
@@ -1199,7 +1303,24 @@ class $modify(LayoutModePlayLayer, PlayLayer) {
     }
 };
 
+// BUG-120 (B) 09.11: addGlow hook DISABLED. Memtrack proved the std::string
+// buffer of each addGlow call is destroyed TWICE inside the geode modifier
+// machinery (bt1 = our override _Tidy_deallocate, bt2 = AsStaticFunction
+// wrapper _Tidy_deallocate, same ptr, ~same epoch) - every level load runs
+// thousands of these, corrupting the heap; the PointNode deleting-dtor crash
+// later in the session is the visible consequence, not the cause.
+// Re-enable after the geode-modifier std::string-by-value ABI is proven
+// (e.g. upstream fix or a signature change to ZStringView in 2.2091
+// bindings). Until then Layout Mode may keep the glow sprite of hidden
+// objects visible - purely cosmetic.
+// class $modify(LayoutModeGameObject, GameObject) {
+//     void addGlow(std::string frame) {
+//         GameObject::addGlow(std::move(frame));
+//         ... (kept in git history)
+//     }
+// };
 
+// Repaints the level background / ground / line / middleground when active.
 class $modify(LayoutModeGJBaseGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -1245,6 +1366,8 @@ class $modify(LayoutModeGJBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
+        // Always call through: skipping it would bypass GD's colour bookkeeping
+        // and leave the layer's internal colour state stale.
         GJBaseGameLayer::updateColor(color, fadeTime, colorID, blending, opacity,
                                      copyHSV, colorIDToCopy, copyOpacity,
                                      callerObject, unk1, unk2);

@@ -1,5 +1,6 @@
 #include "skc_bot.hpp"
 #include "core/physical_keys.hpp"
+#include "core/seam_phase_probe.hpp"
 #include "skc_checkpoint.hpp"
 #include "skc_rng.hpp"
 #include "utils.hpp"
@@ -25,9 +26,29 @@ namespace skk::skc {
 
 namespace {
 
+// BUG-166: qualified handleButton снаружи его хука снова входит в capture.
+// Гейт живёт только на стеке внутреннего вызова, не образует окно по кадрам
+// и не меняет раскладку Bot. Счётчик сохраняет корректность вложенных вызовов.
+unsigned g_captureReconciliationDepth = 0;
+struct ScopedCaptureReconciliation {
+    ScopedCaptureReconciliation() { ++g_captureReconciliationDepth; }
+    ~ScopedCaptureReconciliation() { --g_captureReconciliationDepth; }
+    ScopedCaptureReconciliation(const ScopedCaptureReconciliation&) = delete;
+    ScopedCaptureReconciliation& operator=(const ScopedCaptureReconciliation&) = delete;
+};
+
+// GD game-variable keys for the two accuracy settings SKC forces to vanilla.
+// Read from the same strings the rest of the mod uses (skkBot.hpp:1726).
 constexpr char const* kCbsKey = "0177";
 constexpr char const* kCosKey = "0176";
 
+// The user's own CBS / COS, captured before the first write of a session.
+//
+// Two separate flags rather than one, because they cover different scopes:
+// GameManager's variables are the persisted settings, while the layer fields are
+// what GD actually steps this level with, and a layer can appear or disappear
+// between the moment of the write and the moment of the restore. Saving a
+// layer value that did not exist and restoring it later would invent a setting.
 bool g_accuracySaved = false;
 bool g_savedCbs = false;
 bool g_savedCos = false;
@@ -35,6 +56,10 @@ bool g_layerSaved = false;
 bool g_savedLayerCbs = false;
 bool g_savedLayerCos = false;
 
+// Push the macro's TPS into the one place the whole timing stack reads from.
+// physicsbypass derives the step grid from runtimeTickRate(), so this single
+// write is all SKC has to do to get arbitrary TPS - no scheduler of its own
+// (the first skc module tried that and froze the game).
 void applyTps(double tps) {
     if (!std::isfinite(tps) || tps <= 0.0)
         return;
@@ -43,18 +68,38 @@ void applyTps(double tps) {
     }
 }
 
+// The display rate, applied on exactly the same terms as applyTps: the macro
+// declares it, it goes live for the session, and endMacro() hands the menu's
+// own setting back on every exit path.
+//
+// The macro has THREE possible things to say and all three are applied:
+//   nothing (wire +0.0) -> FPS off for this run, then the menu state back
+//   fps == tps (wire -0.0) -> FPS on, follow the tick rate
+//   n (wire n)          -> FPS on at n
+// Previously only the third engaged, so a macro recorded with FPS off played
+// on whatever the menu happened to have, and a macro recorded with fps == tps
+// did the same.
 void applyDisplayFps(float storedFps) {
     const auto rate =
         skkbot2::fps::MacroDisplayRate::fromWire(static_cast<double>(storedFps));
     if (!skkbot2::fps::beginMacro(rate)) {
+        // beginMacro engages for every state now, so this would mean the module
+        // rejected its own caller. Log rather than swallow: a session silently
+        // running at a display rate nobody asked for is the kind of thing that
+        // gets noticed a week later as "the macro feels different today".
         skkbot2::log::warn("[TIMING] macro display rate refused (wire={:.1f})",
                            static_cast<double>(storedFps));
     }
 }
 
-}
+} // namespace
 
 void Bot::applySessionAccuracy(bool cbs, bool cos) {
+    // Snapshot the user's own CBS / COS the first time this runs in a session,
+    // and only then. This is re-asserted on every resetLevel (AGENTS.md 4), so
+    // without the guard the "saved" value would be whatever we wrote last time -
+    // false - and the restore below would hand back our own leftovers while
+    // looking perfectly correct in the log.
     if (!g_accuracySaved) {
         if (auto* gm = GameManager::get()) {
             g_savedCbs = gm->getGameVariable(kCbsKey);
@@ -81,6 +126,10 @@ void Bot::applySessionAccuracy(bool cbs, bool cos) {
 
 void Bot::reapplySessionAccuracy() const {
     if (m_state == State::Disabled) return;
+    // SKC is vanilla-only (see startRecording). Re-asserting vanilla on every
+    // reset is the AGENTS.md rule 4 contract: GD re-reads the accuracy
+    // settings on reset/practice respawn and would otherwise hand the run back
+    // to whatever CBS/COS the user has enabled in the game.
     applySessionAccuracy(false, false);
 }
 
@@ -98,6 +147,9 @@ void Bot::restoreUserAccuracy() {
             layer->m_clickOnSteps = g_savedLayerCos;
         }
     }
+    // Cleared, not kept: the next session must snapshot GD as it is at THAT
+    // moment. If the user changed these options in between, a stale snapshot
+    // would overwrite their newer choice with an older one.
     g_accuracySaved = false;
     g_layerSaved = false;
     if (auto* engine = ReplayEngine::get())
@@ -117,6 +169,8 @@ Bot& Bot::get() {
 }
 
 bool Bot::platformerModeMismatch() const {
+    // No declared mode = nothing to compare. Old .skc files, and formats that
+    // do not carry a mode bit, stay playable on either kind of level.
     if (!m_macro.platformerKnown) return false;
     auto* playLayer = PlayLayer::get();
     if (!playLayer || !playLayer->m_levelSettings) return false;
@@ -124,6 +178,11 @@ bool Bot::platformerModeMismatch() const {
 }
 
 void Bot::startRecording() {
+    // Окна сохраняются до playback этой записи, но не до следующей записи.
+    skkbot2::seam_probe::skcCenters.clear();
+    // Новая запись не наследует CP и pending-снимки предыдущего макроса.
+    PracticeFix::get().clear();
+    // BUG-109: page heap на время сессии - ловим портчика кучи в момент записи.
     skkbot2::debug::setFullPageHeap(true);
     double captureTps = m_macro.header.tps;
     if (m_state == State::Disabled) {
@@ -134,6 +193,12 @@ void Bot::startRecording() {
     } else if (auto* engine = ReplayEngine::get()) {
         captureTps = engine->runtimeTickRate();
     }
+    // SKC is VANILLA-ONLY. CBS/COS support was removed at the user's request
+    // (01.11): a real record→play round trip with them on died every single
+    // time, and the sub-step marks never survived it. The game's own switches
+    // are forced OFF for the session (restoreUserAccuracy gives the user's
+    // setting back when the session ends) and nothing about them is written to
+    // the file.
     m_macro.cbsMode = false;
     m_macro.cosMode = false;
     m_macro.subtickEncoded = false;
@@ -148,6 +213,9 @@ void Bot::startRecording() {
     applySessionAccuracy(false, false);
     const uint32_t startFrame = FrameClock::get().getFrame();
     m_state = State::Record;
+    // Wipe выполняется уже в Record: journalResetAttempt в Disabled не
+    // очищает журнал. Это общий путь GUI и queued RECORD.
+    onResetEvent(ResetReason::UserClear, 0);
     m_pendingAction = PendingAction::None;
     m_playbackArmed = false;
     m_attemptCount = 0;
@@ -158,18 +226,44 @@ void Bot::startRecording() {
     m_suppressedEvents = 0;
     resetHoldShadow();
     m_suppressionArmed = false;
+    // Bind to the level being RECORDED on. Only the init hook used to do this,
+    // and only for a queued action started from outside the level - so a record
+    // started from the in-game GUI kept whatever level was bound before, and
+    // the next visit to that level treated this macro as belonging to it.
     if (auto* layer = PlayLayer::get()) {
         bindLevel(layer->m_level);
+        // Record the mode this macro belongs to. SKK does the same in
+        // initializeSkMacro (skkBot.hpp:944) and refuses a mismatched playback;
+        // SKC had no field at all, so a platformer macro would happily arm on a
+        // classic level and desync at the first left/right.
         if (layer->m_levelSettings) {
             m_macro.platformerMode = layer->m_levelSettings->m_platformerMode;
             m_macro.platformerKnown = true;
+            // Keep the header view in step with the macro view: the GUI and
+            // readHeader() show the header, encode() reads the macro.
             m_macro.header.platformerMode = m_macro.platformerMode;
             m_macro.header.platformerKnown = true;
         }
     }
+    // The recording must inherit the live TPS selected by the user. Applying
+    // the macro's default header here used to overwrite a live 360.75 TPS with
+    // 240 before the first input, then serialize that accidental 240 into the
+    // file. Playback correctly trusts the stored rate, so the bad capture
+    // looked like a playback-only TPS regression.
     m_macro.header.tps = captureTps;
     m_macro.header.fps = 0.0f;
     applyTps(captureTps);
+    // What the menu is running right now, which is the only thing worth
+    // writing down: the rate the clicks were actually captured under. The
+    // result is one of three wire states - see MacroDisplayRate:
+    //   not stored  FPS was off while recording -> playback leaves it off
+    //   follow tps  FPS on and equal to tps     -> stored as -0.0
+    //   pinned n    FPS on at n != tps          -> stored as n
+    //
+    // Recorded, not applied. During a recording the menu's setting IS the rate
+    // the clicks are being captured under, so pushing it back would be circular.
+    // The apply belongs on the playback side, where the number arrives from the
+    // file instead of from the menu.
     const auto capturedRate = skkbot2::fps::captureForStorage(
         static_cast<double>(m_macro.header.tps));
     m_macro.header.fps = static_cast<float>(capturedRate.toWire());
@@ -184,6 +278,10 @@ void Bot::startRecording() {
         !m_macro.platformerKnown ? "unknown"
                                  : (m_macro.platformerMode ? "platformer" : "classic"),
         startFrame);
+    // SKK records the player's start POSITION and teleports there on playback,
+    // so a mid-level recording is fine there. SKC has no position in the file,
+    // so the only thing that makes a mid-level recording replayable is the
+    // player re-running the same stretch from the spawn. Flag it loudly.
     if (startFrame > 240) {
         skkbot2::log::warn(
             "[SKC] recording started {} frames into the level: playback can only "
@@ -193,6 +291,7 @@ void Bot::startRecording() {
 }
 
 void Bot::startPlayback() {
+    // BUG-109: page heap на время сессии (проигрывание).
     skkbot2::debug::setFullPageHeap(true);
     skkbot2::log::info("[SKC] startPlayback: after setFullPageHeap");
     skkbot2::Logger::get().flush();
@@ -205,6 +304,7 @@ void Bot::startPlayback() {
             "level is {} mode. Open a level of the matching mode.",
             m_macro.platformerMode ? "platformer" : "classic",
             levelPlatformer ? "platformer" : "classic");
+        // Do not leave an armed macro pointing at a level it can never play.
         m_playbackArmed = false;
         m_pendingAction = PendingAction::None;
         return;
@@ -214,6 +314,8 @@ void Bot::startPlayback() {
             m_savedTickRate = engine->tickRate;
         }
     }
+    // Vanilla-only, like the recording side: whatever the file says about
+    // CBS/COS is ignored (the decoder already normalized it away).
     applySessionAccuracy(false, false);
     auto& gui = skkbot2::gui::get();
     gui.lockDelta = m_macro.header.lockDeltaMode;
@@ -245,9 +347,20 @@ void Bot::startPlayback() {
             ? "unknown"
             : (m_macro.platformerMode ? "platformer" : "classic"),
         m_macro.header.realTimeMode ? "Real Time" : "Lock Delta");
+    // The mode question, answered from the level that is actually open. Foreign
+    // imports carry no mode bit, so the only honest statement is "what is in the
+    // file vs what this level is" - and a macro full of left/right actions in a
+    // classic level is the exact situation that produced a silent "PLAY does
+    // nothing" report twice (Windy Road.slc): the actions are dispatched, GD
+    // just has no use for buttons 2/3 outside platformer mode, so the run looks
+    // like an unrelated death a few seconds in.
     if (auto* layer = PlayLayer::get()) {
         const bool levelPlatformer =
             layer->m_levelSettings && layer->m_levelSettings->m_platformerMode;
+        // Which level is actually open, and which level (if any) the macro was
+        // bound to. An imported file carries no level identity, so "dies at
+        // 1.5 s" is only explainable once both sides are on the record: a macro
+        // replayed in the wrong level dies exactly like a broken replay.
         if (auto* level = layer->m_level) {
             skkbot2::log::info(
                 "[SKC] playback level: '{}' (id {}) platformer={} twoPlayer={} "
@@ -275,6 +388,9 @@ void Bot::startPlayback() {
         }
     }
 
+    // The opening of the file, verbatim. When a playback dies before the log's
+    // "state" lines even reach the second authored click, these are the only
+    // frames the run ever had a chance to act on.
     for (size_t i = 0; i < std::min<size_t>(m_macro.actions.size(), 16); ++i) {
         const auto& action = m_macro.actions[i];
         skkbot2::log::info(
@@ -285,6 +401,7 @@ void Bot::startPlayback() {
 }
 
 void Bot::armPlayback() {
+    // Only a loaded macro can be armed.
     if (m_macro.actions.empty()) {
         skkbot2::log::warn("[SKC] PLAY armed refused: no inputs loaded");
         return;
@@ -333,18 +450,32 @@ Bot::PlaybackStart Bot::playbackStartCheck() const {
         return out;
     }
 
+    // Wrong game mode is not a timing problem: no attempt, however fresh, can
+    // make a platformer macro play on a classic level or the other way round.
+    // Checked before the clock so the answer does not depend on where we are.
     if (platformerModeMismatch()) {
         out.decision = StartDecision::WrongMode;
         out.reason = "the macro and the level are in different game modes";
         return out;
     }
 
+    // Not started yet - the "tap to play" screen or the level fade-in. Nothing
+    // has run, so the world is at frame 0 whatever the clock happens to say, and
+    // this is checked BEFORE the clock. The tap screen is the single most common
+    // place to press PLAY, and refusing there because some scheduler ticked
+    // twice would reproduce exactly the bug this decision exists to remove.
     if (!playLayer->m_started) {
         out.decision = StartDecision::Ready;
         out.reason = "";
         return out;
     }
 
+    // THE check that matters. FrameClock is SKC's own counter of physics steps,
+    // reset by resetLevel and by editor playtest entry, monotone within an
+    // attempt (see skc_frame.hpp). Zero means the attempt has not advanced - the
+    // player is at the spawn and the macro's frame numbering lines up with the
+    // world. Anything else and the clicks land on a player the macro never
+    // positioned.
     if (FrameClock::get().getFrame() != 0) {
         out.decision = StartDecision::MidAttempt;
         out.reason = "the attempt is already under way";
@@ -371,6 +502,9 @@ bool Bot::startPlaybackIfReady(PlaybackStart* out) {
 std::string Bot::describeStartBlock(const PlaybackStart& start) const {
     switch (start.decision) {
         case StartDecision::MidAttempt:
+            // The numbers, not an adjective. "The attempt is under way" tells the
+            // operator nothing they can act on; "you are at frame 3180, the
+            // macro starts at frame 0" tells them exactly what to do about it.
             return fmt::format(
                 "SKC: cannot start here - attempt is at frame {}, and the macro "
                 "reproduces only from frame 0. Press PLAY right after the level "
@@ -396,10 +530,20 @@ std::string Bot::describeStartBlock(const PlaybackStart& start) const {
 
 void Bot::stop() {
     const bool wasHolding = m_state != State::Disabled;
+    // BUG-131: stop() раньше логировал только в КОНЦЕ - краш внутри него
+    // оставлял ноль строк. Точка на входе.
     skkbot2::log::info("[SKC] stop: entry (state={})", static_cast<int>(m_state));
     skkbot2::Logger::get().flush();
+    // Autosave contract (02.11, mirrors haltExecution): a rescue snapshot at
+    // every record-off moment, so finishing a practice-stitched line via the
+    // hotkey / leaving the level / a macro swap still ends with the file on
+    // disk. flushRecording() gates itself: SKC branch fires only while the
+    // bot still reports Record and drops zero-input captures.
     if (m_state == State::Record) {
         skkbot2::autosave::flushRecording();
+        // UX (05.11): та же подстановка имени автосейва, что в SKK
+        // haltExecution - SKC-остановки идут разными путями, и PLAY не должен
+        // отбиваться "macro name is empty" после записи.
         auto& gui = skkbot2::gui::get();
         if (gui.macroName[0] == '\0') {
             const std::string autoName = skkbot2::autosave::skcAutosaveName();
@@ -412,12 +556,23 @@ void Bot::stop() {
     m_state = State::Disabled;
     m_pendingAction = PendingAction::None;
     m_playbackArmed = false;
-    skkbot2::fps::endMacro();
+    // Same as SKK's haltExecution: a pinned display rate does not outlive
+    // the session that pinned it, and SKC reaches its stop through several
+    // paths (GUI, macro swap, editor exit, level leave).
+    if (wasHolding) skkbot2::fps::endMacro();
+    // BUG-109: сессия закончена - page heap обратно в стандартный режим.
     skkbot2::debug::setFullPageHeap(false);
+    // And neither does the forced vanilla accuracy: GD persists these two keys
+    // into the user's save file, so leaving them at false after a session is an
+    // edit to their settings that nobody asked for.
     restoreUserAccuracy();
-    if (auto* engine = ReplayEngine::get()) {
-        engine->tickRate = m_savedTickRate;
+    if (wasHolding) {
+        if (auto* engine = ReplayEngine::get()) {
+            engine->tickRate = m_savedTickRate;
+        }
     }
+    // SKK's haltExecution releases whatever the macro was holding; without
+    // this a stop mid-hold leaves the player pressing jump forever.
     if (wasHolding) {
         if (auto* playLayer = PlayLayer::get()) {
             if (playLayer->m_player1) playLayer->m_player1->releaseAllButtons();
@@ -425,6 +580,10 @@ void Bot::stop() {
         }
     }
     skkbot2::log::info("[SKC] stopped");
+    // SKC runs ticks through the same step-grid/lock-delta machinery as SKK,
+    // so the session's plan/step audit is printed here too - the numbers were
+    // previously lost on every stop that did not pass through SKK's
+    // haltExecution (BUG-69 investigation had no epilogue to read).
     if (auto* engine = ReplayEngine::get()) {
         engine->logTimingEpilogues();
     }
@@ -440,6 +599,10 @@ bool Bot::consumePendingAction(GJGameLevel* level) {
 
     if (action == PendingAction::Record) {
         skkbot2::log::info("[SKC] consuming queued RECORD on level entry");
+        // This hook runs before PlayLayer::init(), so the layer's
+        // m_levelSettings is not necessarily built yet. The GJGameLevel knows
+        // the mode itself, and startRecording() only overwrites it when the
+        // layer's settings are already available (with the same answer).
         m_macro.platformerMode = level->isPlatformer();
         m_macro.platformerKnown = true;
         m_macro.header.platformerMode = m_macro.platformerMode;
@@ -452,6 +615,9 @@ bool Bot::consumePendingAction(GJGameLevel* level) {
         skkbot2::log::warn("[SKC] queued PLAY skipped: no inputs loaded");
         return false;
     }
+    // Same pre-init problem as RECORD: platformerModeMismatch() needs the live
+    // layer's LevelSettingsObject, which PlayLayer::init() has not created yet.
+    // Check the mode from the GJGameLevel that was handed to us instead.
     if (m_macro.platformerKnown &&
         m_macro.platformerMode != level->isPlatformer()) {
         skkbot2::log::error(
@@ -461,6 +627,9 @@ bool Bot::consumePendingAction(GJGameLevel* level) {
             level->isPlatformer() ? "platformer" : "classic");
         return false;
     }
+    // Which level the macro is actually being played in. Imported macros carry
+    // no level identity, so a replay started in the wrong level differs from a
+    // broken replay only by this line.
     skkbot2::log::info(
         "[SKC] playing '{}' (id {}) platformer={} twoPlayer={} length={} "
         "difficulty={} downloads={}",
@@ -482,11 +651,17 @@ void Bot::bindLevel(GJGameLevel* level) {
 bool Bot::onLevelEnter(GJGameLevel* level) {
     if (!isEnabled() && !m_playbackArmed)
         return false;
+    // An unbound macro (loaded from disk) has no level to compare against, so
+    // a session on it is never stale.
     if (m_levelId == 0 && m_levelName.empty())
         return false;
     if (!level)
         return false;
 
+// GDR2 level names come from other bots' own metadata and casing does not
+    // match GD's ("rauchkammer 2" vs "Rauchkammer 2"), so the name comparison
+    // is case-insensitive. An ID match is still preferred when both sides have
+    // one - two different levels sharing a name is the only thing this relaxes.
     bool sameName = false;
     if (m_levelName.size() == level->m_levelName.size() && !m_levelName.empty()) {
         sameName = true;
@@ -510,6 +685,12 @@ bool Bot::onLevelEnter(GJGameLevel* level) {
     skkbot2::log::warn("[SKC] entered a different level - halting stale session "
         "(macro level {}/{}, now {}/{})",
         m_levelId, m_levelName, level->m_levelID, level->m_levelName);
+    // A macro recorded on another level can never be valid here: SKC stores no
+    // physics and no start position, so the same inputs on a different layout
+    // die at whatever obstacle they happen to meet. stop() alone left both the
+    // data AND the binding in place, so a later recording on this level kept
+    // the OLD level's identity and re-entering that level treated the stale
+    // macro as valid.
     onResetEvent(ResetReason::LevelChanged, 0);
     m_levelId = 0;
     m_levelName.clear();
@@ -529,6 +710,17 @@ void Bot::onPlaybackExhausted() {
 
 void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
                       bool pressed) {
+    if (g_captureReconciliationDepth != 0) {
+        // Vanilla handleButton уже выполнен хуком; команду запишет владелец
+        // reconciliation. Тень и счётчики настоящего ввода здесь не трогаем.
+        skkbot2::log::debug(
+            "[SKC] capture [internal-reconciliation] frame={} button={} p2={} "
+            "down={} depth={} (единственная запись — напрямую)",
+            frame, button, player2, pressed, g_captureReconciliationDepth);
+        return;
+    }
+    // The death hook can run before GD flips m_isDead. Keep the latch as an
+    // independent gate so callbacks later in that same transition are dropped.
     if (m_deathNoted) {
         ++m_suppressedEvents;
         if (m_suppressedEvents <= 5) {
@@ -539,6 +731,9 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
         return;
     }
 
+    // Inputs received during the death animation are not part of a clean line.
+    // Some platformer paths keep calling handleButton after destroyPlayer and
+    // before resetLevel; without this final gate those events survive into SKC.
     if (auto* layer = PlayLayer::get()) {
         if ((layer->m_player1 && layer->m_player1->m_isDead) ||
             (layer->m_player2 && layer->m_player2->m_isDead)) {
@@ -553,6 +748,11 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
         }
     }
 
+    // Events arrive in frame order by construction (handleButton fires during
+    // the physics step the clock just counted), so append is enough. An
+    // out-of-order event would corrupt the delta stream, so guard anyway - but
+    // loudly: a silent drop here is how a practice session turns into a macro
+    // whose presses have no matching releases.
     const bool outOfOrder = !m_macro.actions.empty() &&
         frame < m_macro.actions.back().frame;
     if (outOfOrder) {
@@ -569,6 +769,17 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
         return;
     }
 
+    // --- restore window: RELEASES ONLY (SKK: captureReleaseSuppressUntil) ---
+    // After a checkpoint restore GD flushes stale buffered presses AND the
+    // stale physical releases. SKK keeps the releases out of the macro stream
+    // (replay_engine.cpp:2932, `if (!hold && ...)`) but deliberately lets
+    // PRESSES through, and its variable name says so:
+    // captureReleaseSuppressUntil.
+    //
+    // SKC suppressed BOTH. That silently ate the player's real presses for
+    // 8 frames after every practice respawn, so the macro was missing input the
+    // recording contained and playback diverged exactly at
+    // boundary + 8 - measured at frame 3360 against a stitch at 3352.
     if (!pressed && m_suppressionArmed && frame >= m_suppressFromFrame &&
         frame <= m_suppressUntilFrame) {
         ++m_suppressedEvents;
@@ -581,6 +792,10 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
         return;
     }
 
+    // --- real transitions only (SKK: recordedHoldShadow) ---
+    // GD re-asserts the same down flag from internal paths; without the shadow
+    // one held button became a stream of duplicate presses and the pairing
+    // produced a macro full of orphans.
     if (button >= 1 && button <= 3) {
         bool& held = m_holdShadow[player2 ? 1 : 0][button];
         if (held == pressed) {
@@ -596,11 +811,18 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
         held = pressed;
     }
 
+    // Fields assigned by NAME, not by aggregate position: Action is
+    // {frame, button, pressed, player2} while this signature is
+    // {frame, button, player2, pressed}. An aggregate emplace_back swapped the
+    // two bools, which stored every press as a release - the macro then replayed
+    // only "release button 1" and the bot appeared to never click.
     Action action;
     action.frame = frame;
     action.button = button;
     action.pressed = pressed;
     action.player2 = player2;
+    // SKC is vanilla-only: there is no sub-step position any more, so the mark
+    // is always false. The field stays in the format so old files still decode.
     action.halfTick = false;
     m_macro.actions.push_back(action);
     m_rngTypedInput = true;
@@ -611,6 +833,15 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
 }
 
 void Bot::syncHoldShadowToPlayer() {
+    // BUG-103: the hold shadow must match the player's REAL button state at a
+    // checkpoint restore. The checkpoint bridge reapplies the saved latch, so
+    // `resetHoldShadow()` must not zero it while the PLAYER is still holding a
+    // button (GD keeps m_holdingButtons across loadFromCheckpoint). A genuine
+    // release inside the old suppression window then hit shadow=false and was
+    // "dropped", leaving shadow out of sync; the next real press hit the
+    // no-transition gate and was eaten too. Two events lost, macro diverges.
+    // Measured 13:35 session: rec 306 events -> saved 304, press@1681 +
+    // press@1695 gone after stitch at 1673.
     for (auto& slot : m_holdShadow) {
         for (bool& held : slot) {
             held = false;
@@ -636,6 +867,15 @@ void Bot::syncHoldShadowToPlayer() {
 }
 
 void Bot::noteInternalRestore(uint32_t frame) {
+    // BUG-103: the 8-frame release-suppression window is GONE. It was meant to
+    // filter GD's stale flush after a restore, but it also swallowed the
+    // player's GENUINE release when a tap ended inside the window (rec#7:
+    // stitch at 1673, tap release at 1681 dropped, shadow stayed DOWN, the
+    // next press at 1695 was then eaten by the no-transition gate).
+    // With the shadow synced to the player (syncHoldShadowToPlayer) the stale
+    // flush is filtered correctly by the no-transition gate instead: a stale
+    // release hits shadow==false and is dropped as a no-transition, while
+    // genuine press/release transitions keep flowing into the macro.
     m_suppressionArmed = false;
     syncHoldShadowToPlayer();
     (void)frame;
@@ -662,9 +902,13 @@ void Bot::reconcileCaptureRestore(uint32_t frame) {
                 continue;
             }
 
-            const bool rawP2 = handleButtonPlayer2Param(slot == 1,
-                                                        controlFlipActive(layer));
-            layer->GJBaseGameLayer::handleButton(physicalHeld, button, rawP2);
+            // The snapshot restores the recorded attempt's latch, but capture
+            // must continue from the keys physically held by the user. Emit
+            // one boundary transition to make the macro stream and live input
+            // state agree; playback remains entirely macro-driven.
+            //
+            // BUG-138/166: префикс измеряем ДО handleButton, иначе повторный
+            // capture внутреннего вызова выдаёт себя за исходный mismatch.
             bool streamHeld = false;
             for (auto it = m_macro.actions.rbegin(); it != m_macro.actions.rend(); ++it) {
                 if (it->button == button && it->player2 == (slot == 1)) {
@@ -679,18 +923,36 @@ void Bot::reconcileCaptureRestore(uint32_t frame) {
                     "preserved for native replay verification",
                     frame, slot == 1, button, physicalHeld, streamHeld, snapshotHeld);
             }
+            // BUG-99: vanilla-вызов обязателен — одного append недостаточно
+            // для выравнивания live hold/jump-buffer. BUG-166: подавляем только
+            // его повторную capture-запись, а не сам вызов и не будущий ввод.
+            const bool rawP2 = handleButtonPlayer2Param(slot == 1,
+                                                        controlFlipActive(layer));
+            const size_t actionsBefore = m_macro.actions.size();
+            {
+                ScopedCaptureReconciliation internalInput;
+                layer->GJBaseGameLayer::handleButton(physicalHeld, button, rawP2);
+            }
+            const size_t hookAppended = m_macro.actions.size() - actionsBefore;
+            if (hookAppended != 0) {
+                skkbot2::log::warn(
+                    "[SKC] reconciliation: внутренний handleButton изменил стрим "
+                    "frame={} p2={} button={} hookAppended={}",
+                    frame, slot == 1, button, hookAppended);
+            }
             Action action;
             action.frame = frame;
             action.button = static_cast<uint8_t>(button);
             action.player2 = slot == 1;
             action.pressed = physicalHeld;
             m_macro.actions.push_back(action);
+            m_rngTypedInput = true;
             m_holdShadow[slot][button] = physicalHeld;
             ++transitions;
             skkbot2::log::info(
-                "[SKC] capture restore reconciliation frame={} p2={} rawP2={} button={} snapshot={} physical={} recorded={}",
+                "[SKC] capture restore reconciliation frame={} p2={} rawP2={} button={} snapshot={} physical={} recorded={} hookAppended={}",
                 frame, slot == 1, rawP2, button, snapshotHeld, physicalHeld,
-                physicalHeld ? "press" : "release");
+                physicalHeld ? "press" : "release", hookAppended);
         }
     }
     if (transitions == 0) {
@@ -703,6 +965,8 @@ void Bot::reconcileCaptureRestore(uint32_t frame) {
 void Bot::finishCaptureRestore(uint32_t frame) {
     if (m_state != State::Record) return;
     noteInternalRestore(frame);
+    // Close only dangling stream edges that the restored snapshot does not
+    // continue. Reconciliation appends any physical transition after this scan.
     closeSeamHolds(frame);
     reconcileCaptureRestore(frame);
 }
@@ -719,7 +983,15 @@ std::optional<Action> Bot::poll(uint32_t frame) {
     if (m_inputIndex >= m_macro.actions.size())
         return std::nullopt;
 
+    // `<=` not `==`: a physics step can legitimately span several recorded
+    // events (two presses on the same tick, or the clock catching up after a
+    // batched step), and dropping the trailing ones would silently shift the
+    // whole rest of the macro.
     const Action& next = m_macro.actions[m_inputIndex];
+    // SKC is vanilla-only, so an action belongs to its frame and nothing else.
+    // The old half-tick gate (CBS) is gone: it made a marked action wait for a
+    // half step that often never came on that frame, slipping the click one
+    // physics step and desyncing the run.
     if (next.frame <= frame) {
         return m_macro.actions[m_inputIndex++];
     }
@@ -734,6 +1006,9 @@ void Bot::clearInputs() {
 
 Bot::HeldState Bot::heldBefore(uint32_t frame) const {
     HeldState state;
+    // Append order is frame order by construction (recordInput rejects a
+    // backwards stamp, the codec sorts on load), so the first action at or
+    // after `frame` ends the fold.
     for (const Action& action : m_macro.actions) {
         if (action.frame >= frame) break;
         const int button = static_cast<int>(action.button) - 1;
@@ -759,6 +1034,9 @@ Bot::SeamQueueReport Bot::sanitizeSeamQueue(
         }
     };
 
+    // Compact digest of what is about to be judged. The command carries no
+    // frame of its own (only the step it was queued in), so the order in the
+    // queue is the only time information there is.
     std::string digest;
     for (size_t i = 0; i < queue.size() && i < 6; ++i) {
         if (i) digest += ' ';
@@ -771,16 +1049,28 @@ Bot::SeamQueueReport Bot::sanitizeSeamQueue(
     if (queue.size() > 6) digest += " ...";
 
     const HeldState stream = heldBefore(resumeFrame);
+    // "The stream has not pressed anything yet" (rule 3) is about the whole
+    // prefix, not one channel: an action at or after the resume frame belongs
+    // to the retry, not to the attempt being stitched into.
     const bool anyActionBefore =
         !m_macro.actions.empty() && m_macro.actions.front().frame < resumeFrame;
 
     if (mode == SeamQueueMode::Record) {
+        // Every command still queued here was queued during the attempt that
+        // just ended: the step it was made in already drained the queue before
+        // the physics that killed the player. Nothing left in it can belong to
+        // the attempt being stitched into, so the whole queue goes - Xenon only
+        // inspects the tail because its recorder reads the queue itself, while
+        // SKC records from handleButton and would bake a phantom press into the
+        // stitched suffix.
         report.rule = "record seam (all queued commands belong to the dead attempt)";
         for (const PlayerButtonCommand& cmd : queue) {
             const int button = static_cast<int>(cmd.m_button);
             if (button < 1 || button > 3) continue;
             const int slot = cmd.m_isPlayer2 ? 1 : 0;
             if (!cmd.m_isPush && !stream.held[slot][button - 1]) {
+                // Same distinction Xenon draws, kept for the log even though
+                // the disposition is identical in this mode.
                 if (anyActionBefore) ++report.extraRelease;
                 else ++report.ghostRelease;
             } else if (cmd.m_isPush && stream.held[slot][button - 1]) {
@@ -791,6 +1081,9 @@ Bot::SeamQueueReport Bot::sanitizeSeamQueue(
         report.clearedQueue = true;
         queue.clear();
     } else {
+        // Play: Xenon's three rules, evaluated on the TAIL only. A command no
+        // rule names - a real press during the death on a channel the stream is
+        // not holding - is left in place, exactly like Xenon does.
         const PlayerButtonCommand& last = queue.back();
         const int button = static_cast<int>(last.m_button);
         if (button >= 1 && button <= 3) {
@@ -827,6 +1120,8 @@ Bot::SeamQueueReport Bot::sanitizeSeamQueue(
             m_ignoreInputs ? 1 : 0, report.cleared, report.inspected,
             report.rule ? report.rule : "tail rule", digest.c_str());
     } else {
+        // Nothing fired: say so, because "the seam saw a queued press and kept
+        // it" is the one case where a respawn-frame click is intended.
         skkbot2::log::info(
             "[SKC] seam-queue[{} site={} f={} ignoreInputs={}]: kept {} queued "
             "command(s) - tail does not contradict the stream: {}",
@@ -837,6 +1132,13 @@ Bot::SeamQueueReport Bot::sanitizeSeamQueue(
 }
 
 bool Bot::onResetEvent(ResetReason reason, uint32_t boundaryFrame) {
+    // The SKK wipe rule, checkpoint_system.cpp:1622-1647. SKC used to evaluate
+    // a DIFFERENT rule at each of its six reset sites; this is now the only
+    // place that decides whether recorded data survives.
+    //
+    // Wipe when: not a practice respawn, OR the attempt starts at the level
+    // start, OR there is nothing to restore to. Otherwise stitch; hold closure
+    // is deferred until the checkpoint snapshot has been reapplied.
     const bool stitch = (reason == ResetReason::PracticeRespawn ||
                          reason == ResetReason::CheckpointRestore);
     const char* name = "unknown";
@@ -854,6 +1156,11 @@ bool Bot::onResetEvent(ResetReason reason, uint32_t boundaryFrame) {
         clearInputs();
         restart();
         resetHoldShadow();
+        // The attempt clock is about to rewind to 0, so a restore window armed
+        // on the dying attempt must not survive into the new one. The range
+        // check in recordInput is the second line of defence; this is the
+        // first, because "armed" with a stale absolute frame is meaningless
+        // once the frame numbering starts over.
         m_suppressionArmed = false;
         m_suppressFromFrame = 0;
         m_suppressUntilFrame = 0;
@@ -868,8 +1175,16 @@ bool Bot::onResetEvent(ResetReason reason, uint32_t boundaryFrame) {
         return dropped > 0;
     }
 
+    // Stitch: keep [0 .. boundary-1] from the attempt that just died. Whether
+    // a hold continues is decided from snapshot and physical state after restore.
     const size_t before = m_macro.actions.size();
     prepareCaptureRestore(boundaryFrame);
+    // No frame correction. With the vanilla restore the state is EXACT - the
+    // player comes back byte-identical to a run that never died - so the retry
+    // simply continues on the same frame grid as the run it is stitched into.
+    // The earlier `-1` compensated for SKK's state bundle holding a frame's
+    // worth of extra movement; with that bundle gone the correction is a plain
+    // one-frame error (measured: dx = -1 frame, dead constant).
     skkbot2::log::info(
         "[SKC] reset[{}] STITCH at frame {} - {} of {} input(s) kept",
         name, boundaryFrame, m_macro.actions.size(), before);
@@ -898,6 +1213,14 @@ void Bot::noteAttemptReset(uint32_t failedAtFrame) {
 void Bot::closeSeamHolds(uint32_t frame) {
     if (m_macro.actions.empty()) return;
 
+    // Port of ReplayEngine::closeSeamHoldEdges (checkpoint_system.cpp:451).
+    // Forward scan of the retained tail: `pressed` opens an edge for
+    // (player2, button), `released` closes it. A slot still open here means its
+    // release was cut by the truncation - that press would replay as an
+    // endless hold across the seam, and the click pairing would match it
+    // against the retry's next press and emit an orphan. Close every dangling
+    // edge exactly ON the boundary frame so the stitch reads
+    // press..release(boundary), then the next attempt's re-press.
     bool open[2][3] = {};
     for (const Action& action : m_macro.actions) {
         if (action.frame > frame) break;
@@ -938,6 +1261,11 @@ void Bot::closeSeamHolds(uint32_t frame) {
 }
 
 void Bot::prepareCaptureRestore(uint32_t frame) {
+    // SKK's boundary is EXCLUSIVE: ReplayEngine::truncateRecordedDataAfter pops
+    // while `inputs.back().tick >= tick`. An input stamped exactly on the
+    // boundary is dropped because the checkpoint restore itself re-pushes the
+    // buttons that were held there (PracticeFix::apply does the re-push), so
+    // replaying it would double-press.
     const size_t before = m_macro.actions.size();
     std::erase_if(m_macro.actions, [frame](const Action& action) {
         return action.frame >= frame;
@@ -963,6 +1291,10 @@ void Bot::seekTo(uint32_t frame) {
 bool Bot::save(const std::filesystem::path& path) {
     m_macro.sortActions();
 
+    // Refuse to write a corrupt macro. Every unusable .skc so far looked fine in
+    // the GUI and only revealed itself by killing the bot a few hundred frames
+    // in. Failing loudly here costs one click; shipping the file costs a
+    // re-record and another round of log archaeology.
     std::string reason;
     if (!validateActions(m_macro.actions, reason, true)) {
         skkbot2::log::error(
@@ -982,6 +1314,11 @@ bool Bot::save(const std::filesystem::path& path) {
     }
 
     m_macroName = skk::pathToUtf8(path.stem());
+    // The per-channel split, because "the macro does not replay" is otherwise
+    // invisible until the file is decoded. A dual-mode level can file clicks
+    // under P2 with no second player present, and P1/P2 are not the same
+    // physics - so a macro with an unexpected P2 stream is already wrong before
+    // it is ever played.
     std::size_t p1 = 0, p2 = 0;
     for (const auto& act : m_macro.actions) {
         if (act.player2) ++p2; else ++p1;
@@ -1005,25 +1342,32 @@ bool Bot::save(const std::filesystem::path& path) {
        return false;
    }
 
+    // A file written by an older build (or by a corrupted capture) can decode
+    // cleanly yet still be unplayable. Reject it here rather than let it die
+    // silently at frame ~230.
+    std::string reason;
+    if (!validateActions(loaded->actions, reason, true)) {
+        skkbot2::log::error(
+            "[SKC] LOAD REFUSED - {} decodes but cannot be replayed: {}.",
+            skk::pathToUtf8(path.filename()), reason);
+        return false;
+    }
+
+    // Отказ загрузки выше не меняет текущую запись. Успешная замена сначала
+    // завершает прежний транспорт, затем инвалидирует все его CP/курсоры.
+    stop();
+    PracticeFix::get().clear();
     m_macro = std::move(*loaded);
     m_inputIndex = 0;
+    m_levelId = 0;
+    m_levelName.clear();
     journalResetCursor();
     if (!m_macro.rngJournal.empty()) {
         skkbot2::log::info("[SKC] file carries a rng journal ({} anchor(s))",
                            m_macro.rngJournal.size());
     }
-
-    std::string reason;
-    if (!validateActions(m_macro.actions, reason, true)) {
-        skkbot2::log::error(
-            "[SKC] LOAD REFUSED - {} decodes but cannot be replayed: {}.",
-            skk::pathToUtf8(path.filename()), reason);
-        m_macro.actions.clear();
-        m_macroName.clear();
-        return false;
-    }
-
     m_macroName = skk::pathToUtf8(path.stem());
+    // BUG-138: повторные команды сохраняются, источник требует capture-лога.
     bool held[2][3] = {};
     size_t repeatedPresses = 0;
     uint32_t firstRepeatedFrame = 0;
@@ -1052,11 +1396,39 @@ bool Bot::save(const std::filesystem::path& path) {
 
 bool Bot::adopt(Macro macro, std::string const& name, uint32_t levelId,
                 std::string levelName) {
+    // Чужой импорт уже нормализован своим импортёром: парная проверка остаётся
+    // строгой. Нативные press-команды не трактуются как flattened tap (BUG-138).
     std::string reason;
     if (!validateActions(macro.actions, reason)) {
         skkbot2::log::error("[SKC] IMPORT REFUSED - {}: {}", name, reason);
         return false;
     }
+    // Formats without a mode bit (Echo, SLC, NHM, RE4, AST) have to be
+    // classified from the click stream itself. The old rule - "any button 2/3
+    // event is proof of platformer" - was wrong: classic GD IGNORES the
+    // left/right keys, but a recorder hooks the raw button, so a stray arrow
+    // press during a classic run still lands in the file. Measured case: the
+    // Schafs .echo carries 42,864 jump presses (P1+P2, a dual classic level)
+    // and exactly 3 stray right presses, and the old rule branded the whole
+    // macro platformer, so PLAY refused it in its own classic level.
+    //
+    // A platformer run MOVES horizontally: left/right presses are a substantial
+    // share of the stream AND both directions appear, because walking one way
+    // for a whole minute is not what a platformer recording looks like. Both
+    // gates are required - a count gate (a handful of stray presses stays
+    // noise), the both-directions gate, and a share gate (even a jump-spammy
+    // platformer presses sideways far more often than a classic player
+    // accidentally mashes arrows).
+    //
+    // The answer is logged and NOTHING ELSE. This is a guess, and a guess must
+    // never gate playback: the second measured case is Windy Road.slc, a
+    // 60-second classic attempt whose second half spams left (975 left presses,
+    // ZERO right presses, 191 jumps, nothing left-of-centre in the first 31
+    // seconds). The one-direction rule called that platformer and PLAY then
+    // refused it in its own classic level - "PLAY does not turn on at all".
+    // Only a format that really stores a mode (.skc's platformer flag) is
+    // allowed to refuse; see platformerModeMismatch(), which reads
+    // platformerKnown, and platformerKnown stays false here.
     if (!macro.platformerKnown) {
         size_t jumpPresses = 0;
         size_t leftPresses = 0;
@@ -1083,10 +1455,18 @@ bool Bot::adopt(Macro macro, std::string const& name, uint32_t levelId,
                         "gated on it)"
                        : "no platformer evidence (plays in any mode)");
     }
+    stop();
+    PracticeFix::get().clear();
     m_macro = std::move(macro);
     m_inputIndex = 0;
     journalResetCursor();
     m_macroName = name;
+    // Bind the source level. An imported macro that stays unbound is exactly the
+    // case onLevelEnter() waves through ("an unbound macro has no level to
+    // compare against"), so playing a foreign replay on the wrong level fails as
+    // an unexplained death instead of being reported as the level mismatch it
+    // is. GDR2's levelId is often 0 - EclipseMenu wrote 0 for Rauchkammer 2 -
+    // so the name is the binding that actually carries.
     m_levelId = levelId;
     m_levelName = std::move(levelName);
     skkbot2::log::info(
@@ -1099,7 +1479,9 @@ bool Bot::adopt(Macro macro, std::string const& name, uint32_t levelId,
 }
 
 void Bot::onLevelExit() {
+    // Halt the session but KEEP the macro in memory (unsaved), exactly like
+    // SKK's onQuit: the user can still press SAVE after leaving the level.
     stop();
 }
 
-}
+} // namespace skk::skc

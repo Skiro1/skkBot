@@ -12,6 +12,7 @@
 
 namespace {
 
+// Xenon has no button field, so every event is a Jump.
 constexpr uint8_t kButton = 1;
 
 static constexpr int64_t kFrameShift = 0;
@@ -51,7 +52,7 @@ bool parseDouble(const std::string& s, double& out) {
     return true;
 }
 
-}
+}  // namespace
 
 bool skk::xe::parse(std::string_view text, skk::xe::Replay& out,
                     std::string& outReason) {
@@ -78,6 +79,8 @@ bool skk::xe::parse(std::string_view text, skk::xe::Replay& out,
                 ++malformed;
                 continue;
             }
+            // A two-number line is the header, NOT an action. Reading it as an
+            // action injects a bogus record at the tps value.
             unsigned long long t = 0;
             unsigned long long c = 0;
             if (!parseUnsigned(nums[0], t) || !parseUnsigned(nums[1], c)) {
@@ -132,6 +135,7 @@ bool skk::xe::parse(std::string_view text, skk::xe::Replay& out,
             return fail("xe: frame " + std::to_string(frame) +
                         " exceeds SKC's 32-bit frame counter");
         }
+        // isPlayer1, not isPlayer2: player2 is its negation.
         out.actions.push_back(skk::xe::Action{frame, holding != 0, p1 == 0, 0.0, false});
     }
 
@@ -184,6 +188,8 @@ bool skk::xe::toSkcMacro(const skk::xe::Replay& replay, skc::Macro& out,
                                           a.pressed, a.player2});
     }
 
+    // Stray releases are dropped here and a collapsed tap is rebuilt as a
+    // same-frame up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

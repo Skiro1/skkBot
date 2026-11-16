@@ -100,6 +100,8 @@ namespace MovingObjects {
 #if defined(__SSE2__) || defined(_M_X64)
 #define ECHO_THREADED_MOVE 1
 
+	// threads for huge groups
+	// NEVER destroyed bc joining on unload deadlocks
 	class MoveThreads {
 	public:
 		static const unsigned HELPERS = 5;

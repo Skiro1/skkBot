@@ -1,3 +1,19 @@
+# v0.1.41 (2026-11-16)
+Record & Play accuracy update for SKK and SKC: checkpoint capture/restore seams, boundary-input deduplication, and full diagnostics.
+
+## Improvements
+- **Improved SKK Record & Play (practice seams)**: checkpoint capture/restore now reconciles holds with exactly one boundary input — no duplicates, no losses; immediate presses apply physics on the same tick, active P2 reseals carry velocity/rotation/dash-ring state, and genuine releases pass through the restore window (verified live: 5/5 seam edges clean, 528/528 inputs dispatched, 0 drift, completion)
+- **Improved SKC Record & Play**: input order/prefix stitching across practice checkpoints is preserved; every boundary action is recorded exactly once; provenance of late captures is now logged
+- **Improved SKK state tail**: boundary state is resealed after reconciliation, and the per-frame writer (P2/dash-ring) is shared with the ordinary path
+- **Full step trace for SKK/SKC**: the record sample is captured even when the step is not batched (batch 0), with a separate capture-phase tick so repeated substeps no longer overwrite the reference state
+
+## Fixes
+- **Fixed double-recorded boundary input in SKK** (re-entry): a qualified reconciliation handleButton no longer re-enters the capture hook and duplicates the action
+- **Fixed same defect for SKC** (re-entry guard), including death/reset branches and same-tick genuine input
+- **Fixed SKSJ sample loss at batch 0** and time-phase mixing in the step trace
+
+---
+
 # v0.1.4 (2026-11-15)
 SKC seed & mid-level playback, hitbox/checkpoint fixes, live render monitor, Geode 6.0.0-alpha.2 port (GD 2.2091), menu customization.
 

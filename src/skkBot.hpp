@@ -70,11 +70,20 @@ namespace skk::hitboxes {
     void forceRefresh();
 }
 
+// Physical player input, observed at the only place it can be observed with
+// certainty: UILayer::keyDown / keyUp / ccTouch*. Playback injects straight into
+// m_queuedButtons and never goes through here, so anything reaching these
+// functions was pressed by a person. Implemented in replay_engine.cpp next to
+// the hook that fires it.
 namespace skkbot2 {
+// One physical press. `kind` is prose ("key down"), `key` is the raw
+// cocos2d::enumKeyCodes value; key 0 means a mouse touch rather than a key.
 void notePlayerInput(char const* kind, int key);
 
+// Session tally, then reset. Called when a run ends so the cap on individual
+// lines does not cost the totals.
 void dumpPlayerInputTally(char const* reason);
-}
+}  // namespace skkbot2
 
 enum MacroMode {
     MODE_DISABLED,
@@ -132,9 +141,19 @@ public:
     ValidationResult validationStatus = RESULT_OK;
 
     bool dataModified = false;
+    uint64_t macroGeneration = 0;
+    uint64_t macroRevision = 0;
 
+    // True while an async macro-file save is running on a worker thread: the
+    // multi-MB .skk serialization+zstd+disk write happens off the game thread
+    // (a synchronous save visibly hitched the game); completion posts back to
+    // the main thread, and this flag is only ever touched there.
     std::atomic<bool> macroSaveInFlight{false};
 
+    // True while the async save worker is still compressing+writing. The GUI
+    // reads this to keep the RECORD button from being re-pressed mid-save (a
+    // several-MB macro takes long enough that a double-click would otherwise
+    // queue a second capture over the one already being flushed).
     bool macroSaveBusy() const { return macroSaveInFlight.load(std::memory_order_acquire); }
 
     float tickAccumulator = 0.f;
@@ -156,8 +175,19 @@ public:
     bool fastPlayback = false;
     bool respawnTimeOverrideEnabled = false;
     int respawnTimeOverrideMs = 1000;
+    // Strips the level to its gameplay layout (blueprint): decorations + colour
+    // triggers hidden, authored colours/glow removed, background/ground/line
+    // repainted to a flat palette. Purely visual, no gameplay effect. Backing
+    // field for hacks/layout_mode.cpp; see that file for the reference ports
+    // (GDH "Layout Mode", EclipseMenu, Neverhook).
     bool layoutMode = false;
+    // "Use Regular Background" (Echo/Silicate/Grape): keep the level's authored
+    // background + middleground channels (1000/1013/1014) while the rest of
+    // the layout flattens. Only meaningful while layoutMode is on.
     bool layoutModeRegularBg = false;
+    // "Default Art" (Echo layout.cpp): redraw every block/slope/spike/saw as
+    // the standard GD object sized to its real hitbox, on an art layer just
+    // below the player. Only meaningful while layoutMode is on.
     bool layoutModeDefaultArt = false;
     int layoutModeBackgroundR = 160;
     int layoutModeBackgroundG = 160;
@@ -185,9 +215,22 @@ public:
     float noclipDeathColorG = 0.0f;
     float noclipDeathColorB = 0.0f;
 
+    // Safe Mode (existing field): suppresses GD's progress accounting so a run
+    // cannot bank score, jumps or attempts. Single master toggle Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it always
+    // freezes attempts AND jumps. The per-effect switches that used to back this
+    // were removed at the user's request (the extra two settings are gone from
+    // the GUI); both effects stayed on, which is also what GDH "Safe Mode"
+    // (hacks/core/safe_mode.cpp) and EclipseMenu "Safe Mode"
+    // (hacks/Global/SafeMode.cpp) do. Backing field for hacks/safe_mode.cpp.
     bool safeMode = false;
     bool persistenceMode = false;
 
+    // WAVE TRAIL FIX (drag-fix + draw-fix, always-on, visual only):
+    // waveTrailFix is the master switch. dragFix rebuilds the streak geometry
+    // every update (vanilla only adds points on collision, so noclipping or
+    // fast vertical snaps leave gaps / stray lines); drawFix replaces the
+    // vanilla stroke renderer with a miter-joined band that can be tinted and
+    // given an opacity, and adds an outline sub-part.
     bool waveTrailFix = true;
     bool waveTrailDragFix = true;
     bool waveTrailDrawFix = true;
@@ -219,6 +262,9 @@ public:
     PlayerObject* noclipLastDeathPlayer = nullptr;
     GameObject* noclipLastDeathObject = nullptr;
 
+    // RNG lock is non-configurable by design: always engaged, always the same
+    // start seed (100), so every recording and playback share one deterministic
+    // randoms base. The old GUI seed field was removed (see docs RNG survey).
     bool rngLocked = true;
     static constexpr unsigned int rngSeedVal = 100;
     uintptr_t capturedRngState = 0;
@@ -242,6 +288,10 @@ public:
     }
 
     std::unordered_map<CheckpointObject*, CheckpointStateBundle> storedRestorePoints;
+    // GD's platformer setup-checkpoint lives behind m_activatedCheckpoint and
+    // is not always the CheckpointObject left at the end of m_checkpointArray.
+    // Keep the exact CheckpointObject made for that activation, like GucciBot's
+    // m_platformerCheckpoints, so resetLevel can make GD restore that object.
     std::vector<CheckpointObject*> platformerCheckpointObjects;
     void trackPlatformerCheckpoint(CheckpointObject* checkpoint) {
         if (!checkpoint) return;
@@ -258,6 +308,14 @@ public:
     std::vector<CheckpointStateBundle> practiceFixQueue;
     int lastTickIndex = 0;
     int respawnTickIndex = -1;
+    // Respawn splice staging (flat SKK main timeline, bug BUG-06). Each
+    // practice attempt records into captureStaging instead of the main
+    // timeline. On death/respawn the segment up to the last checkpoint the
+    // attempt TOUCHED while alive is committed into main (that crossing is
+    // proven progress); everything above it (the dying tail, incl. air/death
+    // frames below newer checkpoints) is dropped and never reaches playback.
+    // The retry therefore can never leave a death seam in the line, and a
+    // failed section keeps the last clean traversal from an earlier attempt.
     SkMacro* captureStaging = nullptr;
     int captureStagingStartTick = 0;
     int captureStagingTouchFloor = 0;
@@ -265,10 +323,17 @@ public:
         return engineMode == MODE_CAPTURE && captureStaging && skMode && activeSk && !canUsePersistenceCapture();
     }
     void captureStagingReset(int startTick);
+    void clearFlatCaptureTimeline();
+    void appendCaptureStagingTo(SkMacro& snapshot) const;
     void captureCommitStagingToFloor(int floorTick);
     void captureFlushStagingAll();
     void captureOnRespawn(int respawnTick);
     void captureOnCheckpointTouched(int tick);
+    // Practice-restart RNG boundary (spliced recordings): the checkpoint
+    // restore latch {progress, live triple} here. The next captured frame
+    // stamps the macro tick and pushes the LIVE triple (not a formula) to
+    // activeSk->rngBoundaries. Playback restores entries with
+    // nextBoundaryIndex + applyRngBoundaryReseed.
     struct PendingRngBoundary {
         int progress = -1;
         uint64_t primary = 0;
@@ -280,10 +345,16 @@ public:
     size_t playbackAnchorIndex = 0;
     size_t perFramePlaybackIndex = 0;
     bool captureIgnored = false;
+    // True death pauses clean-line capture until GD completes the attempt reset.
     bool captureDeathPending = false;
+    // Внешний reset не должен затирать тень завершённого вложенного restore.
+    uint64_t captureRestoreSerial = 0;
     bool levelRestarting = false;
     bool initialRun = false;
     bool pendingPlaybackStart = false;
+    // When playback was queued from outside a level (fresh entry) the level is
+    // already at the start, so the initialRun reset would cause a needless
+    // visible restart. This flag suppresses that single reset.
     bool suppressInitialRunReset = false;
     enum class PendingAction { None, Record, Play };
     PendingAction pendingAction = PendingAction::None;
@@ -291,49 +362,153 @@ public:
     bool anchorReconciliation = false;
     bool perFrameReconciliation = false;
     bool playbackExhaustionNotified = false;
+    // Countdown budget for the substep-grid probe (processCommands trace in
+    // record/play logs). Armed on capture/play start; 0 disables logging.
     int substepProbe = 0;
+    // Center tick of a permanent Р В РІР‚в„ўР вЂ™Р’В±24-label substep trace window, armed on the
+    // last playback death so both the next PLAY attempt and the next RECORD
+    // pass through the same window emit per-substep traces (half/last, dt,
+    // levelTime, step) - lets record and playback phase grids be compared
+    // line by line around the exact death. -1 disables.
     int probeAroundTick = -1;
+    // BUG-102 v3: список центров окон (tick ± 24) из saved-значения
+    // "skc-probe-ticks" (строка "416,516,1237") - несколько расхождений
+    // за один прогон, без переконфигурации между сессиями. Плюс одиночный
+    // легаси "skc-probe-tick" и death-tick из checkpoint_system.
     std::vector<int> probeAroundTicks;
+    // Frame-boundary input semantics (capture truth): GD consumes touches
+    // between frames, effective on the FIRST substep of the next frame, and
+    // capture stamps the press with that frame's entry label. Dispatching on
+    // mid-frame substep label equality puts clicks one substep late in the
+    // fps-grid (the 1,1,2-step pattern). The planner refreshes frameEntryTick
+    // at every frame top; the first playback substep of the frame dispatches
+    // everything due for that entry label, once.
     int frameEntryTick = -1;
     bool frameDispatchDone = true;
+    // Per-anchor fast_rand audit: counts emitted desync warnings (reset with
+    // the drift meter at every PLAY setup).
     int rngStreamMismatchReports = 0;
+    // Throttle bookkeeping for dash-ring reattachment attempts (per slot).
     int dashReattachLast[2] = { -999, -999 };
+    // v4 step-grid clock: when true, tick labels come from completed physics
+    // sub-step PAIRS (half+last), the same grid GD's rings/flips/collisions
+    // live on - immune to levelTime-vs-step phase drift. Reset per attempt.
     bool stepClock = false;
     int stepPairCount = 0;
+    // Editor-playtest cadence compensation: GD funnels processCommands at
+    // ~180/s with dt=1/180 there (not 240/s @ dt=1/240 like a PlayLayer),
+    // so one call is NOT one macro tick. The step clock advances by
+    // dt*tickRate instead of +1 to keep the playback grid locked to the
+    // level's game time; this fraction holds the sub-tick remainder.
     double stepPairFrac = 0.0;
+    // Periodic phase-grid visibility was plan-count based; replaced by the
+    // wall-clock step-grid sample window (sessionSampleWallStart/DtSum).
 
+    // Sample window per session: reset at session start so a window never
+    // spans restarts/pauses (which used to produce bogus negative deltas).
     double sessionSampleLastLevelTime = 0.0;
     long long sessionSampleStepsWindow = 0;
+    // The step-grid sample's wall-clock window: started on the first plan
+    // after a reset, the sample fires every 2.0 s of WALL time and sums the
+    // delivered dt stream (sessionSampleDtSum) so the log can compare
+    // "sim time fed" against "wall time passed" directly.
     double sessionSampleWallStart = 0.0;
     double sessionSampleDtSum = 0.0;
+    // BUG-97 instrument: the speedhack value seen in the last sample window.
+    // A dynamic speed change DURING an SKC record is captured here and
+    // reported once per change; the speed track work must make record ==
+    // play under any speed sequence. Reset at session start.
     double sampleSpdLast = 0.0;
+    // Smoothed measured frame time (seconds per drawn frame), the stall cap's
+    // cadence source when the display pin is not being substituted. Updated
+    // ONLY from non-stall frames: a stall frame's dt is the batch's own
+    // serving time, and feeding it back re-creates BUG-66's self-reinforcing
+    // budget loop (budget from delivered fps).
     double emaFrameTime = 0.0;
+    // Stall accounting: how often the backlog past the cap was refused and
+    // how much level time that dropped, plus how many scheduler walks never
+    // became plans (custom-timing-off exits) - the first instrumented run
+    // showed 1310 walks against 401 plans and the split was unreadable.
     long long lockBacklogDrops = 0;
     double lockBacklogDropped = 0.0;
     long long sessionSchedWalks = 0;
     long long sessionVanillaExits = 0;
+    // Per-session step-grid audit: total plan calls, total steps planned,
+    // how many hit the resume-fade zero-dt window, and the first/last
+    // levelTime. Logged in haltExecution as "step-grid epilogue".
     long long sessionPlanCount = 0;
     long long sessionStepSum = 0;
     long long sessionResumeZeroPlans = 0;
+    // Freeze-path audit (the deficit that is INSIDE update): plans whose
+    // update() GD ran on the freeze path - zero physics, zero levelTime, the
+    // whole batch lost. Two gates, read raw at plan time:
+    //   13144 (0x3358) - the pause-family flag; 0 freezes every such frame;
+    //   13220 (0x33A4) - the post-resume grace counter; freeze requires >= 2
+    //     because this update's own getModifiedDelta call decrements it
+    //     before the freeze check sees it.
     long long batFrozenFlagPlans = 0;
     long long batFrozenFlagSteps = 0;
     long long batFreezeCtrPlans = 0;
     long long batFreezeCtrSteps = 0;
-    int startFrozenFrames = 0;
-    bool startFrozenReported = false;
-    double startFrozenWall = 0.0;
-    bool startLiveReported = false;
-    bool playbackFirstInputReported = false;
+    // BUG-79 start-window trace (INFO, once per session): the user reports
+    // "the song starts while the level is somehow still waiting" - i.e. the
+    // same pathology BUG-70 measured (1.36 s of frozen frames at attempt
+    // start: scene/audio/triggers alive, physics and levelTime dead). These
+    // fields record WHEN the frozen gate engaged, how many frames it ate,
+    // and the wall time between first freeze and first live physics plan,
+    // so the next run ties the symptom to a number.
+    int startFrozenFrames = 0;      // gate-frozen frames this session
+    bool startFrozenReported = false;  // gate-engage INFO emitted
+    double startFrozenWall = 0.0;   // wall (hot::now) of the first frozen frame
+    bool startLiveReported = false; // first-live-plan INFO emitted
+    bool playbackFirstInputReported = false; // first [PLAY-START] emitted
     double sessionFirstLevelTime = 0.0;
     double sessionLastLevelTime = 0.0;
     bool sessionLevelTimeInit = false;
+    // Lock delta audit.
+    //
+    // Always on, so this is not a session setting but a measurement of the frame
+    // clock: how far the measured dt strays from the interval that replaces it,
+    // and what the planner decides as a result. lockDroppedCarry is the SIGNED
+    // sum of that difference - positive means real frames were longer than the
+    // pinned interval, negative means shorter.
     long long lockPlanCount = 0;
     long long lockWantedSum = 0;
     long long lockStepSum = 0;
     long long lockMaxWanted = 0;
+    // How many frames the step cap actually bit on. Steady state and a stall
+    // backlog look identical in every other counter, and this is the number that
+    // says whether the cap is a guard or a tax: it should be 0 in a healthy run
+    // and non-zero on exactly the frames where the display fell behind.
+    // Delivered vs requested display rate. The bug this project shipped on
+    // 19.10.2026 was advancing the clock by 1/360 while the machine delivered
+    // 1/240; the log printed the requested rate and never the delivered one, so
+    // a third of the speed looked like a judgement call rather than a fact.
+    //
+    // Starts at 1.0, not 0.0: it is the fraction of frames that MISSED the
+    // interval, and `displayHolds` is `fraction < 0.25`. At 0.0 the verdict is
+    // therefore "the display is holding the pin" before a single frame has been
+    // measured - a test that cannot fail for its first window. Starting at 1.0
+    // means the honest measured frame time is used until evidence arrives, and
+    // evidence is the only thing that can turn the substitution on.
     double lockOffCadenceFraction = 1.0;
     long long lockOffCadenceInWindow = 0;
     long long lockWindowFrames = 0;
+    // BUG-95: the substitution constant is the display's ACTUAL cadence -
+    // learned from the window of measured frame dts and snapped to an
+    // integer fps. Same monitor for record and play -> the same snapped
+    // constant, so the step grid repeats across sessions even when
+    // getAnimationInterval lies about it (probed: promised 1/240 while the
+    // V-Sync'd display delivered 1/180, which left the interval-gated
+    // substitution permanently off and the grid undeterministic).
+    //
+    // BUG-95a: the first take (median, re-anchor on any 2% drift) flapped
+    // the anchor 180 <-> 158 <-> 97 fps every few seconds on hitchy frames
+    // and the level audibly sped up and slowed down. Two disciplines on
+    // top of the learn: the window statistic is the 25th percentile (the
+    // fast frame cluster, immune to hitches that drag the median into the
+    // slow cluster), and the anchor moves only after a candidate differs
+    // by >10% across two consecutive windows (hysteresis).
     float lockLearnedInterval = 0.0f;
     std::vector<float> lockLearnsWindow;
     int lockAnchorFps = 0;
@@ -347,40 +522,93 @@ public:
     double lockMaxDtSkew = 0.0;
     bool lockEverOn = false;
     bool lockLoggedOn = false;
+    // BUG-94 probes: per step-grid sample window, the raw dt the scheduler
+    // hook actually received per drawn frame, and how many entries fell back
+    // to the vanilla path. The 22:48 record sample showed walks and plans in
+    // a split that looked impossible for a per-frame hook - these counters
+    // must split that apart in one run instead of guesses.
     float sampleRawDtMin = 0.0f;
     float sampleRawDtMax = 0.0f;
     double sampleRawDtSum = 0.0;
     long long  sampleRawFrames = 0;
     long long  sampleVanillaExits = 0;
+    // BUG-96 probes: the drive stream's dt was caught summing to MORE than
+    // the wall time that actually passed (dtSum 4.1s in a 2.0s wall window -
+    // impossible for an honest wall-fed stream). For every drive we also
+    // store the REAL wall gap since the previous drive; comparing the two
+    // distributions names the phantom drives (dt > wall gap) or proves the
+    // stream honest once and for all.
     double sampleWallGapSum = 0.0;
     float  sampleWallGapMin = -1.0f;
     float  sampleWallGapMax = 0.0f;
     long long samplePhantomCount = 0;
     double samplePhantomDtSum = 0.0;
+    // Pacing-deficit stage 2: raw drive frames are HONEST (rawSum == wallGap
+    // sum), but the dt the planner received (dtSum) is ~17ms/2s short. Split
+    // the seam inside one window: how many plans the window carried vs how
+    // many raw frames drove it, and the rawSum itself next to dtSum - the
+    // difference names the exact loss class (undelivered plans, substituted
+    // constant, or per-frame walk count skew).
     long long samplePlansWindow = 0;
+    // Pacing-deficit stage 3 (RT): the feed passes through three stages
+    // before the planner sees it - raw dt (GD), the DWM-tick smoothing
+    // (refresh_frame_time) and the wall clamp. Each stage can eat time, and
+    // the totals name WHICH one does:
+    //   sampleRawDtSum - what GD reported (already counted per drive)
+    //   sampleDwmSum   - what the display-tick smoothing returned
+    //   sampleClampSum - what the wall clamp let through
+    //   sampleFedSum   - what the planner received (the dtSum the log shows)
     double sampleDwmSum = 0.0;
     double sampleClampSum = 0.0;
     double sampleFedSum = 0.0;
+    // How many drives the window carried (one per drawn frame) and how many
+    // of them the DWM smoothing actually rewrote (a rewritten drive is a
+    // candidate for the loss).
     long long sampleDrives = 0;
     long long sampleDwmRewrites = 0;
+    // BUG-96 stage-3 audit: does the tempo-debt feed actually reach the
+    // planner? sampleDebtSum/count = what advanceNormalScheduler fed into
+    // g_extraDelta; sampleWantSum = what the planner ASKED for
+    // (wantedSteps * timestep); sampleFreezeDropped = debt destroyed by the
+    // frozen gate (zeroing the carry on pause-family frames). If feed is
+    // large but want is not, the loss sits between the two.
     double sampleDebtSum = 0.0;
     long long sampleDebtCount = 0;
     double sampleWantSum = 0.0;
     double sampleFreezeDropped = 0.0;
     double lastDriveWall = 0.0;
+    // Frame number at which lock delta was first seen doing something, so a report
+    // can say where in the macro it engaged rather than only that it did.
     int lockFirstPlanFrame = -1;
     int processSliceSkips = 0;
+    // True while the tick planner's quantized dt is inside the engine update
+    // (getModifiedDelta must pass it through, not re-quantize).
     bool customTickPlanActive = false;
+    // CBS dispatch mix (proves which sub-step consumption branch is running).
     int cbsImmediateCount = 0;
     int cbsQueueNativeCount = 0;
     int cbsWaitCount = 0;
+    // Vanilla-physics delta measured before the recorded per-frame position is
+    // applied. Diagnostic only; this is not rendered/post-reconcile drift.
     float playDriftMax = 0.0f;
     int playDriftMaxTick = -1;
     int playDriftLastLogTick = -100000;
     int playDriftLastSampleTick = -100000;
+    // Rendered-drift meter (VISIBLE residual): sampled at isLastTick AFTER the
+    // whole pin+physics+reconcile cycle, i.e. what the eye actually renders
+    // against the recorded frame for the same effective tick. Unlike
+    // playDriftMax (which reads pre-reconcile preP1x and always shows the
+    // Р В РІР‚в„ўР вЂ™Р’В±1.95px phase saw), this excludes the measurement artifact.
     float renderDriftMax = 0.0f;
     int renderDriftMaxTick = -1;
     int renderDriftLastLogTick = -100000;
+    // Seam-recovery glide (BUG-06): a recording seam (practice death/restart
+    // stitched into the per-frame stream) produces a physically-impossible jump
+    // with NO portal object nearby. Snapping the player across it in one tick
+    // looks like a 'fast lag-freeze' teleport. Instead, while this watermark is
+    // active, prePhyPositionPin/reconcilePerFrames move the player toward the
+    // recorded route at a capped per-tick speed so the jump reads as a fast
+    // natural dash instead of a blink.
     int seamGlideUntilTick = -1;
     static constexpr float kSeamGlideStepPx = 26.0f;
     static constexpr float kSeamGlideArmTicks = 40;
@@ -393,11 +621,34 @@ public:
     std::array<std::array<bool, 3>, 2> checkpointResumedHolds = {};
     bool activeButtons[6] = { false, false, false, false, false, false };
     bool priorButtonState[6] = { false, false, false, false, false, false };
+    // Capture-mode shadow of "we last recorded this slot/button as held".
+    // GD clears m_holdingButtons internally (wave flips, gate steps) before the
+    // physical release reaches handleButton, so the game flag alone drops the
+    // release edge - a recorded wave section then replays as an endless hold.
+    // Index: slot*3 + (button-1), slot 0=P1, 1=P2.
     bool recordedHoldShadow[6] = { false, false, false, false, false, false };
+    // Last logged game-side held bit (button 1) for P1/P2 during capture, so
+    // the hold-probe only fires on real changes. -2 = unset.
     int holdProbeLast[2] = { -2, -2 };
+    // After a practice checkpoint restore / restart, GD zeroes player hold
+    // maps and then delivers the stale physical releases as ordinary
+    // handleButton events. Recording those seam releases writes phantom
+    // 'up' edges into the stream (duplicate release right after the rewind
+    // tick) which cancel held-orb/ring states early at replay. Releases are
+    // dropped until this label; presses always pass.
     int captureReleaseSuppressUntil = 0;
+    // Orientation-state change probe (gravity sign / upside-down / spider /
+    // rotation bucket) logged in both CAPTURE and PLAYBACK; diffing the two
+    // event sequences localizes 'character visually wrong gravity' to the
+    // recorded data or to playback restore. Rotation is bucketed to 5 deg to
+    // avoid tween spam.
     uint64_t gravProbeLast = 0;
+    // BUG-04 study: capped counter of bursty per-frame reconciles (>1 frame
+    // consumed by reconcilePerFrames in a single tick) - the smoke signal for
+    // 'recorded state applied N ticks late'.
     int perFrameReconciliationCatchUps = 0;
+    // BUG-04 study: number of live-vs-recorded gravity/ud mismatches logged
+    // by gravDiffProbe (capped so a pathological run can't flood the log).
     int gravDiffReports = 0;
 
     static constexpr int kGravDiffReportCap = 40;
@@ -416,6 +667,8 @@ public:
     bool cbsPlaybackProcessingQueue = false;
     bool unsavedGuardActive = false;
     bool replayAccuracyEnvironmentActive = false;
+    // SKC owns a separate per-macro accuracy environment. Do not let the
+    // settings UI adopt that temporary runtime mode as the user's preference.
     bool externalAccuracyEnvironmentActive = false;
     bool savedClickBetweenSteps = false;
     bool savedLayerClickBetweenSteps = false;
@@ -445,16 +698,29 @@ public:
     double lastProcessSliceTimestamp = -1.0;
     double macroStartTimestamp = -1.0;
 
-    double tickStartWallTime = 0.0;
-    double prevTickStartWallTime = 0.0;
-    double prevTickStartTimestamp = 0.0;
-    double inputArrivalWallTime = -1.0;
+    // CBS sub-tick phase anchors. GD's PlayerButtonCommand::m_timestamp is the
+    // step-aligned game clock (m_timestamp), frozen between processCommands
+    // calls, so m_timestamp - tickStartTimestamp is always ~0 and a recorded
+    // CBS macro never captured its real within-tick phase. Instead we anchor
+    // the LIVE wall clock at every new tick (see processCommands) and stamp
+    // the wall clock on each physical input arrival (UILayer keyDown/keyUp /
+    // ccTouchBegan/Ended hooks). The delta is the true sub-tick phase.
+    double tickStartWallTime = 0.0;       // wall-clock seconds at current tick anchor
+    double prevTickStartWallTime = 0.0;   // wall-clock seconds at previous tick anchor
+    double prevTickStartTimestamp = 0.0;  // game-clock seconds at previous tick anchor
+    double inputArrivalWallTime = -1.0;   // wall-clock seconds of last physical input
     bool hasInputArrivalWallTime = false;
 
     double cbsPhaseFromInputWall() const {
         if (!hasInputArrivalWallTime) {
             return -1.0;
         }
+        // Frame the physical arrival between the previous and the current tick
+        // anchors in WALL time. The macro's cbsTimeOffset is a sub-tick phase
+        // in GAME seconds within [0, 1/tps); the wall interval between two
+        // processCommands calls is ~1/240 (a step), which can be LONGER than
+        // the macro tick (1/tps at tps>240), so a raw wall delta would crack
+        // the recordAction guard (< 1/safeTps). Normalize to a fraction first.
         if (prevTickStartWallTime <= 0.0 || tickStartWallTime <= prevTickStartWallTime) {
             return -1.0;
         }
@@ -466,17 +732,29 @@ public:
         }
         double clamped = std::min(fraction, 1.0);
         if (clamped >= 1.0) {
-            return -1.0;
+            return -1.0; // arrival after the current tick start lands in this tick's slot
         }
         return clamped * (1.0 / runtimeTickRate());
     }
 
     int tickOffset = 0;
+    // The effective tick of the most recent pre-step dispatch. The trajectory
+    // ghost mirrors the bot's own grid, not a clock it re-derives: every real
+    // physics step reads actions with `tick <= effectiveTick`, and the window
+    // advances by exactly one per step, so the ghost's i-th step must ask for
+    // `lastDispatchEffectiveTick + 1 + i`. Deriving this from FrameClock or
+    // levelTime instead put every macro press one or two ticks off.
     int lastDispatchEffectiveTick = -1;
     bool startPosActive = false;
     std::string startPosWarning;
     bool startPosWarningIsKey = false;
 
+    // Macro-list keys carry their format, because a stem can legitimately exist
+    // twice: the SAME name saved once as SKK (.skk) and once as SKC (.sc).
+    // Keying on the bare stem deduped them into one row, so the SKK copy became
+    // invisible whenever a SKC macro of the same name was present - and the
+    // delete path removed BOTH files. Key is now "<stem> [<ext>]"; these two
+    // split it back apart at every boundary (display, load, info, delete).
     static std::string macroEntryKey(std::string const& stem, std::string const& ext) {
         return stem + " [" + ext + "]";
     }
@@ -493,6 +771,9 @@ public:
     }
 
     std::vector<std::string> storedMacros;
+    // Bumped by every reloadMacroList() disk scan so shells can cheaply re-sync
+    // their cached macro list once an async scan (e.g. after a save lands on
+    // the worker thread) has refreshed the engine's storedMacros.
     uint32_t macroListVersion = 0;
     std::unordered_set<std::string> incompatibleMacros;
     std::unordered_set<std::string> cbsMacros;
@@ -570,6 +851,8 @@ public:
         std::unordered_set<std::string> usableStems;
 
         auto addUsable = [&](std::string const& stem, std::string const& ext) {
+            // Keyed on stem AND extension: DF2.skc and DF2.skk are two distinct
+            // macros and both must be reachable.
             if (usableStems.insert(stem + ext).second) {
                 storedMacros.push_back(macroEntryKey(stem, ext));
             }
@@ -587,6 +870,9 @@ public:
                 return static_cast<char>(std::tolower(ch));
             });
 
+            // .skk/.skc are native. .gdr2 and .slc are shared formats read from other bots
+            // and converted into SKC on load - their macros become playable here,
+            // but we never write either (our output stays lossless .skc).
             if (extension != ".skk" && extension != ".skc" &&
                 extension != ".gdr2" && extension != ".slc" && extension != ".nhm" && extension != ".xe" &&
                 extension != ".re4" && extension != ".ttrl" &&
@@ -596,8 +882,18 @@ public:
                 continue;
             }
 
+            // Always surface the file in the list so the user can see it even
+            // if it fails to parse (e.g. a corrupt or foreign .skk/.skc).
             addUsable(stem, extension);
 
+            // PERF (14.11, "fps проседает при открытии списка макросов"): this
+            // loop used to SkMacro::loadFromPath EVERY .skk just to fill the
+            // cbs/platformer tag sets — synchronous on the GUI thread, on
+            // every refresh (open, save, stop-record). The sets have no
+            // readers (verified: grep over src — nothing consumes them), so
+            // the parse was pure wasted work and seconds of hitching with a
+            // large library. The tags live on; if a consumer appears, parse
+            // lazily (async or header-only), never inline here.
             if (extension == ".skk") {
                 skMacros.insert(stem);
             }
@@ -608,15 +904,19 @@ public:
         }
     }
 
+    // Queue Record/Play to start automatically when the next level is entered.
     void queueRecord(std::string const& name) {
         pendingAction = PendingAction::Record;
         pendingActionName = name;
+        // BUG-80: a fresh PlayLayer can reuse the dead one's heap address;
+        // disarm the [ENTRY-FREEZE] watcher here so the queued entry rearms.
         skkbot2::entryFreezeReset();
         skkbot2::log::info("RECORD queued for next level entry (name='{}')", name);
     }
     void queuePlayback(std::string const& name) {
         pendingAction = PendingAction::Play;
         pendingActionName = name;
+        // Same disarm reason as queueRecord above.
         skkbot2::entryFreezeReset();
         skkbot2::log::info("PLAY queued for next level entry (name='{}')", name);
     }
@@ -627,9 +927,14 @@ public:
         }
         pendingAction = PendingAction::None;
         pendingActionName.clear();
+        // Disarm the queued playback START too. Cancelling the pending action
+        // used to leave this latched, and every "is playback busy?" test that
+        // consults it then stayed true forever Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ which is what kept the Frame
+        // Stepper master toggle greyed out after a cancelled PLAY.
         pendingPlaybackStart = false;
     }
 
+    // Loads a .skk macro by name from the replays dir into memory (no playback).
     bool loadMacroFromName(std::string const& name) {
         if (engineMode != MODE_DISABLED) return false;
         if (name.empty()) return false;
@@ -641,20 +946,29 @@ public:
         if (!macro) return false;
         delete activeSk;
         activeSk = macro.release();
+        ++macroGeneration;
         skMode = true;
         selectedAccuracyMode = activeSk->accuracyMode;
         enableCBSForLoadedMacroIfNeeded();
         double safeTps = activeSk->framerate > 0.0 ? activeSk->framerate : tickRate;
+        // Привязки CP относятся к прежнему макросу, даже в том же PlayLayer.
+        storedRestorePoints.clear();
         practiceFixQueue = skk::bridge::wireToBundles(activeSk->practiceFixCheckpoints, safeTps);
         return true;
     }
 
+    // Consume a queued Record/Play when a level is entered. Called from the
+    // PlayLayer init hook. Returns true if a queued action was consumed.
     bool consumePendingAction(GJGameLevel* level) {
         if (pendingAction == PendingAction::None || !level) {
             return false;
         }
         PendingAction act = pendingAction;
         std::string name = pendingActionName;
+        // Consuming is not cancellation. Clear only the queue fields here;
+        // clearPendingAction() is the user-cancel path and also disarms a
+        // pending start. Reusing it made successful level-entry consumption
+        // indistinguishable from a cancelled PLAY in the log.
         pendingAction = PendingAction::None;
         pendingActionName.clear();
         skkbot2::log::info(
@@ -686,6 +1000,11 @@ public:
             skkbot2::log::error("PLAY queue failed: macro '{}' has no inputs", name);
             return false;
         }
+        // Queued PLAY can load a macro before PlayLayer::init has populated
+        // m_levelSettings. Older queued recordings therefore may carry the
+        // default classic-mode bit even though they belong to this exact
+        // platformer level. Level identity is the guard: never infer mode from
+        // a different level or silently make cross-level macros compatible.
         const bool sameLevel = activeSk &&
             (activeSk->levelId > 0
                 ? activeSk->levelId == static_cast<int32_t>(level->m_levelID)
@@ -701,6 +1020,8 @@ public:
                 activeSk->platformerMode = actualPlatformer;
             }
         }
+        // Queued from outside the level: the level is already at the start on
+        // entry, so skip the initialRun reset when playback begins.
         skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::Playback);
         suppressInitialRunReset = true;
         pendingPlaybackStart = true;
@@ -730,17 +1051,29 @@ public:
 
         pendingPlaybackStart = false;
         engineMode = MODE_CAPTURE;
+        ++sessionCounter; // BUG-141: pending-чекпоинты прежней записи недействительны.
+        storedRestorePoints.clear();
+        clearPlatformerCheckpoints();
+        // Сэмпл-профилировщик: запись тоже несёт холодный per-step - профиль
+        // записи против профиля плейбэка отделит аллокации от физики.
         skkbot2::debug::profilerStart("skk-record");
         anchorReconciliation = true;
         perFrameReconciliation = true;
         nextBoundaryIndex = 0;
         pendingRngBoundary = {};
+        // v4: every new capture runs on the GD physics-step label grid.
         stepClock = true;
         stepPairCount = 0;
         stepPairFrac = 0.0;
         resetTimingTracking();
         resetSessionStepGridStat();
         resetRecordedHoldShadow();
+        // A fresh record session must start from a clean staging slate even
+        // when Start was pressed without Clear first: leaving the previous
+        // session's captureStaging alive would buffer all button presses into
+        // staging and only surface them in activeSk after the first death
+        // (captureOnRespawn -> captureCommitStagingToFloor), so Record->Play
+        // right after a clean no-death run would miss every input.
         if (captureStaging) {
             delete captureStaging;
             captureStaging = nullptr;
@@ -759,9 +1092,14 @@ public:
             collisionBypass);
         clearPersistenceRuntimeState();
         clearQueuedSubstepState();
+        // BUG-109: page heap на время сессии - ловим портчика кучи в момент
+        // записи (см. core/page_heap_debug.hpp).
         skkbot2::debug::setFullPageHeap(true);
         skkbot2::log::info("[BC] after setFullPageHeap");
         skkbot2::Logger::get().flush();
+        // CBS/COS ЗАМОРОЖЕНЫ для SKK (решение 05.11, как в SKC vanilla-only):
+        // сессия всегда живёт на ванильной точности независимо от меню и тегов
+        // макроса. endReplayAccuracyEnvironment вернёт пользователю его настройки.
         AccuracyMode captureAccuracyMode = AccuracyMode::Vanilla;
         beginReplayAccuracyEnvironment(captureAccuracyMode, false);
         skkbot2::log::info("[BC] after beginReplayAccuracyEnvironment");
@@ -810,6 +1148,9 @@ public:
             activeMacro->name = level->m_levelName;
         }
         activeMacro->framerate = tickRate;
+        // Same capture, same rule as the tick rate one line above: what the
+        // menu is running right now, stored only if it says something the
+        // framerate does not already say.
         activeMacro->displayFps =
             skkbot2::fps::captureForStorage(tickRate).toWire();
         auto const& gui = skkbot2::gui::get();
@@ -823,12 +1164,13 @@ public:
     }
 
     void initializeSkMacro(GJGameLevel* level) {
+        ++macroGeneration;
         if (activeSk) {
             delete activeSk;
         }
         activeSk = new SkMacro();
         activeSk->accuracyMode = runtimeAccuracyModeFor(selectedAccuracyMode);
-        activeSk->usesStepClock = true;
+        activeSk->usesStepClock = true;  // v4: physics-step label grid
         if (level) {
             activeSk->levelId = level->m_levelID;
             activeSk->levelName = level->m_levelName;
@@ -871,6 +1213,9 @@ public:
         }
 
         pendingPlaybackStart = false;
+        // Boundaries are appended in record order (practice respawns), which is
+        // not ascending-by-tick; sort + dedupe so playback reseeds fire when the
+        // run crosses each tick (BUG-06 RNG desync fix).
         if (skMode && activeSk && !activeSk->rngBoundaries.empty()) {
             size_t pre = activeSk->rngBoundaries.size();
             normalizeSkRngBoundaries(*activeSk);
@@ -878,8 +1223,10 @@ public:
                 pre, activeSk->rngBoundaries.size());
         }
         engineMode = MODE_EXECUTE;
+        // BUG-109: page heap на время сессии (запись и проигрывание).
         skkbot2::debug::setFullPageHeap(true);
         refreshManualInputIgnoreState();
+        // Follow the macro's own clock declaration (legacy files = time grid).
         stepClock = skMode && activeSk ? activeSk->usesStepClock : false;
         stepPairCount = 0;
         stepPairFrac = 0.0;
@@ -894,6 +1241,10 @@ public:
         cbsWaitCount = 0;
         clearPersistenceRuntimeState();
         initialRun = true;
+        // Both arm sites run on a FRESH attempt, so the tick>2 initialRun
+        // re-sync must NOT reset a second time: the double reset re-fires
+        // spawn triggers (the spawn teleport then never re-arms) and shifts
+        // RNG/object phase.
         suppressInitialRunReset = true;
         respawnTickIndex = -1;
         tickOffset = 0;
@@ -905,7 +1256,12 @@ public:
         resetSessionStepGridStat();
         substepProbe = 96;
         clearQueuedSubstepState();
+        // CBS/COS заморожены (05.11): SKK-плейбэк всегда ванильный, тег
+        // точности старого макроса игнорируется.
         beginReplayAccuracyEnvironment(AccuracyMode::Vanilla, true);
+        // Auto-applied timing profile (idea 4): the macro's declared source TPS
+        // drives the runtime clock substep grid regardless of the user's manual
+        // tickRate setting; clock provenance follows the file's own declaration.
         skkbot2::log::info(
             "PLAY timing profile: hintTps={} appliedTickRate={} clock={} accuracy={}",
             (skMode && activeSk) ? activeSk->framerate
@@ -934,11 +1290,17 @@ public:
                 activeSk->name, activeSk->inputs.size(), chainInputsTotal,
                 activeSk->persistenceAttempts.size(), activeSk->perFrames.size(),
                 runtimeTickRate(), activeSk->framerate);
+            // Materialization sanity trace: first/last runtime ticks of the
+            // stream that will actually play.
             auto* list = activeSkInputs();
             if (list && !list->empty()) {
                 skkbot2::log::info("PLAY stream: [0].tick={} [{}].tick={}",
                     (*list)[0].tick, list->size() - 1, list->back().tick);
             }
+            // ---- BUG-06 diag #4: dump every input (index -> tick -> position)
+            // so the user's pointer "problem at input ~99-100" can be tied to a
+            // concrete tick and map position. Also logs a few frames around the
+            // interesting inputs.
             if (list && !list->empty()) {
                 auto inDump = skkbot2::paths::file("inputs_dump.txt");
                 std::ofstream idump(inDump, std::ios::trunc);
@@ -956,12 +1318,14 @@ public:
                     idump.close();
                     skkbot2::log::info("BUG-06 inputs dump written: {}", inDump);
                 }
+                // Position of the FIRST ~120 inputs mapped to the recorded route.
                 if (!activeSk->perFrames.empty() && list->size() >= 80) {
                     size_t const limit = std::min<size_t>(list->size(), 130);
                     std::ostringstream oss;
                     oss << "BUG-06 input->pos:";
                     for (size_t i = 0; i < limit; ++i) {
                         auto const& in = (*list)[i];
+                        // nearest perFrame <= in.tick
                         float px = 0.f, py = 0.f;
                         for (auto const& f : activeSk->perFrames) {
                             if (f.tick > in.tick) break;
@@ -970,6 +1334,7 @@ public:
                         oss << " #" << i << "=" << in.tick << ":("
                             << std::fixed << std::setprecision(1) << px << "," << py << ")";
                         if (i >= 94 && i <= 109) {
+                            // also dump 3 frames AROUND the reported spot
                             oss << "[f:";
                             for (auto const& f : activeSk->perFrames) {
                                 if (std::abs((int)f.tick - (int)in.tick) <= 2) {
@@ -983,6 +1348,9 @@ public:
                     skkbot2::log::info("{}", oss.str());
                 }
             }
+            // ---- BUG-06 diag #2: one-time dump of EVERY TeleportPortalObject
+            // in the level (position + linked exit), to correlate the recorded
+            // jump table (perframe_jumps.txt) with real portal placements.
             if (auto* pl = PlayLayer::get()) {
                 auto portalDump = skkbot2::paths::file("portal_objects.txt");
                 std::ofstream pd(portalDump, std::ios::trunc);
@@ -1014,6 +1382,10 @@ public:
                         portalDump, pcount);
                 }
             }
+            // ---- BUG-06 diagnostics: dump every consecutive-frame jump in the
+            // recorded per-frame stream to see the REAL seam structure (raw
+            // recorded data, before any playback smoothing). Any |dpos|>THRESH
+            // between AUDACIOUS frames is exactly the "teleport" players see.
             if (!activeSk->perFrames.empty()) {
                 auto const& pfs = activeSk->perFrames;
                 int64_t tickSpan = (int64_t)pfs.back().tick - (int64_t)pfs.front().tick;
@@ -1050,6 +1422,9 @@ public:
                                  << "\n";
                         }
                     }
+                    // Exact capture holes: every integer tick in [first..last]
+                    // with no frame, as contiguous ranges - the "record side"
+                    // of BUG-06 (did the macro lose ticks at the orb arcs?).
                     {
                         std::vector<int> present;
                         present.reserve(pfs.size());
@@ -1091,6 +1466,7 @@ public:
             if (auto* endLayer = playLayer->getChildByType<EndLevelLayer>(0)) {
                 endLayer->removeFromParentAndCleanup(true);
             }
+            // Do not force disable practice mode
             if (playLayer->m_levelSettings && playLayer->m_levelSettings->m_platformerMode) {
                 playLayer->resetLevelFromStart();
             } else {
@@ -1113,6 +1489,10 @@ public:
         }
         if (!playLayer) {
             if (skk::gameplay::isEditorPlaytest()) {
+                // PLAY pressed while ALREADY inside an editor playtest: arm in
+                // place, then park so the LIVE position drives the takeover
+                // (the player is mid-flight, not at a spawn - re-aligning to a
+                // spawn would fake a backwards teleport).
                 if (!armExecutionState()) {
                     engineMode = MODE_DISABLED;
                     return false;
@@ -1121,6 +1501,8 @@ public:
                 parkPlaybackPending();
                 return true;
             }
+            // Editor build mode (or menu): arm now; the playtest-start hook
+            // performs the spawn alignment when physics begins.
             return beginExecutionImmediate();
         }
 
@@ -1151,16 +1533,40 @@ public:
         return armExecutionState();
     }
 
+    // Live-playback takeover (PLAY pressed while the player is mid-run): the
+    // engine is sitting in the armed-waiting state (pendingPlaybackStart true,
+    // MODE_DISABLED). Each tick we check whether the recording actually covers
+    // the player's CURRENT spot (X AND Y proximity, so the takeover is seamless);
+    // on the first covered tick we arm MODE_EXECUTE IN PLACE - no resetLevel,
+    // no realignment to the macro's first frames, no backwards teleport.
     bool tryLivePlaybackTakeover(GJBaseGameLayer* playLayer);
 
+    // True when the recording has a frame/anchor within the given X/Y
+    // tolerances of (refX, refY). Used to refuse starting playback from a spot
+    // the macro never covered, instead of tight->loose aligning a raw spawn to
+    // a mid-run macro's first frames (the ~900px PLAY teleport).
     bool coversPlaybackPosition(float refX, float refY,
                                 float xTolerance, float yTolerance);
 
+    // Transition from a just-armed MODE_EXECUTE state back into the
+    // armed-waiting state (pendingPlaybackStart true, MODE_DISABLED) when the
+    // reset spawn turned out to be uncovered by the recording. Keeps the macro
+    // loaded so the live takeover can arm once the player reaches covered ground.
     void parkPlaybackPending();
 
+    // Step-grid and lock-delta session epilogues. Extracted from
+    // haltExecution so SKC's stop path (Bot::stop) prints the SAME audits:
+    // SKC sessions plan ticks through the same machinery and the numbers were
+    // previously lost whenever a run ended outside SKK's own stop funnel.
     void logTimingEpilogues() {
+        // Step-grid session epilogue: audit plan/step/resume counts.
         if (sessionPlanCount > 0) {
             const double ltDelta = sessionLastLevelTime - sessionFirstLevelTime;
+            // The tick count is the session's ACTUAL served steps, not
+            // ltDelta * runtimeTickRate(): runtimeTickRate is the menu's tick
+            // rate (240 by default), while SKC playback runs at the macro's
+            // tps (e.g. 3414) through the physics bypass - the old estimate
+            // printed ~1813 ticks for what was really 25805 steps.
             const long long estTicks = static_cast<long long>(sessionStepSum);
             skkbot2::log::info(
                 "step-grid epilogue: plans={} steps={} resumeZero={} | "
@@ -1169,6 +1575,18 @@ public:
                 sessionFirstLevelTime, sessionLastLevelTime, ltDelta, estTicks,
                 estTicks > 0 ? static_cast<double>(sessionPlanCount) / static_cast<double>(estTicks) : 0.0);
         }
+        // Lock delta session epilogue.
+        //
+        // Always on, so unlike the setting it replaced there is no "was it
+        // switched off" case to guard - every run produces one of these. The
+        // numbers to read are lockMaxDtSkew (how far the wall clock strayed from
+        // the smoothed grid, i.e. how much smoothing work was needed) and the
+        // steps-per-frame average against the tps/fps ratio it should equal.
+        // Cadence truth lives in the step-grid samples: dtSum/wall is the
+        // real-time fidelity number (100% = the level was fed real time).
+        // (The old "display delivered X fps, Y% of frames late" fields are gone:
+        // they were never updated since the wall-clock rework and always printed
+        // their initial values 0.0 fps / 100% - noise that read as slow motion.)
         if (lockPlanCount > 0) {
             skkbot2::log::info(
                 "lock-delta epilogue: engaged at frame {}, {} frames planned, "
@@ -1187,17 +1605,32 @@ public:
     }
 
     void haltExecution() {
+        // Профилировщик: отчёт по любой остановке сессии (no-op если не шёл).
         skkbot2::debug::profilerStopAndReport();
+        // The user's autosave contract (02.11): a rescue snapshot at EVERY
+        // record-off moment, not only when the GUI stop button runs
+        // stopRecording() (level complete, macro swap, editor exit, hotkey
+        // oddities all funnel here without it). Still record-only: the call
+        // is a no-op outside MODE_CAPTURE, and skkSnapshot bumps nothing
+        // when the capture has zero inputs.
         if (engineMode == MODE_CAPTURE) {
+            // Сначала финализируем ВСЕ данные: спасательный файл и Stop→Play
+            // должны видеть одинаковую попытку, staging и таблицу variance.
+            captureFlushStagingAll();
+            captureVarianceSnapshot();
+            flushPendingPersistenceCaptureAttempt();
             ::skkbot2::autosave::flushRecording();
         }
         if (engineMode == MODE_CAPTURE) {
-            captureVarianceSnapshot();
             if (activeSk) {
                 skkbot2::log::info("RECORD session ended: main inputs={} anchors={} frames={} | chain links={} | variance slots={}",
                     activeSk->inputs.size(), activeSk->anchors.size(), activeSk->perFrames.size(),
                     activeSk->persistenceAttempts.size(), activeSk->varianceOverrides.size());
             }
+            // UX (05.11, BUG из сессии 20:44): запись через автосейв оставляла
+            // поле имени пустым, и PLAY отбивался "macro name is empty". Филл
+            // живёт ЗДЕСЬ, а не в GUI-кнопке STOP: haltExecution - воронка ВСЕХ
+            // путей остановки (хоткей, выход из уровня, смена макроса).
             auto& gui = ::skkbot2::gui::get();
             if (gui.macroName[0] == '\0') {
                 const std::string autoName = ::skkbot2::autosave::skkAutosaveName();
@@ -1225,6 +1658,10 @@ public:
         macroInputActive = false;
         respawnTickIndex = -1;
         tickAccumulator = 0.0f;
+        // Hand back a pinned display rate. haltExecution is the one place
+        // every SKK stop funnels through - GUI stop, macro swapped, editor
+        // exit - so it is where the pin has to be released, or it survives the
+        // session that set it and slows down ordinary play.
         ::skkbot2::fps::release();
         resetTimingTracking();
         resetDeferredInputState();
@@ -1238,6 +1675,7 @@ public:
         }
         Autoclicker::get()->reset();
         endReplayAccuracyEnvironment();
+        // BUG-109: сессия закончена - page heap обратно в стандартный режим.
         skkbot2::debug::setFullPageHeap(false);
         executeIndex = 0;
         playbackAnchorIndex = 0;
@@ -1340,7 +1778,8 @@ public:
     bool hasMacroInputs() const {
         if (skMode) {
             return activeSk && (!activeSk->inputs.empty() || !activeSk->persistenceAttempts.empty() ||
-                                !persistenceCaptureAttempt.inputs.empty());
+                                !persistenceCaptureAttempt.inputs.empty() ||
+                                (captureStaging && !captureStaging->inputs.empty()));
         }
         return activeMacro && !activeMacro->inputs.empty();
     }
@@ -1365,12 +1804,14 @@ public:
 
     bool hasUnsavedActiveMacro() const {
         bool hasInputs = (activeSk && (!activeSk->inputs.empty() || !activeSk->persistenceAttempts.empty() ||
-                                       !persistenceCaptureAttempt.inputs.empty() || !persistenceCaptureAttempt.anchors.empty()))
+                                       !persistenceCaptureAttempt.inputs.empty() || !persistenceCaptureAttempt.anchors.empty() ||
+                                       (captureStaging && !captureStaging->inputs.empty())))
             || (activeMacro && !activeMacro->inputs.empty());
         return dataModified && hasInputs;
     }
 
     void markActiveMacroDirty() {
+        ++macroRevision;
         dataModified = true;
     }
 
@@ -1420,6 +1861,9 @@ public:
         if (engineMode != MODE_EXECUTE || !skMode || !activeSk) {
             return nullptr;
         }
+        // Main-first policy: when the macro owns a clean full run (the main
+        // timeline), playing it directly beats re-enacting the death chain
+        // (whose only visible effect was replaying a recorded death on run 1).
         if (!activeSk->inputs.empty()) {
             return nullptr;
         }
@@ -1507,6 +1951,13 @@ public:
         return std::max(1.0, framerate);
     }
 
+    // The display rate the ACTIVE macro declares. The wire value is decoded by
+    // MacroDisplayRate::fromWire, which is the only place the sign of zero is
+    // read: +0.0 = the macro carries nothing (FPS was off when it was
+    // recorded), -0.0 = fps == tps, n = pinned. All three engage on playback;
+    // the middle one used to be indistinguishable from the first and did
+    // nothing, so a macro recorded with fps == tps played on whatever the menu
+    // had at the time.
     skkbot2::fps::MacroDisplayRate activeMacroDisplayRate() const {
         double fps = 0.0;
         if (skMode && activeSk) {
@@ -1527,9 +1978,30 @@ public:
     }
 
     static AccuracyMode runtimeAccuracyModeFor(AccuracyMode mode) {
+        // Only native accuracy levels exist now: Vanilla and CBS. SIP/CBF are
+        // declared incompatible at load time and any accuracy tag they left in
+        // old replay files degrades to CBS (best native level).
         return mode == AccuracyMode::CBS ? AccuracyMode::CBS : AccuracyMode::Vanilla;
     }
 
+    // Adopt GD's live CBS / COS state so a change made in GD's own options Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ or by
+// another mod Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ shows up in our menu instead of a stale value.
+//
+// Source of truth, in order:
+//   1. GJBaseGameLayer::m_clickBetweenSteps / m_clickOnSteps Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the fields GD
+//      itself gates on (2.2081 GJBaseGameLayer.cpp:1180 reads
+//      m_clickBetweenSteps). Authoritative while a level is on screen.
+//   2. Game vars 0177 / 0176 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ our own persisted state, used when no game layer
+//      exists (main menu / option screens). GD's own code never touches these
+//      two keys, so they must not be treated as a mirror of GD's settings.
+//
+// An adopted value is mirrored into our saved values, otherwise the next launch
+// resurrects the old ones from gui_accuracy / gui_cos. Returns true when
+// something actually changed.
+//
+// Skipped while a replay owns the accuracy environment: the replay applies its
+// own mode there and the user's live choice is restored by
+// endReplayAccuracyEnvironment(), not by the menu.
 bool syncAccuracyFromGame() {
     if (replayAccuracyEnvironmentActive || externalAccuracyEnvironmentActive) {
         return false;
@@ -1577,6 +2049,8 @@ bool syncAccuracyFromGame() {
     static void applyRuntimeAccuracyMode(AccuracyMode mode, bool cosEnabled) {
         mode = runtimeAccuracyModeFor(mode);
         bool enabled = mode == AccuracyMode::CBS;
+        // COS (Click On Steps) is an auxiliary vanilla mechanic: it only applies
+        // together with Vanilla or CBS accuracy.
         bool cosOn = cosEnabled &&
             (mode == AccuracyMode::Vanilla || mode == AccuracyMode::CBS);
         if (auto* gameManager = GameManager::get()) {
@@ -1590,6 +2064,8 @@ bool syncAccuracyFromGame() {
     }
 
     void enableCBSForLoadedMacroIfNeeded() {
+        // CBS/COS заморожены (05.11): тег точности загруженного макроса больше
+        // не включает CBS - SKK-сессии всегда ванильные.
         selectedAccuracyMode = AccuracyMode::Vanilla;
     }
 
@@ -1612,6 +2088,10 @@ bool syncAccuracyFromGame() {
         }
 
         if (overridePlaybackTickRate) {
+            // Replay declares its own timing profile (GDH reference): the source
+            // TPS wins over the user's manual tickRate. Re-assert idempotently on
+            // every arm - if a previous environment reuse left a stale auto rate,
+            // the profile of the macro being replayed now is authoritative.
             double declaredTps = activePlaybackTickRate();
             if (!playbackTickRateOverrideActive) {
                 savedPlaybackTickRate = tickRate;
@@ -1621,6 +2101,18 @@ bool syncAccuracyFromGame() {
                 tickRate = declaredTps;
             }
 
+            // The display rate, on the same contract: taken from the macro,
+            // re-asserted idempotently on every arm, handed back in
+            // endReplayAccuracyEnvironment().
+            //
+            // Inside this guard because the flag is really "this is PLAYBACK,
+            // not capture" - it is false on the recording call. That distinction
+            // is the whole reason: at record time the macro's number was just
+            // read OUT of the menu setting a line earlier, so applying it back
+            // would be circular. It would also freeze the FPS row for the length
+            // of a recording and log a pin that was never a change. At play time
+            // the number comes from the FILE and applying it is the entire
+            // point of storing it.
             const auto declaredFps = activeMacroDisplayRate();
             if (!playbackFpsOverrideActive) {
                 if (skkbot2::fps::beginMacro(declaredFps)) {
@@ -1630,6 +2122,15 @@ bool syncAccuracyFromGame() {
                 skkbot2::fps::updateMacro(declaredFps);
             }
 
+            // Timing mode: применяем режим ИЗ МАКРОСА (05.11, запрос
+            // пользователя — паритет с SKC, который восстанавливает режим из
+            // заголовка в skc_bot.cpp:298). Раньше GUI был драйвером (контракт
+            // 02.11 BUG-96 stage-5) и флаги макроса были только метаданными —
+            // из-за этого плейбэк шёл в режиме меню, а не записи. Решающие
+            // слова advanceNormalScheduler / applyCustomTickPlan читают
+            // gui.lockDelta/gui.realTime для ОБОИХ движков, так что
+            // восстановление в GUI и есть применение. Пишем и в saved-ключи,
+            // чтобы меню и перезапуск игры показывали тот же режим.
             auto& gui = skkbot2::gui::get();
             const bool macroLockDelta =
                 (skMode && activeSk) ? activeSk->lockDelta
@@ -1651,10 +2152,18 @@ bool syncAccuracyFromGame() {
             skkbot2::log::info(
                 "[SKK] playback timing mode: {} (from the macro, menu follows)",
                 gui.realTime && !gui.lockDelta ? "Real Time" : "Lock Delta");
+            // Сэмпл-профилировщик холодного per-step (05.11): стартует на arm
+            // плейбэка, отчёт печатает haltExecution. Опция из LOGGING.
             skkbot2::debug::profilerStart("skk-play");
             dropCarry();
         }
 
+        // CBS/COS ЗАМОРОЖЕНЫ для SKK (05.11): параметры сохранены для
+        // совместимости сигнатуры, но сессия принудительно ванильная - и
+        // запись, и плейбэк, независимо от меню и тегов макроса. GD
+        // перечитывает m_clickBetweenSteps/m_clickOnSteps из game-переменных
+        // при каждом reset, а мы пишем false в обе (0177/0176), так что
+        // ваниль держится через любые рестарты и респавны.
         applyRuntimeAccuracyMode(AccuracyMode::Vanilla, false);
         if (mode != AccuracyMode::Vanilla || cosEnabled) {
             skkbot2::log::info(
@@ -1665,6 +2174,11 @@ bool syncAccuracyFromGame() {
 
     void endReplayAccuracyEnvironment() {
         if (playbackFpsOverrideActive) {
+            // Before the tick rate is handed back, not after: endMacro() puts
+            // the menu's own FPS state back AND drops the pin, so leaving it to
+            // run after the tick rate is restored would leave one frame where
+            // the display is back at its old rate and the budget still sized
+            // for the macro's.
             skkbot2::fps::endMacro();
             playbackFpsOverrideActive = false;
         }
@@ -1696,6 +2210,11 @@ bool syncAccuracyFromGame() {
         replayAccuracyEnvironmentActive = false;
     }
 
+    // Hand the tick rate back to the menu's own setting WITHOUT ending the
+    // replay's accuracy environment Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the TPS toggle in the GUI uses this when
+    // the user turns it off mid-playback, so the clock returns to whatever the
+    // menu declared at arm time (the "Р В Р Р‹Р Р†Р вЂљРЎв„ўР В Р’В Р РЋРІР‚СћР В Р Р‹Р Р†Р вЂљРЎв„ў TPS Р В Р Р‹Р Р†Р вЂљР Р‹Р В Р Р‹Р Р†Р вЂљРЎв„ўР В Р’В Р РЋРІР‚Сћ Р В Р’В Р вЂ™Р’В±Р В Р Р‹Р Р†Р вЂљРІвЂћвЂ“Р В Р’В Р вЂ™Р’В» Р В Р’В Р В РІР‚В  Р В Р’В Р РЋР’ВР В Р’В Р вЂ™Р’ВµР В Р’В Р В РІР‚В¦Р В Р Р‹Р В РІР‚в„–" behaviour) while
+    // CBS / click-between-steps stay engaged for the running replay.
     void dropPlaybackTickRateOverride() {
         if (playbackTickRateOverrideActive) {
             tickRate = savedPlaybackTickRate;
@@ -1712,10 +2231,18 @@ bool syncAccuracyFromGame() {
     }
 
     double fixedSimulationDelta() const {
+        // Nominal period for scheduler/carry accounting. Keep this in double;
+        // the actual GD physics quantum is rounded once by fixedPhysicsDelta.
         return 1.0 / runtimeTickRate();
     }
 
     double fixedPhysicsDelta(double timeWarp = 1.0) const {
+        // GD's per-step physics delta is ultimately a float. Match the
+        // reference's rounding order: calculate (1 / TPS) * timeWarp in
+        // double, round that single-step quantum to float exactly once, then
+        // promote the exact float value back to double for planning and the
+        // step-grid hooks. Rounding 1/TPS first and applying timeWarp later
+        // can differ by one float ULP per step and accumulate over a level.
         if (!std::isfinite(timeWarp)) {
             return 0.0;
         }
@@ -1760,6 +2287,11 @@ bool syncAccuracyFromGame() {
         persistenceCaptureDeathRecorded = false;
     }
 
+    // Move the in-flight persistence attempt into the macro. Attempt data is
+    // normally finalized by death, but Stop/halt/Save/restart can arrive
+    // first; without this flush the segment (and in persistence mode often
+    // the ENTIRE recording, since main streams stay empty) would be silently
+    // dropped by clearPersistenceRuntimeState/resetPersistenceCaptureAttempt.
     void resetRecordedHoldShadow() {
         for (bool& state : recordedHoldShadow) {
             state = false;
@@ -1768,23 +2300,48 @@ bool syncAccuracyFromGame() {
         gravProbeLast = 0;
     }
 
+    // Одна политика для живого Stop и немутирующего autosave-снимка.
+    // Аргумент по значению: snapshot получает копию, финализация — move.
+    static void mergePersistenceCaptureAttempt(SkMacro& snapshot, SkAttemptSegment attempt) {
+        if (!attempt.hasData()) return;
+        if (attempt.deathTick <= 0 && attempt.inputs.size() >= snapshot.inputs.size()) {
+            snapshot.inputs = std::move(attempt.inputs);
+            snapshot.anchors = std::move(attempt.anchors);
+            snapshot.perFrames = std::move(attempt.perFrames);
+        } else {
+            snapshot.persistenceAttempts.push_back(std::move(attempt));
+        }
+    }
+
+    void appendPendingPersistenceTo(SkMacro& snapshot) const {
+        if (canUsePersistenceCapture()) {
+            mergePersistenceCaptureAttempt(snapshot, persistenceCaptureAttempt);
+        }
+    }
+
     void flushPendingPersistenceCaptureAttempt() {
         if (!activeSk || !persistenceCaptureAttempt.hasData()) {
             persistenceCaptureAttempt = {};
             persistenceCaptureDeathRecorded = false;
             return;
         }
-        if (persistenceCaptureAttempt.deathTick <= 0 &&
-            persistenceCaptureAttempt.inputs.size() >= activeSk->inputs.size()) {
-            const size_t inCount = persistenceCaptureAttempt.inputs.size();
-            const size_t pfCount = persistenceCaptureAttempt.perFrames.size();
-            activeSk->inputs = std::move(persistenceCaptureAttempt.inputs);
-            activeSk->anchors = std::move(persistenceCaptureAttempt.anchors);
-            activeSk->perFrames = std::move(persistenceCaptureAttempt.perFrames);
+        // Deathless survivor runs are the FINAL timeline candidate: promote to
+        // MAIN whenever the survivor is at least as long as current main
+        // (same wholesale-replace rule as completePersistenceCaptureAttempt).
+        // The old 'main must be empty' condition stranded a 20-input survivor
+        // in the chain behind a stale 6-input main, and main-first playback
+        // then ignored the good run. A survivor never belongs in the chain
+        // (a link without death never advances); it stays there only as a
+        // fallback when main is already longer (unreachable, harmless).
+        const bool promote = persistenceCaptureAttempt.deathTick <= 0 &&
+            persistenceCaptureAttempt.inputs.size() >= activeSk->inputs.size();
+        const size_t inCount = persistenceCaptureAttempt.inputs.size();
+        const size_t pfCount = persistenceCaptureAttempt.perFrames.size();
+        mergePersistenceCaptureAttempt(*activeSk, std::move(persistenceCaptureAttempt));
+        if (promote) {
             skkbot2::log::info("RECORD flush: survivor promoted to MAIN (inputs={} frames={})",
                 inCount, pfCount);
         } else {
-            activeSk->persistenceAttempts.push_back(std::move(persistenceCaptureAttempt));
             skkbot2::log::info("RECORD flush: segment appended to chain (#{} links)",
                 activeSk->persistenceAttempts.size());
         }
@@ -1792,6 +2349,16 @@ bool syncAccuracyFromGame() {
         persistenceCaptureDeathRecorded = false;
     }
 
+    // Variance session state (GJBaseGameLayer::m_varianceValues, 2000 slots
+    // consumed by offset-variance objects and random triggers). Recording:
+    // snapshot the non-zero slots while the level is live. Playback: force-
+    // prefill those slots at every attempt start, so variance reads match the
+    // recorded session regardless of how this game session's RNG history was
+    // shaped. Slots that were still lazy at capture time are deliberately not
+    // written - the locked per-tick reseed rerolls them to the same value.
+    // Does activeSk belong to the level that is currently loading/live?
+    // id>0 compares ids; id==0 (editor/unpublished) falls back to name;
+    // empty metadata (legacy macros) is treated as matching.
     bool activeSkMatchesCurrentLevel() const {
         if (!activeSk) {
             return false;
@@ -1807,7 +2374,17 @@ bool syncAccuracyFromGame() {
         return activeSk->levelName.empty() || activeSk->levelName == level->m_levelName.c_str();
     }
 
+    // R1 setup-seed parity (toasty-lite model, bindings only): GD chains
+    // global fast_srand AND GJBaseGameLayer::m_randomSeed/m_replayRandSeed
+    // through resetLevel to derive per-attempt object rolls (variance index,
+    // random triggers). The chain input differs between sessions (menu
+    // consumes LCG!) -> blocks land px-off -> deterministic mid-run deaths.
+    // Force the layer's seed triple to a constant derived from rngSeedVal on
+    // EVERY attempt in BOTH capture and playback (toasty-lite applies after
+    // vanilla reset so GD's own derivation is overwritten, fully stateless).
     static constexpr uint64_t forcedAttemptSeed() {
+        // splitmix64 of the macro's rng seed base - distinct per rngSeedVal,
+        // nonzero, well-distributed into the LCG chain
         uint64_t z = static_cast<uint64_t>(rngSeedVal) + 0x9E3779B97F4A7C15ull;
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
@@ -1815,12 +2392,15 @@ bool syncAccuracyFromGame() {
     }
 
     uint64_t macroSetupSeed() const {
+        // legacy captures stored the observed pre-reset state - keep using it;
+        // new recordings get the forced constant (stamped on capture below).
         if (activeSk && activeSk->setupRngSeed != 0) {
             return activeSk->setupRngSeed;
         }
         return forcedAttemptSeed();
     }
 
+    // BEFORE vanilla resetLevel derives attempt state: feed the chain input.
     void pinSetupSeedBeforeReset() {
         if (!activeSk) {
             return;
@@ -1830,6 +2410,10 @@ bool syncAccuracyFromGame() {
                 if (activeSk->setupRngSeed == 0) {
                     activeSk->setupRngSeed = forcedAttemptSeed();
                 }
+                // Snapshot counters BEFORE vanilla init re-reads them; GD does
+                // not clear persistent counters at retry, so the map visible
+                // here is exactly what this attempt starts with. The last
+                // stamped attempt is the survivor that becomes MAIN.
                 if (auto* playLayer = PlayLayer::get()) {
                     if (auto* em = playLayer->m_effectManager) {
                         activeSk->persistentItems.assign(
@@ -1847,6 +2431,9 @@ bool syncAccuracyFromGame() {
         }
     }
 
+    // AFTER vanilla resetLevel: overwrite GD's freshly derived state with the
+    // forced constants (toasty-lite ordering - post-reset write beats the
+    // session-dependent derivation inside vanilla).
     void forceLayerSeeds() {
         if (!activeSk || !activeSkMatchesCurrentLevel()) {
             return;
@@ -1862,21 +2449,28 @@ bool syncAccuracyFromGame() {
     }
 
     void captureVarianceSnapshot() {
+        if (activeSk) captureVarianceSnapshot(*activeSk);
+    }
+
+    void captureVarianceSnapshot(SkMacro& snapshot) const {
         if (!activeSk || !activeSkMatchesCurrentLevel()) {
+            // Do not let a foreign level's freshly-rolled variance table
+            // overwrite the macro's recorded one (halt from the cross-level
+            // init guard must not corrupt the kept macro's data).
             return;
         }
         auto* playLayer = PlayLayer::get();
         if (!playLayer) {
             return;
         }
-        activeSk->varianceOverrides.clear();
+        snapshot.varianceOverrides.clear();
         size_t index = 0;
         for (const float& value : playLayer->m_varianceValues) {
             if (value != 0.0f && std::isfinite(value) && index < playLayer->m_varianceValues.size()) {
                 SkVarianceEntry entry;
                 entry.index = static_cast<uint16_t>(index);
                 entry.value = value;
-                activeSk->varianceOverrides.push_back(entry);
+                snapshot.varianceOverrides.push_back(entry);
             }
             ++index;
         }
@@ -1887,18 +2481,30 @@ bool syncAccuracyFromGame() {
             return;
         }
         if (!activeSkMatchesCurrentLevel()) {
+            // Playing a foreign-level macro already desyncs; do not ALSO
+            // spray its variance slots into this level's table.
             return;
         }
         auto* playLayer = PlayLayer::get();
         if (!playLayer) {
             return;
         }
+        // m_varianceValues is absolute STATE, not a stream: GD fills it at
+        // level load and objects read slots directly (no lazy reroll on read),
+        // and it is not refilled per attempt. So playback restores the exact
+        // captured table: clear everything, then write the recorded non-zero
+        // slots. Slots absent from the snapshot were zero at capture time.
         std::fill(playLayer->m_varianceValues.begin(), playLayer->m_varianceValues.end(), 0.0f);
         for (auto const& entry : activeSk->varianceOverrides) {
             if (entry.index < playLayer->m_varianceValues.size()) {
                 playLayer->m_varianceValues[entry.index] = entry.value;
             }
         }
+        // Persistent trigger counters: the recorded run may have been played
+        // as attempt N of its session (counters already non-zero); the fresh
+        // replay session starts them at zero, which moves every
+        // "count/count-equals/counter" gated object -> single-point world
+        // deaths at identical ticks. Re-apply the captured map per attempt.
         if (auto* em = playLayer->m_effectManager) {
             em->m_persistentItemCountMap.clear();
             for (auto const& item : activeSk->persistentItems) {
@@ -1925,6 +2531,8 @@ bool syncAccuracyFromGame() {
             return;
         }
 
+        // Never put death-animation input into a macro. In particular,
+        // platformer callbacks can arrive between destroyPlayer and resetLevel.
         if (auto* layer = PlayLayer::get()) {
             if ((layer->m_player1 && layer->m_player1->m_isDead) ||
                 (layer->m_player2 && layer->m_player2->m_isDead)) {
@@ -1945,6 +2553,11 @@ bool syncAccuracyFromGame() {
         }
     }
 
+    // Orientation-state change probe for both record and playback. Fires only
+    // when (gravity sign | level-upside-down | spider | 5-deg rotation bucket)
+    // changes for either player, so a spider section yields a short event
+    // stream that can be diffed rec-vs-play to answer 'recorded wrong or
+    // replayed wrong' for the character's gravity facing.
     static uint64_t gravStateKey(PlayerObject* p, uint64_t shift) {
         if (!p) {
             return 1ULL << shift;
@@ -1952,10 +2565,17 @@ bool syncAccuracyFromGame() {
         uint64_t g = (p->m_gravity < 0.0) ? 1ULL : 0ULL;
         uint64_t ud = p->m_isUpsideDown ? 2ULL : 0ULL;
         uint64_t sp = p->m_isSpider ? 4ULL : 0ULL;
+        // Node scale signs: GD flips some vehicle/spider visuals through
+        // scaleX/scaleY rather than gravity; invisible to the g/ud/rot triple.
         uint64_t sx = p->getScaleX() < 0.0 ? 8ULL : 0ULL;
         uint64_t sy = p->getScaleY() < 0.0 ? 16ULL : 0ULL;
+        // Dash-ring hold state: the ring object currently driving the
+        // 'pressed' pose (null = not on a dash ring) + dashing flag. The
+        // reported 'hold animation never plays' is this, not gravity.
         uint64_t dr = p->m_dashRing ? 32ULL : 0ULL;
         uint64_t dash = p->m_isDashing ? 64ULL : 0ULL;
+        // Spider sprite is a CHILD node with its own rotation/scale - legs
+        // orientation lives there, root scale/rot can match while it is wrong.
         uint64_t spr = 0;
         if (auto* spider = p->m_spiderSprite) {
             const double srot = std::fmod(std::fabs(static_cast<double>(spider->getRotation())), 360.0);
@@ -1964,7 +2584,7 @@ bool syncAccuracyFromGame() {
             if (spider->getScaleY() < 0.0) spr |= (1ULL << 13);
         }
         double rot = std::fmod(std::fabs(static_cast<double>(p->getRotation())), 360.0);
-        uint64_t rotb = static_cast<uint64_t>(static_cast<int>(rot / 5.0)) & 0x7FULL;
+        uint64_t rotb = static_cast<uint64_t>(static_cast<int>(rot / 5.0)) & 0x7FULL; // bits 14-20
         return (g | ud | sp | sx | sy | dr | dash | spr | (rotb << 14)) << shift;
     }
 
@@ -1977,6 +2597,9 @@ bool syncAccuracyFromGame() {
             camKey = camBucket << 48;
         }
         const uint64_t key = gravStateKey(p1, 0) | gravStateKey(p2, 24) | camKey;
+        // Change-only logging misses channels that move in one session and
+        // sit still in the other; a forced digest every 480 ticks (2s) keeps
+        // both sides comparable everywhere at trivial log cost.
         const bool periodic = (tick % 480) == 0;
         if (key == gravProbeLast && !periodic) {
             return;
@@ -2008,6 +2631,10 @@ bool syncAccuracyFromGame() {
             p2 && p2->m_spiderSprite && p2->m_spiderSprite->getScaleX() < 0.0 ? -1 : 1,
             p2 && p2->m_spiderSprite && p2->m_spiderSprite->getScaleY() < 0.0 ? -1 : 1,
             p2 ? static_cast<double>(p2->getRotation()) : 0.0);
+        // Dash-ring witness: when either player holds a ring, log ring vs
+        // player positions + touching-ring counts. Decides the reattach
+        // mystery: ring physically elsewhere (moving object, unpinned) vs
+        // ring present but GD refusing the hold.
         {
             auto ringWitness = [&](PlayerObject* p, const char* tag) {
                 if (!p) return;
@@ -2027,6 +2654,16 @@ bool syncAccuracyFromGame() {
         }
     }
 
+    // BUG-04 study: diff the LIVE player's gravity/ud against the RECORDED
+    // per-frame target for the same effective tick. Unlike gravStateProbe
+    // (which logs change-only state snapshots on both sides) this fires ONLY
+    // when live disagrees with the recorded frame and stamps the relation:
+    //   [raw]      - live BEFORE reconcile: GD's own physics already differ
+    //                from the recording (the phantom originated in physics)
+    //   [applied]  - live AFTER reconcile: our per-frame application still
+    //                disagrees (the phantom is either not being applied or
+    //                is swallowed by a later physics step)
+    // Historically rare, so a small cap avoids log floods on a bad run.
     void gravDiffProbe(const char* stage, int tick, PlayerObject* p1, PlayerObject* p2) {
         if (gravDiffReports >= kGravDiffReportCap) {
             return;
@@ -2035,6 +2672,15 @@ bool syncAccuracyFromGame() {
         if (!frames || frames->empty() || !p1) {
             return;
         }
+        // The recorded frame owning `tick`: the last pf.tick <= tick (frames up to
+        // `tick` may be missing due to duplicate compression). Frames are
+        // sorted by tick ascending - binary search. The old reverse linear
+        // scan was O(n) PER CALL, twice per tick: at tps=10000 with a 65k
+        // frame macro that is ~1.3 CPU-s/s - the sampling profiler caught
+        // gravDiffProbe at 55.5% of all main-thread samples (session 08:19,
+        // 08:19:08 report) - the "cold per-step" cost was our own probe, not
+        // GD physics. Clean runs never hit the report cap, so the scan ran
+        // on every single tick forever.
         auto it = std::upper_bound(
             frames->begin(), frames->end(), tick,
             [](int t, const typename std::remove_reference_t<decltype(
@@ -2074,6 +2720,8 @@ bool syncAccuracyFromGame() {
             return;
         }
 
+        // Per-frame state and anchors are the trajectory stream. A dead frame
+        // is not a legal point on the clean route and must never be serialized.
         if (captureDeathPending || (player1 && player1->m_isDead) ||
             (player2 && player2->m_isDead)) {
             return;
@@ -2081,6 +2729,15 @@ bool syncAccuracyFromGame() {
 
         gravStateProbe("rec", tick, player1, player2);
 
+        // Hold-bit probe: the game-side held state (button 1) per slot,
+        // logged on change. Distinguishes the two remaining suspects of the
+        // 'p2 press never activated the trigger' reports: a touch the game
+        // never delivered (bit stays 0 across the physical press) vs one it
+        // holds stuck at 1 after a lost release (cocos multi-touch glitch).
+        // Diagnostic extension: also dump on a 30-tick cadence even without a
+        // change, and include Y velocity + residual jump flags so a self-jump
+        // that bypasses m_holdingButtons entirely (post-restore jumpBuffered /
+        // robot residue) still shows up.
         {
             auto heldBit = [](PlayerObject* p, int b) -> int {
                 if (!p) return -1;
@@ -2116,6 +2773,10 @@ bool syncAccuracyFromGame() {
             }
         }
 
+        // Start-position state isn't known at beginCapture (it runs before
+        // PlayLayer::init builds m_startPosObject). Stamp it on the first
+        // captured tick so recordedFromStartPos/startPosX/Y describe the real
+        // run start; playback's SP guard depends on it.
         if (!activeSk->startPosStamped) {
             activeSk->startPosStamped = true;
             if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_startPosObject) {
@@ -2128,6 +2789,8 @@ bool syncAccuracyFromGame() {
         }
 
         if (canUsePersistenceCapture()) {
+            // Attempt ticks are run-local (restart at zero); each segment owns
+            // a full per-frame stream in that same local coordinate space.
             activeSk->recordPerFrame(persistenceCaptureAttempt.perFrames, tick, player1, player2);
             if (persistenceCaptureAttempt.inputs.empty()) {
                 return;
@@ -2136,6 +2799,10 @@ bool syncAccuracyFromGame() {
         } else {
             SkMacro* recSk = captureStaging ? captureStaging : activeSk;
             recSk->recordPerFrame(tick, player1, player2);
+            // First frame after a practice respawn: verify the seam is sealed.
+            // The boundary frame at `tick-1` was rewritten by captureResealBoundaryFrame
+            // to the respawn position; if this frame is far from it the splice is
+            // still broken (a >30px delta = the BUG-06 seam leaking into the line).
             if (pendingRngBoundary.progress > 0) {
                 float const gap = [&]() -> float {
                     if (recSk->perFrames.size() < 2) return 0.0f;
@@ -2157,6 +2824,12 @@ bool syncAccuracyFromGame() {
                 boundary.tick = tick;
                 boundary.progress = pendingRngBoundary.progress;
                 auto liveTriple = skk::captureTripleRng();
+                // The boundary stores the LIVE post-restore globals - this is
+                // the exact state the segment runs under, not a formula guess.
+                // Teleport persists unchanged across a fast_srand respawn,
+                // so taking it here (first captured frame) reproduces the
+                // capture path precisely. Shake is captured the same way now
+                // that it is locked for both SKK and SKC.
                 boundary.primary = liveTriple.primary;
                 boundary.shake = skk::shakeStateGet();
                 boundary.teleport = liveTriple.teleport;
@@ -2172,6 +2845,17 @@ bool syncAccuracyFromGame() {
                 return;
             }
 
+            // Gravity-flip forensic window (record side).
+            //
+            // A UFO that touches a gravity portal during RECORD looked correct but
+            // the macro replayed it frozen at that instant, so either the sampling
+            // point lags a tick behind the portal effect or playback fails to apply
+            // it. Both are visible only if we dump the recorded bits around the
+            // transition: if the flip first appears one tick AFTER the live player
+            // already changed, the record is the culprit; if the recorded flip is on
+            // time, playback is. captureTick() runs on the step-grid hook
+            // (stepCount@0x340B18), which fires BEFORE GD's collision pass, so the
+            // lag is the prime suspect.
             if (player1 && recSk->perFrames.size() >= 1) {
                 auto const& back = recSk->perFrames.back();
                 const bool nowUD = (back.p1vis & kVisualUpsideDown) != 0;
@@ -2211,6 +2895,9 @@ bool syncAccuracyFromGame() {
 
         persistenceCaptureAttempt.deathTick = std::max(1, deathTick);
         persistenceCaptureAttempt.deathPlayer2 = deathPlayer2;
+        // A death segment without a single input is pure noise: on playback
+        // it forces a tick-1 death at the head of the chain ("strange death at
+        // the start of play"). Only keep attempts the user actually played.
         if (!persistenceCaptureAttempt.inputs.empty() && persistenceCaptureAttempt.hasData()) {
             activeSk->persistenceAttempts.push_back(std::move(persistenceCaptureAttempt));
             markActiveMacroDirty();
@@ -2375,6 +3062,9 @@ bool syncAccuracyFromGame() {
         rng.fastRandState = GameToolbox::getfast_srand();
         rng.locked = rngLocked;
         rng.seed = rngSeedVal;
+        // Shake is locked for BOTH SKK and SKC now, so it must be captured
+        // like any other locked stream - otherwise a checkpoint taken
+        // mid-attempt stores 0 and the practice restore cannot rewind it.
         rng.shakeState = skk::shakeStateGet();
         rng.teleportState = *skk::gdTeleportRng();
         return rng;
@@ -2475,11 +3165,32 @@ bool syncAccuracyFromGame() {
     );
     void armQueuedSubstepTick(std::vector<QueuedSubstepInput> actions);
     void truncateRecordedDataAfter(int tick);
+    // Juice-fix (GucciBot): a respawn/reset cut of the input stream can slice a
+    // press/release pair - the press stays while its release lands beyond the
+    // seam (Popped by truncateAfter or suppressed by the post-restore window),
+    // so a held key replays as permanently stuck across the stitch. Re-scan the
+    // retained tail and append one synthetic release per dangling (p2, button)
+    // edge at the seam tick so every pair closes on the boundary.
     static void closeSeamHoldEdges(std::vector<SkInput>& inputs, int boundaryTick);
     void prepareCaptureRestore(int tick);
+    // После snapshot-restore закрывает только оборванные пары и один раз
+    // сверяет восстановленные удержания с физическими клавишами (только SKK capture).
     void finishCaptureRestore(PlayLayer* playLayer, int tick);
     int reconcileCaptureRestore(PlayLayer* playLayer, int tick);
+    // BUG-06 record-side seal: after a practice checkpoint restore, rewrite the
+    // recorded boundary frame at `tick` (kept by truncateAfter from the dying
+    // attempt) to the post-restore respawn position. Without this the seam
+    // frame keeps the corpse tail position (e.g. x=17099) while the retry's
+    // first frame (tick+1) is at the spawn position (x=17228) - a ~130px jump
+    // recorded straight into the per-frame line. Sealing makes the boundary
+    // smooth and leaves one legit checkpoint teleport for Play to snap.
     void captureResealBoundaryFrame(int tick, PlayerObject* p1, PlayerObject* p2, bool isPlatformer, bool isDual);
+    // BUG-06 playback-side mapping: the recorded streams are labelled with the
+    // capture step clock, but practice respawns re-align against the game-time
+    // tick (m_levelTime). Map a game-time respawn tick back to the step-clock
+    // tick of the first retry frame (bundle.priorTick + 1) so Play continues
+    // from the seamless splice, not the 130px-behind dying tail. Returns -1
+    // when no checkpoint bundle matches (level start, no checkpoints).
     int respawnStepTickForGameTick(int gameTick);
     void restoreLockedRngState(uintptr_t rngState);
     void restoreLockedShakeState(uint64_t shakeState);

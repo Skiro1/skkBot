@@ -10,9 +10,14 @@
 
 namespace skk::playback_align {
 
+    // Position coverage tolerances shared by the armed-waiting takeover and the
+    // reset-spawn coverage gate (also used by the editor playtest attempt arm).
     inline constexpr float kPlaybackTightTolerance = 8.0f;
     inline constexpr float kPlaybackTakeoverYTolerance = 24.0f;
 
+    // Level-time label for the given gameplay layer at the current physics
+    // boundary. Works for both PlayLayer and an editor playtest (LevelEditorLayer
+    // is a GJBaseGameLayer with the same gameState).
     inline int computePlaybackTick(GJBaseGameLayer* layer) {
         if (!layer) {
             return 0;
@@ -51,6 +56,12 @@ namespace skk::playback_align {
         return static_cast<size_t>(std::distance(frames.begin(), it));
     }
 
+    // Non-standard-start support: find the recorded tick whose p1 X coordinate
+    // best matches the reference X (where the character currently spawns/stands).
+    // GD levels advance along X, so X is the alignment axis; Y at the same X
+    // varies across attempts (jump height/phase), so it is deliberately ignored.
+    // Returns -1 when the recording has NO frame within `tolerance` of refX -
+    // i.e. the macro never covered that spot and there is nothing to align to.
     inline int matchRecordedTickByPosition(std::vector<SkPerFrame> const& frames, float refX, float tolerance) {
         if (frames.empty()) {
             return -1;
@@ -83,6 +94,11 @@ namespace skk::playback_align {
         return bestTick;
     }
 
+    // Combined X+Y proximity match for a LIVE takeover. The player is mid-flight
+    // at (refX, refY), so matching X alone could snap them vertically to a
+    // recorded frame whose Y at the same X is far away. Both deltas bound the
+    // visual jump the takeover is allowed to make. Returns the tick of the
+    // closest frame within both tolerances (min |dx| wins), or -1.
     inline int matchRecordedTickByPositionXY(std::vector<SkPerFrame> const& frames,
                                              float refX, float refY,
                                              float xTolerance, float yTolerance) {
@@ -133,6 +149,14 @@ namespace skk::playback_align {
         return bestTick;
     }
 
+    // Start-pos alignment: nearest pose the recording actually covers, within
+    // the same tight window as the coverage gate (kPlaybackTightTolerance /
+    // kPlaybackTakeoverYTolerance). The previous 50px-euclidean search returned
+    // the EARLIEST in-window anchor (tick 187 at (285.8,2975.3) for a spawn at
+    // (315,3015)) even when an ~matching pose existed right at the spawn, and
+    // its offset was measured from the game-time label instead of the step-clock
+    // baseline - a negative offset put playback into a blind pre-roll before the
+    // recording's first frame and the "activated" bot silently fed nothing.
     inline int matchStartPosTargetTick(ReplayEngine* engine,
                                        std::vector<PlaybackAnchor> const& anchors,
                                        float refX, float refY) {
@@ -150,9 +174,17 @@ namespace skk::playback_align {
         return -1;
     }
 
-    inline int playbackBaselineTick(GJBaseGameLayer* layer, ReplayEngine* engine) {
+    enum class AlignmentPhase { BeforeStep, InStep };
+
+    // Reset/live takeover вызываются ДО следующего processCommands: он сначала
+    // увеличит count, затем current() вернёт count+1. При count=0 первый label=2,
+    // не 1. Editor arm идёт уже ПОСЛЕ дробного dt*TPS-инкремента текущего шага.
+    // Это только база tickOffset; сами часы и timing/feed не меняются.
+    inline int playbackBaselineTick(GJBaseGameLayer* layer, ReplayEngine* engine,
+                                     AlignmentPhase phase = AlignmentPhase::BeforeStep) {
         if (engine->stepClock) {
-            return std::max(0, engine->stepPairCount + 1);
+            const int advance = phase == AlignmentPhase::BeforeStep ? 1 : 0;
+            return std::max(0, engine->stepPairCount + advance + 1);
         }
         return computePlaybackTick(layer);
     }

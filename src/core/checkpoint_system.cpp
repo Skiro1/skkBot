@@ -3,8 +3,12 @@
 #include "core/start_position_policy.hpp"
 #include "physics/anti_ssb.hpp"
 #include "core/checkpoint_handler.hpp"
+#include "core/checkpoint_creation.hpp"
+#include "core/seam_phase_probe.hpp"
+#include "core/step_trace.hpp"
 #include "core/broken_object_tracker.hpp"
 #include "core/physical_keys.hpp"
+#include "core/capture_reconciliation.hpp"
 #include "core/paths.hpp"
 #include "core/practice_fix_bridge.hpp"
 #include "core/playback_align.hpp"
@@ -12,11 +16,16 @@
 #include "render/renderer.hpp"
 #include "trajectory/trajectory.hpp"
 #include "skc/skc_bot.hpp"
+#include "skc/skc_checkpoint.hpp"
+#include "skc/skc_frame.hpp"
 
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #endif
 
+// Playback alignment helpers (position matching, tick baselines, coverage
+// tolerances) moved to core/playback_align.hpp so the editor playtest path can
+// reuse the exact logic that powers the PlayLayer attempt takeovers.
 using namespace skk::playback_align;
 
 #include "core/frame_stepper.hpp"
@@ -41,6 +50,15 @@ using namespace skk::playback_align;
 using namespace geode::prelude;
 
 namespace {
+    void logCheckpointRngPhase(char const* phase, CheckpointStateBundle const& state) {
+        const auto live = skk::captureTripleRng();
+        skkbot2::log::info(
+            "[CK-RNG] phase={} tick={} prior={} live=({:X},{:X},{:X}) snap=({:X},{:X},{:X}) wire={}",
+            phase, state.tick, state.priorTick, live.primary, live.teleport,
+            skk::shakeStateGet(), state.rng.fastRandState, state.rng.teleportState,
+            state.rng.shakeState, !state.hasPlayerState);
+    }
+
     void incrementSaturated(int& value) {
         if (value < std::numeric_limits<int>::max()) {
             ++value;
@@ -199,10 +217,13 @@ void refreshRngState(bool isLevelStart) {
             : computeFallbackSeed();
         GameToolbox::fast_srand(computedSeed);
 
+        // Triple RNG lock: pin teleport at attempt/level start.
+        // Use the same seed derivation so all channels are deterministic.
         if (isLevelStart || attemptStart) {
             uint64_t teleportSeed = skk::lcgAdvance(computedSeed);
             skk::pinTripleSeedAtReset(computedSeed, teleportSeed);
 
+            // Reseed per-object advanced randoms (2068/1912/3607).
             skk::advRandomReseed(computedSeed);
 
             skkbot2::log::info("rng lock armed: seedBase={} progress={} -> "
@@ -210,6 +231,11 @@ void refreshRngState(bool isLevelStart) {
                 seedBase, playLayer->m_gameState.m_currentProgress,
                 computedSeed, teleportSeed);
 
+            // Splice boundary fallback (capture): a practice respawn re-arms
+            // mid-run. Latch the triple we just seeded here as the default;
+            // the checkpoint-restore latch that follows overrides it with the
+            // LIVE post-restore globals. If no restore runs (unknown checkpoint)
+            // this seed-family snapshot is what the segment actually starts from.
             if (engine->engineMode == MODE_CAPTURE && !attemptStart) {
                 auto triple = skk::captureTripleRng();
                 engine->pendingRngBoundary.progress = playLayer->m_gameState.m_currentProgress;
@@ -300,6 +326,11 @@ bool ReplayEngine::saveActiveMacro() {
             return false;
         }
 
+        // Live restore points are authoritative when the level is still open.
+        // After a level exit, onQuit already materialized them into the macro
+        // and cleared the map (BUG-19); re-capturing then would overwrite the
+        // preserved set with an empty one and drop every practice-fix
+        // checkpoint recorded this session.
         if (!storedRestorePoints.empty() || activeSk->practiceFixCheckpoints.empty()) {
             activeSk->practiceFixCheckpoints = skk::bridge::captureRestorePointsToWire(
                 storedRestorePoints, activeSk->framerate > 0.0 ? activeSk->framerate : tickRate);
@@ -311,6 +342,11 @@ bool ReplayEngine::saveActiveMacro() {
             return false;
         }
 
+        // Snapshot the macro on the game thread (cheap vector copies), then
+        // serialize + zstd-compress + write on a worker thread so a several-MB
+        // .skk never blocks the game loop. Only the immutable write metadata is
+        // merged back, on the main thread - never the recorded streams, so a
+        // concurrent recording cannot be clobbered by an in-flight snapshot.
         SkMacro snapshot = *activeSk;
         snapshot.author = GJAccountManager::get()->m_username;
         snapshot.recordTimestamp = static_cast<int64_t>(std::time(nullptr));
@@ -331,8 +367,12 @@ bool ReplayEngine::saveActiveMacro() {
         }
 
         SkMacro* live = activeSk;
+        const auto savedGeneration = macroGeneration;
+        const auto savedRevision = macroRevision;
+        const auto originalName = activeSk->name;
+        const bool savedWhileRecording = engineMode == MODE_CAPTURE;
         macroSaveInFlight = true;
-        std::thread worker([this, live, snapshot = std::move(snapshot)]() mutable {
+        std::thread worker([this, live, savedGeneration, savedRevision, originalName, savedWhileRecording, snapshot = std::move(snapshot)]() mutable {
             std::error_code ec;
             auto directory = skkbot2::paths::replays();
             if (!std::filesystem::exists(directory, ec)) {
@@ -343,6 +383,7 @@ bool ReplayEngine::saveActiveMacro() {
             if (!ec) {
                 skkbot2::log::info("[SAVE] worker: makeUniqueReplayName ENTRY name={}", snapshot.name);
                 skkbot2::Logger::get().flush();
+                // Exact name+.skk match gets _n+1, always - see makeUniqueReplayName.
                 snapshot.name = ReplayStorage::makeUniqueReplayNameInDirectory(
                     directory, snapshot.name, ".skk");
                 snapshot.persistedName = snapshot.name;
@@ -355,7 +396,7 @@ bool ReplayEngine::saveActiveMacro() {
             } else {
                 skkbot2::log::error("Could not prepare replay directory '{}': {}", skk::pathToUtf8(directory), ec.message());
             }
-            geode::queueInMainThread([this, live, ok, resolvedName = std::move(resolvedName), snapshot = std::move(snapshot)]() mutable {
+            geode::queueInMainThread([this, live, savedGeneration, savedRevision, originalName, savedWhileRecording, ok, resolvedName = std::move(resolvedName), snapshot = std::move(snapshot)]() mutable {
                 skkbot2::log::info("[SAVE] main-thread callback ENTRY ok={}", (bool)ok);
                 skkbot2::Logger::get().flush();
                 macroSaveInFlight = false;
@@ -366,7 +407,13 @@ bool ReplayEngine::saveActiveMacro() {
                 }
                 skkbot2::log::info("[SAVE] main-thread callback: merging metadata into activeSk");
                 skkbot2::Logger::get().flush();
-                if (skMode && activeSk && activeSk == live) {
+                // Only merge scalar write metadata. If activeSk was replaced
+                // (Clear/Load) while the save ran, skip - the file is still
+                // valid on disk and the new macro owns the name.
+                const bool unchanged = skMode && activeSk && activeSk == live &&
+                    macroGeneration == savedGeneration && macroRevision == savedRevision &&
+                    activeSk->name == originalName && !savedWhileRecording && engineMode != MODE_CAPTURE;
+                if (unchanged) {
                     activeSk->name = snapshot.name;
                     activeSk->persistedName = snapshot.persistedName;
                     activeSk->duration = snapshot.duration;
@@ -374,10 +421,11 @@ bool ReplayEngine::saveActiveMacro() {
                     activeSk->fileFormat = SkFileFormat::SKK3;
                     activeSk->accuracyMode = snapshot.accuracyMode;
                     activeSk->exactCbsTiming = snapshot.exactCbsTiming;
+                    dataModified = false;
                 }
-                skkbot2::log::info("[SAVE] main-thread callback: dataModified=false, reloadMacroList");
+                skkbot2::log::info("[SAVE] callback: metadataMerged={} generation={}/{} revision={}/{} dirty={}",
+                    unchanged, macroGeneration, savedGeneration, macroRevision, savedRevision, dataModified);
                 skkbot2::Logger::get().flush();
-                dataModified = false;
                 reloadMacroList();
                 skkbot2::log::info("[SAVE] main-thread callback: notification");
                 skkbot2::Logger::get().flush();
@@ -412,6 +460,7 @@ bool ReplayEngine::saveActiveMacro() {
 }
 
 void ReplayEngine::discardActiveMacro() {
+    ++macroGeneration;
     endReplayAccuracyEnvironment();
 
     if (activeSk) {
@@ -447,6 +496,9 @@ void ReplayEngine::closeSeamHoldEdges(std::vector<SkInput>& inputs, int boundary
     if (inputs.empty()) {
         return;
     }
+    // Сканируем сохранённый хвост: press открывает пару (raw p2, button),
+    // release закрывает её. Вызывается ТОЛЬКО после snapshot-restore: открытая
+    // пара закрывается на boundary лишь если snapshot не продолжает это удержание.
     bool open[2][3] = {};
     for (SkInput const& input : inputs) {
         if (input.tick > boundaryTick) {
@@ -471,6 +523,9 @@ void ReplayEngine::closeSeamHoldEdges(std::vector<SkInput>& inputs, int boundary
                 continue;
             }
 
+            // В SKInput хранится raw-параметр handleButton. При control flip он
+            // адресует противоположный PlayerObject, поэтому snapshot берём из
+            // того же объекта, которому playback передаст этот raw-параметр.
             bool snapshotP2 = slot == 1;
             if (hasSecondPlayer) {
                 snapshotP2 = handleButtonPlayer2Param(snapshotP2, flip);
@@ -494,7 +549,7 @@ void ReplayEngine::closeSeamHoldEdges(std::vector<SkInput>& inputs, int boundary
             release.setPressed(false);
             release.stepOffset = 0.0f;
             release.cbsTimeOffset = -1.0;
-            release.timeSeconds = -1.0;
+            release.timeSeconds = -1.0;  // tick-derived time on serialize
             release.swiftPairAnchor = false;
             inputs.push_back(release);
             ++appended;
@@ -531,6 +586,7 @@ void ReplayEngine::truncateRecordedDataAfter(int tick) {
         }
 
         activeSk->truncateAfter(tick);
+        skkbot2::step_trace::trim(tick);
         skkbot2::log::debug("CAPTURE truncate: to tick={} inputs={} anchors={} frames={} "
             "backFrame=({:.3f},{:.3f} {:.3f},{:.3f}) backAnchorTick={}",
             tick,
@@ -557,9 +613,21 @@ void ReplayEngine::prepareCaptureRestore(int tick) {
         tick, stepPairCount, lastTickIndex);
     resetDeferredInputState();
     resetTimingTracking();
+    // CBS offset baseline: resetTimingTracking zeroes tickStartTimestamp.  The
+    // first raw press right after a checkpoint restore would then compute
+    // cbsTimeOffset = m_timestamp - 0.0 = the ENTIRE accumulated game clock
+    // (e.g. 121617s), corrupting one input per death (timeSeconds non-monotonic
+    // => on-disk 'unsorted inputs', playback freezes on the giant tick).
+    // Anchor the baseline to the live clock so the offset stays a small
+    // within-tick phase (the normal update() path re-asserts it every tick).
     if (auto* playLayer = PlayLayer::get()) {
         tickStartTimestamp = playLayer->m_timestamp;
     }
+    // Truncation/respawn staging is a RECORD-only concern: it trims the
+    // growing capture stream to the commit boundary. Replaying must never cut
+    // the source macro (potentially deleting everything past the restore point
+    // of the very stream being replayed). MODE_EXECUTE still needs the timing
+    // reset + skip label below.
     if (engineMode == MODE_CAPTURE) {
         truncateRecordedDataAfter(tick);
         captureOnRespawn(tick);
@@ -568,6 +636,11 @@ void ReplayEngine::prepareCaptureRestore(int tick) {
     tickAccumulator = 0.0f;
 }
 
+// BUG-99 (SKK): сверка snapshot-удержаний с физикой делается ПОСЛЕ полного
+// восстановления чекпоинта. closeSeamHoldEdges знает про snapshot и не рвёт
+// удержание, которое тот продолжает; расхождение с физической клавиатурой
+// становится ровно одним boundary-переходом в активном capture-буфере.
+// Плейбэк сюда не попадает: он остаётся macro-driven.
 int ReplayEngine::reconcileCaptureRestore(PlayLayer* playLayer, int tick) {
     if (engineMode != MODE_CAPTURE || !skMode || !activeSk || !playLayer ||
         !playLayer->m_player1) {
@@ -592,6 +665,9 @@ int ReplayEngine::reconcileCaptureRestore(PlayLayer* playLayer, int tick) {
             const bool physicalHeld = physicalHoldActive(
                 mode, button, slot == 1, player->m_controlsDisabled);
 
+            // SKK хранит raw-параметр handleButton; при control flip он идёт
+            // противоположному объекту. В тень пишем слот, под которым событие
+            // реально попало бы в обычный capture-пайплайн.
             const bool rawP2 = handleButtonPlayer2Param(slot == 1, flip);
             const bool storedP2 = hasSecondPlayer ? rawP2 : false;
             const int shadowIndex =
@@ -601,9 +677,43 @@ int ReplayEngine::reconcileCaptureRestore(PlayLayer* playLayer, int tick) {
                 continue;
             }
 
-            playLayer->GJBaseGameLayer::handleButton(physicalHeld, button, rawP2);
+            // Qualified вызов снова входит в Geode capture-hook. Scoped-гейт
+            // оставляет vanilla-эффект, но не даёт hook записать вторую команду;
+            // единственный boundary-input добавляется ниже напрямую.
+            const double vyBefore = player->m_yVelocity;
+            const bool groundBefore = player->m_isOnGround;
+            const bool bufferedBefore = player->m_jumpBuffered;
+            const auto& targetInputs = canUsePersistenceCapture()
+                ? persistenceCaptureAttempt.inputs
+                : captureStaging ? captureStaging->inputs : activeSk->inputs;
+            const size_t inputsBefore = targetInputs.size();
+            {
+                skkbot2::capture_reconciliation::Scope internalCall;
+                playLayer->GJBaseGameLayer::handleButton(physicalHeld, button, rawP2);
+            }
+            const size_t hookAppended = targetInputs.size() >= inputsBefore
+                ? targetInputs.size() - inputsBefore : 0;
+            if (hookAppended != 0) {
+                skkbot2::log::warn(
+                    "[SKK-RESTORE-EDGE] повторная capture-запись tick={} p={} button={} hookAppended={}",
+                    tick, slot + 1, button, hookAppended);
+            }
             recordSkAction(tick, button, storedP2, physicalHeld, 0.0f, -1.0);
+            const size_t totalAppended = targetInputs.size() >= inputsBefore
+                ? targetInputs.size() - inputsBefore : 0;
             ++transitions;
+            if (skkbot2::step_trace::enabled()) {
+                const auto after = player->m_holdingButtons.find(button);
+                skkbot2::log::info(
+                    "[SKK-RESTORE-EDGE] tick={} p={} button={} edge={} rawP2={} storedP2={} "
+                    "active={} dual={} twoPlayer={} held={}->{} vy={:a}->{:a} ground={}->{} buffered={}->{} "
+                    "hookAppended={} totalAppended={}",
+                    tick, slot + 1, button, physicalHeld ? "press" : "release", rawP2, storedP2,
+                    player->getParent() != nullptr, mode.dual, mode.twoPlayer, snapshotHeld,
+                    after != player->m_holdingButtons.end() && after->second,
+                    vyBefore, static_cast<double>(player->m_yVelocity), groundBefore, player->m_isOnGround,
+                    bufferedBefore, player->m_jumpBuffered, hookAppended, totalAppended);
+            }
             skkbot2::log::info(
                 "[SKK] capture restore reconciliation tick={} p2={} rawP2={} button={} "
                 "snapshot={} physical={} recorded={} route={}",
@@ -625,6 +735,8 @@ void ReplayEngine::finishCaptureRestore(PlayLayer* playLayer, int tick) {
     if (engineMode != MODE_CAPTURE || !skMode || !activeSk) {
         return;
     }
+    // Смерть уже завершена: reconcile пишет в обычный capture-маршрут, а не в
+    // приостановленную death-цепочку.
     captureDeathPending = false;
 
     auto& retainedInputs = canUsePersistenceCapture()
@@ -636,6 +748,7 @@ void ReplayEngine::finishCaptureRestore(PlayLayer* playLayer, int tick) {
     if (retainedInputs.size() != beforeClose || transitions > 0) {
         markActiveMacroDirty();
     }
+    ++captureRestoreSerial;
 }
 
 void ReplayEngine::captureResealBoundaryFrame(
@@ -646,6 +759,11 @@ void ReplayEngine::captureResealBoundaryFrame(
         return;
     }
 
+    // The boundary per-frame (kept by truncateAfter from the dying attempt) must
+    // describe the POST-restore state, i.e. where the retry actually continues
+    // from. Without the seal the recorded line holds the corpse tail position at
+    // `tick` while the retry's first frame (tick+1) sits at the checkpoint spawn
+    // position - a ~130px seam straight into the macro (BUG-06).
     auto& frames = activeSk->perFrames;
     if (frames.empty()) {
         skkbot2::log::debug("CAPTURE reseal: skip tick={} (no per-frames)", tick);
@@ -658,40 +776,27 @@ void ReplayEngine::captureResealBoundaryFrame(
     }
 
     SkPerFrame const old = frames.back();
-    SkPerFrame fresh;
-    fresh.tick = tick;
-    if (p1) {
-        auto pos = p1->getPosition();
-        fresh.p1x = pos.x;
-        fresh.p1y = pos.y;
-        fresh.p1vy = p1->m_yVelocity;
-        fresh.p1vyb = p1->m_yVelocityBeforeSlope;
-        fresh.p1rot = p1->getRotation();
-        fresh.p1vis = visualFlagsOf(p1);
-        if (p1->m_dashRing) {
-            fresh.p1RingId = static_cast<GameObject*>(p1->m_dashRing)->m_objectID;
-        }
-    }
-    if (p2) {
-        fresh.hasPlayer2 = true;
-        auto pos = p2->getPosition();
-        fresh.p2x = pos.x;
-        fresh.p2y = pos.y;
-        fresh.p2vy = p2->m_yVelocity;
-        fresh.p2vyb = p2->m_yVelocityBeforeSlope;
-        fresh.p2rot = p2->getRotation();
-        fresh.p2vis = visualFlagsOf(p2);
-    }
-    frames.back() = std::move(fresh);
+    // Тот же writer, что у обычного capture: dormant P2 не становится живым,
+    // dash-ring ID обоих игроков и visual bits не расходятся на шве.
+    activeSk->recordPerFrame(tick, p1, p2);
+    auto const& fresh = frames.back();
 
     float const dx = fresh.p1x - old.p1x;
     float const dy = fresh.p1y - old.p1y;
     float const dist = std::sqrt(dx * dx + dy * dy);
     skkbot2::log::info("CAPTURE reseal: boundary tick={} p1 old=({:.3f},{:.3f}) -> new=({:.3f},{:.3f}) "
-        "d={:.2f}px frames={} rngLocked={}",
-        tick, old.p1x, old.p1y, fresh.p1x, fresh.p1y, dist, frames.size(), rngLocked ? 1 : 0);
+        "d={:.2f}px frames={} rngLocked={} vy={:.9f}->{:.9f} rot={:.6f}->{:.6f} "
+        "p2Active={}->{} rings=({},{})->({},{}) phase=post-reconcile",
+        tick, old.p1x, old.p1y, fresh.p1x, fresh.p1y, dist, frames.size(), rngLocked ? 1 : 0,
+        old.p1vy, fresh.p1vy, old.p1rot, fresh.p1rot, old.hasPlayer2, fresh.hasPlayer2,
+        old.p1RingId, old.p2RingId, fresh.p1RingId, fresh.p2RingId);
 
+    // Rewrite the boundary anchor too: playback reconcile seeds from anchors, a
+    // stale one (corpse position) there would re-open the seam at tick+1 even
+    // with a clean per-frame line. recordAnchor replaces the tail anchor when it
+    // shares the tick and appends a monotonic-ordered one otherwise.
     activeSk->recordAnchor(tick, p1, p2, isPlatformer, isDual);
+    skkbot2::step_trace::seal(PlayLayer::get(), tick);
     if (!activeSk->anchors.empty() && activeSk->anchors.back().tick == tick) {
         skkbot2::log::debug("CAPTURE reseal: boundary anchor rewritten tick={} (anchors={})",
             tick, activeSk->anchors.size());
@@ -702,6 +807,12 @@ void ReplayEngine::captureResealBoundaryFrame(
 }
 
 int ReplayEngine::respawnStepTickForGameTick(int gameTick) {
+    // The checkpoint bundles carry the game-time label (`tick`) and the
+    // step-clock label (`priorTick` = lastTickIndex on touch). Practice respawn
+    // re-aligns the player at the game-time tick; find the bundle whose game
+    // label is closest and translate to the first retry frame of the recorded
+    // stream (priorTick + 1). Callers fall back to the raw game tick when
+    // nothing matches (level start / no checkpoints).
     const CheckpointStateBundle* best = nullptr;
     int bestDist = std::numeric_limits<int>::max();
     auto consider = [&](CheckpointStateBundle const& b) {
@@ -729,14 +840,24 @@ int ReplayEngine::respawnStepTickForGameTick(int gameTick) {
 
 namespace {
 template <typename T>
-void spliceStagingBucket(std::vector<T>& main, std::vector<T>& staging, int floor) {
-    for (auto const& item : staging) {
-        if (item.tick >= floor) break;
-        if (!main.empty() && item.tick <= main.back().tick) continue;
+void spliceStagingBucket(std::vector<T>& main, std::vector<T>& staging, int floor,
+                         bool appendAtBoundary = false) {
+    // Фиксируем границу ДО переноса, иначе теряем соседние команды одного тика.
+    // Префикс потребляем: повторный commit не должен создавать дубликаты.
+    // Для inputs равный тик допустим (seam-close + reconciliation), а state
+    // boundary-кадр уже запечатан в main и должен остаться единственным.
+    const bool hadMain = !main.empty();
+    const int coveredTick = hadMain ? main.back().tick : 0;
+    auto end = staging.begin();
+    for (; end != staging.end() && end->tick < floor; ++end) {
+        auto const& item = *end;
+        if (hadMain && (item.tick < coveredTick ||
+            (!appendAtBoundary && item.tick == coveredTick))) continue;
         main.push_back(item);
     }
+    staging.erase(staging.begin(), end);
 }
-}
+}  // namespace
 
 void ReplayEngine::captureStagingReset(int startTick) {
     if (skMode && activeSk && !canUsePersistenceCapture()) {
@@ -757,11 +878,43 @@ void ReplayEngine::captureStagingReset(int startTick) {
     captureStagingTouchFloor = startTick;
 }
 
+void ReplayEngine::appendCaptureStagingTo(SkMacro& snapshot) const {
+    if (!captureStaging || canUsePersistenceCapture()) return;
+    // Autosave не коммитит живой dying-tail: переносим только в копию.
+    auto staging = *captureStaging;
+    constexpr int kNoFloor = std::numeric_limits<int>::max();
+    spliceStagingBucket(snapshot.inputs, staging.inputs, kNoFloor, true);
+    spliceStagingBucket(snapshot.anchors, staging.anchors, kNoFloor);
+    spliceStagingBucket(snapshot.perFrames, staging.perFrames, kNoFloor);
+}
+
+void ReplayEngine::clearFlatCaptureTimeline() {
+    if (!activeSk) return;
+    skkbot2::step_trace::wipe();
+    skkbot2::log::info(
+        "[SKK] очистка записи с начала: inputs={} staging={} rng={} wireCP={}",
+        activeSk->inputs.size(), captureStaging ? captureStaging->inputs.size() : 0,
+        activeSk->rngBoundaries.size(), activeSk->practiceFixCheckpoints.size());
+    activeSk->inputs.clear();
+    activeSk->anchors.clear();
+    activeSk->perFrames.clear();
+    activeSk->rngBoundaries.clear();
+    activeSk->practiceFixCheckpoints.clear();
+    storedRestorePoints.clear();
+    pendingRngBoundary = {};
+    nextBoundaryIndex = 0;
+    // Не включаем staging там, где запись уже шла напрямую в main.
+    if (captureStaging) captureStagingReset(0);
+    captureStagingStartTick = 0;
+    captureStagingTouchFloor = 0;
+    markActiveMacroDirty();
+}
+
 void ReplayEngine::captureCommitStagingToFloor(int floorTick) {
     if (!captureStaging || !activeSk) {
         return;
     }
-    spliceStagingBucket(activeSk->inputs, captureStaging->inputs, floorTick);
+    spliceStagingBucket(activeSk->inputs, captureStaging->inputs, floorTick, true);
     spliceStagingBucket(activeSk->anchors, captureStaging->anchors, floorTick);
     spliceStagingBucket(activeSk->perFrames, captureStaging->perFrames, floorTick);
     skkbot2::log::debug("CAPTURE staging: committed to floor={} (inputs {} anchors {} frames {}) "
@@ -776,7 +929,7 @@ void ReplayEngine::captureFlushStagingAll() {
         return;
     }
     constexpr int kNoFloor = std::numeric_limits<int>::max();
-    spliceStagingBucket(activeSk->inputs, captureStaging->inputs, kNoFloor);
+    spliceStagingBucket(activeSk->inputs, captureStaging->inputs, kNoFloor, true);
     spliceStagingBucket(activeSk->anchors, captureStaging->anchors, kNoFloor);
     spliceStagingBucket(activeSk->perFrames, captureStaging->perFrames, kNoFloor);
     skkbot2::log::debug("CAPTURE staging: FLUSH all (inputs {} anchors {} frames {})",
@@ -794,6 +947,9 @@ void ReplayEngine::captureOnRespawn(int respawnTick) {
         skkbot2::Logger::get().flush();
         return;
     }
+    // The dying attempt proved only up to the last checkpoint it touched while
+    // alive; its own tail frames above that (the death/air segment the retry
+    // jumps over) are dropped and never pollute the committed line.
     int const floor = std::max(captureStagingTouchFloor, captureStagingStartTick);
     skkbot2::log::info("[CK] captureOnRespawn: floor={} stagingStartTick={} touchFloor={}",
         floor, captureStagingStartTick, captureStagingTouchFloor);
@@ -826,10 +982,12 @@ void ReplayEngine::restoreLockedRngState(uintptr_t rngState) {
     }
 }
 
+// Rewind the shake LCG as well. It used to be skipped ("camera shake is not
+// locked"), which made every practice restore leave the chain wherever the
+// failed attempt ended - the one locked stream with no restore path at all.
 void ReplayEngine::restoreLockedShakeState(uint64_t shakeState) {
-    if (shakeState != 0) {
-        skk::shakeStateSet(shakeState);
-    }
+    // Ноль — допустимое состояние LCG, а не признак отсутствующего снимка.
+    skk::shakeStateSet(shakeState);
 }
 
 void ReplayEngine::pruneStoredRestorePoints(PlayLayer* playLayer, int restoredTick) {
@@ -1031,15 +1189,30 @@ bool ReplayEngine::tryLivePlaybackTakeover(GJBaseGameLayer* playLayer) {
         }
     }
     if (targetTick < 0) {
+        // The player has not reached a spot the macro covers yet: keep waiting.
         skkbot2::log::debug("PLAY takeover wait: live=({:.0f},{:.0f}) no recorded coverage within {}/{}px (x/y)",
             refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance);
         return false;
     }
 
+    // Found coverage: arm the engine exactly there. Unlike the reset path this
+    // does NOT resetLevel - the live run keeps its current attempt (no teleport).
     if (!armExecutionState()) {
         return false;
     }
+    // The reset path re-asserts the recorded variance table under MODE_EXECUTE;
+    // a takeover arms from a live run, so do the same here.
     applyVarianceOverrides();
+
+    // armExecutionState сбросил count/frac. В editor следующий шаг может дать
+    // 0/1/несколько macro-тиков, поэтому его baseline заранее не угадываем.
+    // attemptPlaytestArm выставит offset и курсоры после реального инкремента,
+    // до dispatch/pin этого шага. Здесь физика уже закончилась, dispatch нет.
+    if (skk::gameplay::isEditorPlaytest()) {
+        startPosActive = false;
+        skkbot2::log::info("PLAY live takeover: editor armed at ({:.0f},{:.0f}); alignment deferred to next step", refX, refY);
+        return true;
+    }
 
     const int baselineTick = playbackBaselineTick(playLayer, this);
     tickOffset = targetTick - baselineTick;
@@ -1064,6 +1237,8 @@ bool ReplayEngine::tryLivePlaybackTakeover(GJBaseGameLayer* playLayer) {
 bool ReplayEngine::coversPlaybackPosition(float refX, float refY,
                                           float xTolerance, float yTolerance) {
     if (!skMode || !activeSk) {
+        // Legacy macro path keeps the classic tick-0 playback; there are no
+        // position streams to test coverage against.
         return true;
     }
     if (auto const* frames = activePerFrames(); frames && !frames->empty()) {
@@ -1080,6 +1255,10 @@ bool ReplayEngine::coversPlaybackPosition(float refX, float refY,
 }
 
 void ReplayEngine::parkPlaybackPending() {
+    // A just-armed MODE_EXECUTE turned out to have an uncovered reset spawn.
+    // Drop back into the armed-waiting state (same shape requestExecutionStart
+    // produces) so the live takeover can arm when the player reaches the
+    // macro-covered route. No "PLAY session ended" epilogue - nothing ended.
     pendingPlaybackStart = true;
     initialRun = false;
     levelRestarting = false;
@@ -1186,6 +1365,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 level ? level->m_levelID : 0,
                 m_isPlatformer ? "true" : "false");
         }
+        // Runtime state from the previous scene survives into a newly inited
+        // level ONLY when it belongs to this same level: pause-menu Restart and
+        // re-entering the level recreate the PlayLayer, and recording/playing
+        // must continue (resetLevel during init rewinds indices anyway). State
+        // tied to a different level (or an unknown one) is stale - halt it so
+        // an old macro can never auto-run or keep recording in the wrong level.
         bool sameLevel = engine->activeSk && level &&
             (engine->activeSk->levelId > 0
                 ? engine->activeSk->levelId == static_cast<int32_t>(level->m_levelID)
@@ -1199,6 +1384,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->resetNoclipAccuracyStats();
         engine->consumePendingAction(level);
         if (engine->engineMode == MODE_CAPTURE) {
+            // Only (re)initialize a macro that does not belong to this level
+            // yet; re-initializing on every PlayLayer::init would delete the
+            // in-progress macro (incl. persistence attempts) on each restart.
             bool needsInit = engine->skMode
                 ? (!engine->activeSk || !level ||
                    (engine->activeSk->levelId > 0
@@ -1214,10 +1402,25 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 }
             }
         }
+        // A fresh PlayLayer means the previous level's GameObjects (and their
+        // $modify Fields) are gone. Without clearing here the per-object RNG
+        // registry (g_advRandom) keeps dangling statePtr and the first
+        // applyReplayResetState -> advRandomReseed on the new objects writes
+        // into freed memory (AV / heap corruption). customObjectSetup running
+        // inside PlayLayer::init re-registers the fresh object fields; focus
+        // respawns in practice never recreate the PlayLayer and keep reusing
+        // the same object instances, so the registry still survives attempts.
         skk::advRandomClear();
+        // CheckpointObject pointers belong to one PlayLayer instance. Even an
+        // editor playtest that preserves the macro/runtime must not carry its
+        // retained platformer objects into the newly-created layer.
+        engine->storedRestorePoints.clear();
         engine->clearPlatformerCheckpoints();
         bool ret = PlayLayer::init(level, dontCreateObjects);
         if (auto* engine = ReplayEngine::get()) {
+            // beginCapture/initializeSkMacro can run from consumePendingAction
+            // before the base PlayLayer::init creates m_levelSettings. Stamp
+            // mode metadata now, while the actual initialized layer is live.
             if (ret && engine->engineMode == MODE_CAPTURE && engine->skMode &&
                 engine->activeSk && engine->activeSk->levelId ==
                     static_cast<int32_t>(level ? level->m_levelID : 0) &&
@@ -1230,8 +1433,28 @@ class $modify(MacroPlayLayer, PlayLayer) {
                     engine->activeSk->twoPlayerMode ? "true" : "false");
             }
             if (engine->replayAccuracyEnvironmentActive) {
+                // The replay owns the accuracy environment — it re-applies its
+                // own mode on every arm.
             } else if (skk::skc::Bot::get().ownsTiming()) {
+                // An SKC session owns the clock. SKC labels every click with a
+                // count of processCommands calls and its format carries no
+                // sub-step offset, so CBS would split those steps in half and
+                // make the recorded stream not line up with the physics that
+                // produced it. SkcPlayLayer::resetLevel forces vanilla accuracy
+                // for exactly that reason - and this hook used to undo it a few
+                // frames later, on the same reset, by pushing the menu's
+                // selected mode back. The two modules were fighting over one
+                // setting with no rule for who wins; the session that owns the
+                // clock is the one whose answer has to hold.
             } else {
+                // GD re-initialises m_clickBetweenSteps / m_clickOnSteps from
+                // its own source inside PlayLayer::init, which would wipe the
+                // mode the user picked in our menu. Re-apply our value instead
+                // of adopting the post-init one: syncAccuracyFromGame() is the
+                // menu's job and would here silently undo the user's choice.
+                // A change the user made in GD's own options while inside a
+                // level is already mirrored by the menu (it adopts straight from
+                // the layer field), so this re-apply is idempotent for it.
                 ReplayEngine::applyRuntimeAccuracyMode(engine->selectedAccuracyMode,
                                                        engine->cosEnabled);
             }
@@ -1239,50 +1462,176 @@ class $modify(MacroPlayLayer, PlayLayer) {
         return ret;
     }
 
+    void syncBotCheckpoints() {
+        skk::skc::PracticeFix::get().syncStoredCheckpoints(this);
+        auto* engine = ReplayEngine::get();
+        if (!engine) return;
+        const auto present = [this](CheckpointObject* cp) {
+            return m_checkpointArray && cp && m_checkpointArray->containsObject(cp);
+        };
+        std::erase_if(engine->storedRestorePoints,
+            [&](auto const& entry) { return !present(entry.first); });
+        std::erase_if(engine->platformerCheckpointObjects, [&](auto* cp) {
+            if (present(cp)) return false;
+            cp->release();
+            return true;
+        });
+    }
+
+    void removeCheckpoint(bool first) {
+        const auto before = m_checkpointArray ? m_checkpointArray->count() : 0;
+        PlayLayer::removeCheckpoint(first);
+        syncBotCheckpoints();
+        skkbot2::log::info(
+            "[CK] checkpoint REMOVE: first={} count={}->{} target={} "
+            "(ввод не обрезан)", first, before,
+            m_checkpointArray ? m_checkpointArray->count() : 0,
+            m_checkpointArray ? static_cast<void*>(m_checkpointArray->lastObject()) : nullptr);
+    }
+
+    void removeAllCheckpoints() {
+        PlayLayer::removeAllCheckpoints();
+        syncBotCheckpoints();
+        skkbot2::log::info("[CK] checkpoint REMOVE ALL: count={} (ввод не обрезан)",
+            m_checkpointArray ? m_checkpointArray->count() : 0);
+    }
+
+    CheckpointObject* createCheckpoint() {
+        auto* checkpoint = PlayLayer::createCheckpoint();
+        if (!checkpoint || skk::trajectory::isSimulating() ||
+            (m_player1 && m_player1->m_isDead) ||
+            (m_player2 && m_player2->m_isDead)) return checkpoint;
+
+        auto* engine = ReplayEngine::get();
+        auto& bot = skk::skc::Bot::get();
+        auto* saved = static_cast<SkkCheckpointCreation*>(checkpoint);
+        // После vanilla create поля CP уже заполнены, а live-состояние ещё
+        // относится к тому же шагу. Store может прийти через сотни тиков.
+        if (bot.isRecording() && !bot.isDeathCapturePaused()) {
+            const auto frame = skk::skc::FrameClock::get().getFrame();
+            skkbot2::seam_probe::arm(static_cast<int>(frame));
+            skkbot2::seam_probe::log("create-after-vanilla", m_player1);
+            skkbot2::seam_probe::log("create-after-vanilla", m_player2);
+            saved->m_fields->skc = SkkCheckpointCreation::Snapshot{
+                skk::skc::PracticeFix::get().generation(), frame,
+                CheckpointStateManager::capture(static_cast<int>(frame), -1,
+                    this, engine ? engine->captureRngState() : AnchorRngState{})};
+            skkbot2::log::info(
+                "[SKC] checkpoint CREATE: object={} frame={} cpTime={:.9f} "
+                "liveTime={:.9f} cpProgress={} liveProgress={} cpX={:.6f} liveX={:.6f}",
+                static_cast<void*>(checkpoint), frame,
+                checkpoint->m_gameState.m_levelTime, m_gameState.m_levelTime,
+                checkpoint->m_gameState.m_currentProgress, m_gameState.m_currentProgress,
+                checkpoint->m_player1Checkpoint ? checkpoint->m_player1Checkpoint->m_position.x : 0.f,
+                m_player1 ? m_player1->getPositionX() : 0.f);
+        }
+        if (engine && engine->engineMode == MODE_CAPTURE && engine->skMode &&
+            engine->activeSk && !engine->captureDeathPending) {
+            const int tick = static_cast<int>(
+                m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
+            skkbot2::seam_probe::arm(engine->stepPairCount);
+            skkbot2::seam_probe::log("create-after-vanilla", m_player1);
+            skkbot2::seam_probe::log("create-after-vanilla", m_player2);
+            saved->m_fields->skk = SkkCheckpointCreation::Snapshot{
+                static_cast<uint64_t>(engine->sessionCounter), static_cast<uint32_t>(tick),
+                CheckpointStateManager::capture(tick, engine->lastTickIndex,
+                    this, engine->captureRngState())};
+            skkbot2::log::info(
+                "CAPTURE checkpoint CREATE: object={} tick={} cpTime={:.9f} "
+                "liveTime={:.9f} cpX={:.6f} liveX={:.6f}",
+                static_cast<void*>(checkpoint), tick,
+                checkpoint->m_gameState.m_levelTime, m_gameState.m_levelTime,
+                checkpoint->m_player1Checkpoint ? checkpoint->m_player1Checkpoint->m_position.x : 0.f,
+                m_player1 ? m_player1->getPositionX() : 0.f);
+        }
+        return checkpoint;
+    }
+
     void storeCheckpoint(CheckpointObject* checkpoint) {
         const bool setupCheckpoint = m_activatedCheckpoint != nullptr;
         PlayLayer::storeCheckpoint(checkpoint);
+        syncBotCheckpoints(); // Учитывает и внутреннее удаление старых CP в GD.
 
         auto* engine = ReplayEngine::get();
         if (checkpoint && m_isPlatformer && setupCheckpoint && engine &&
             (engine->engineMode == MODE_CAPTURE || engine->engineMode == MODE_EXECUTE)) {
             engine->trackPlatformerCheckpoint(checkpoint);
         }
+        // BUG-156: поздний store регистрирует живой create-снимок даже после
+        // смерти. Запрет corpse-capture остаётся только в createCheckpoint.
         if (!checkpoint || !engine || engine->engineMode != MODE_CAPTURE ||
-            !engine->skMode || !engine->activeSk || skk::trajectory::isSimulating() ||
-            engine->captureDeathPending ||
-            (m_player1 && m_player1->m_isDead) ||
-            (m_player2 && m_player2->m_isDead)) {
+            !engine->skMode || !engine->activeSk || skk::trajectory::isSimulating()) {
             return;
         }
 
-        const int tick = static_cast<int>(
-            m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
-        auto bundle = CheckpointStateManager::capture(
-            tick, engine->lastTickIndex, this, engine->captureRngState());
+        auto& created = static_cast<SkkCheckpointCreation*>(checkpoint)->m_fields->skk;
+        if (!created || created->generation != static_cast<uint64_t>(engine->sessionCounter)) {
+            skkbot2::log::warn(
+                "CAPTURE checkpoint STORE: object={} нет снимка текущей записи; "
+                "поздний live-capture запрещён", static_cast<void*>(checkpoint));
+            return;
+        }
+        const int tick = static_cast<int>(created->frame);
+        auto bundle = std::move(created->state);
+        created.reset();
         const bool hasFull = bundle.hasFullState;
+        const int captureTick = bundle.priorTick;
         engine->storedRestorePoints[checkpoint] = std::move(bundle);
 
-        engine->captureOnCheckpointTouched(tick);
+        // GucciBot's platformer path keys setup-checkpoints here, while
+        // m_activatedCheckpoint is still set. Do not rely on
+        // GJBaseGameLayer::checkpointActivated: GD 2.2081 does not route this
+        // setup-checkpoint path through that callback. storeCheckpoint is the
+        // live checkpoint boundary for both ordinary and setup checkpoints.
+        // Staging живёт на step-clock, tick bundle — метка времени игры.
+        // Floor исключающий: +1 сохраняет boundary-state для reseal; inputs
+        // ровно на boundary затем удалит включающий truncateAfter.
+        engine->captureOnCheckpointTouched(captureTick + 1);
         skkbot2::log::info(
             "CAPTURE checkpoint stored: tick={} platformer={} activatedSetup={} "
-            "restorePoints={} hasFull={}",
+            "restorePoints={} hasFull={} cpTime={:.9f} storeTime={:.9f} stepTick={} "
+            "deathPending={} deadP1={} deadP2={}",
             tick, m_isPlatformer, setupCheckpoint,
-            engine->storedRestorePoints.size(), hasFull);
+            engine->storedRestorePoints.size(), hasFull,
+            checkpoint->m_gameState.m_levelTime, m_gameState.m_levelTime, captureTick,
+            engine->captureDeathPending, m_player1 && m_player1->m_isDead,
+            m_player2 && m_player2->m_isDead);
     }
 
     void applyReplayResetState(bool inPractice, int tick,
                                bool platformerCheckpointMode = false) {
         auto* engine = ReplayEngine::get();
 
+        // A platformer level uses checkpoints even when m_isPracticeMode is
+        // false: the editor "setup checkpoint" object / PlayerObject's
+        // platformer auto-checkpoint path calls PlayLayer::markCheckpoint() and
+        // GD respawns from the last CheckpointObject on death. Treating that
+        // reset as a from-start restart wiped the recorded timeline and every
+        // restore point, so the retry continued without the checkpoint the
+        // player actually respawned at. Practice mode and platformer both keep
+        // the checkpoint chain; only a real from-start reset drops it.
         const bool checkpointMode = inPractice || platformerCheckpointMode;
 
+        // `tick` is m_gameState.m_currentProgress, which is an x coordinate in
+        // a platformer and is still ~0 at the editor "setup checkpoint" (the
+        // player has not moved yet). The old `tick <= 1` wipe guard therefore
+        // deleted the snapshot of the very checkpoint the player respawned at.
+        // In platformer the authoritative sign of a checkpoint respawn is the
+        // checkpoint array GD is about to restore from: resetLevel() calls
+        // loadFromCheckpoint(lastObject()) whenever it is non-empty. Classic
+        // keeps the progress guard (there is no x-based checkpoint array in a
+        // normal classic run).
         const bool checkpointPresent =
             m_checkpointArray && m_checkpointArray->count() > 0;
         const bool progressed = platformerCheckpointMode ? checkpointPresent
                                                          : (tick > 1);
         const bool wipeCapture = !checkpointMode || !progressed ||
                                  engine->storedRestorePoints.empty();
+        // Snapshot-map availability is a capture concern, not the lifetime of
+        // GD's platformer checkpoint object. During playback there is normally
+        // no storedRestorePoints map, but the exact setup CheckpointObject must
+        // remain tracked across every retry. Drop objects only on a true
+        // from-start reset, not merely because this session has no capture map.
         if (!checkpointMode || !progressed) {
             engine->clearPlatformerCheckpoints();
         }
@@ -1299,7 +1648,26 @@ class $modify(MacroPlayLayer, PlayLayer) {
                     ? "WIPE" : "KEEP");
         }
 
+        // Per-object RNG (2068/1912/3607): re-seed FIRST while the registry
+        // still holds the level instance's object pointers. These states are
+        // NOT serialized into the macro, so the ONLY way a fresh attempt
+        // reproduces the recorded section is a deterministic reset to
+        // computedSeed ^ (uid*2137) on every level start/respawn.
+        //
+        // CRITICAL: the registry must SURVIVE across attempts. Objects are
+        // registered once at level load (customObjectSetup) and GD reuses the
+        // same GameObject* instances across practice respawns - clearing the
+        // registry here dropped every pointer after the first attempt, turning
+        // advRandomReseed into a no-op on later attempts. Per-object LCG states
+        // then leaked from the previous attempt -> the same random section
+        // looked different attempt-to-attempt (attempt 1 ok, attempt 2 dead,
+        // attempt 3 ok). The registry is torn down on level exit (onQuit),
+        // where the GameObject* actually become invalid.
         refreshRngState(true);
+        // Post-vanilla (toasty-lite ordering): force the layer seed triple so
+        // runtime object rolls that read m_randomSeed/m_replayRandSeed match
+        // across record & replay sessions regardless of prior attempts. The
+        // pre-vanilla pin in resetLevel already set the chain input for setup.
         if (engine->engineMode == MODE_CAPTURE || engine->engineMode == MODE_EXECUTE) {
             engine->forceLayerSeeds();
         }
@@ -1314,6 +1682,11 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->respawnTickIndex = -1;
         engine->nextBoundaryIndex = 0;
         engine->tickAccumulator = 0.0f;
+        // PLAY was armed while the player was already in a live run (or queued
+        // outside the level): take over NOW only if the freshly reset spawn is
+        // actually covered by the recording. Otherwise keep waiting - the
+        // per-tick live takeover arms the moment the player reaches a covered
+        // spot. Never realign a raw spawn to a mid-run macro's first frames.
         if (engine->pendingPlaybackStart && engine->engineMode != MODE_EXECUTE) {
             float spawnX = m_startPosObject ? m_startPosObject->getPositionX()
                                             : (m_player1 ? m_player1->getPositionX() : 0.f);
@@ -1357,6 +1730,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
             }
         }
         if (engine->engineMode == MODE_EXECUTE) {
+            // Fresh attempt: re-assert recorded variance slots before any
+            // object reads them this run (lazy GD variance stays locked-in
+            // otherwise to whatever this session rolled).
             engine->applyVarianceOverrides();
             engine->advancePersistencePlaybackAfterReset();
         }
@@ -1401,6 +1777,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 startPosMatch = std::sqrt(dx * dx + dy * dy) < 50.0f;
             }
 
+            // Non-standard-start support: the recording knows WHERE its timeline
+            // began. A macro whose first captured frame sits beyond this tick was
+            // recorded MID-RUN (the bot was armed while the player was already in
+            // the level) - its data does not cover the prefix a tick-0 timeline
+            // assumes, so playback must align by POSITION instead. Everything is
+            // derived from the saved streams (no wire-format change).
             int recFirstTick = 0;
             float recFirstX = 0.f, recFirstY = 0.f;
             bool midRun = false;
@@ -1411,6 +1793,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 recFirstY = engine->activeSk->recordStartY();
             }
 
+            // Where the character stands right now: the start-pos object the
+            // player spawns at (if the level has one), else the live player
+            // position itself - the bot "understands" where the player is.
             const bool haveRef = m_startPosObject != nullptr || m_player1 != nullptr;
             float refX = m_startPosObject
                 ? m_startPosObject->getPositionX()
@@ -1419,6 +1804,14 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 ? m_startPosObject->getPositionY()
                 : (m_player1 ? m_player1->getPositionY() : 0.f);
 
+            // Coverage gate: refuse to start playback from a spawn the recording
+            // never covered. Previously a mid-run macro (data begins at tick ~2,
+            // far ahead of the world spawn) would tight->loose align a raw spawn
+            // X to its first frames - a ~900px catch-up that jarringly teleported
+            // the player backwards. If the spawn IS covered, proceed (alignment
+            // happens right there, seamless). Without coverage, park back into
+            // the armed-waiting state; the live takeover arms when the player
+            // reaches a covered position.
             if (engine->skMode && !engine->activePersistencePlaybackAttempt() &&
                 !engine->coversPlaybackPosition(refX, refY, kPlaybackTightTolerance, kPlaybackTakeoverYTolerance)) {
                 skkbot2::log::info(
@@ -1439,6 +1832,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
             constexpr float kAlignTight = 120.0f;
             constexpr float kAlignLoose = 500.0f;
 
+            // Position-aware timeline alignment: find the recorded frame whose p1
+            // X best matches the player's spawn and re-anchor the playback there
+            // (tickOffset + per-frame/anchor/input cursors). Skips persistence
+            // chain playback (its segments use run-local ticks) and legacy macros
+            // (no position streams). Returns false when the recording has no
+            // coverage near the reference X.
             auto alignByPosition = [&](float alignRefX, float alignRefY) -> bool {
                 if (!engine->skMode || engine->activePersistencePlaybackAttempt() || !haveRef) {
                     return false;
@@ -1485,6 +1884,11 @@ class $modify(MacroPlayLayer, PlayLayer) {
             };
 
             if (m_startPosObject && startPosMatch) {
+                // The player uses the exact SP the macro was recorded from.
+                // When the recording's data begins at tick 0 the world spawn IS
+                // the macro start: classic tick-0 alignment. A MID-RUN recording
+                // begins several frames AFTER that spawn, so tick-0 would replay
+                // the missing prefix blind - align by position instead.
                 if (!midRun) {
                     engine->tickOffset = 0;
                     engine->startPosActive = true;
@@ -1494,6 +1898,9 @@ class $modify(MacroPlayLayer, PlayLayer) {
                         engine->playbackAnchorIndex = 0;
                     }
                     if (engine->skMode) {
+                        // Seek in the stream that will ACTUALLY play (chain link
+                        // during persistence playback, main otherwise), not
+                        // blindly in main's array.
                         if (auto* frames = engine->activePerFrames()) {
                             engine->perFramePlaybackIndex = findFirstPerFrameAtTick(*frames, 0);
                         }
@@ -1515,12 +1922,18 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 }
             } else if (m_startPosObject && anchors && !anchors->empty()) {
                 if (engine->activePersistencePlaybackAttempt()) {
+                    // Chain segments use run-local ticks; their own reset path
+                    // restores cursors. Skip position alignment entirely.
                     engine->tickOffset = 0;
                     engine->startPosActive = false;
                     engine->clearStartPosWarning();
                 } else {
                     int targetTick = matchStartPosTargetTick(engine, *anchors, refX, refY);
                     if (targetTick < 0) {
+                        // A start pos the recording never covered within the
+                        // tight window: park back into the armed wait - the live
+                        // takeover arms the moment the player reaches a covered
+                        // spot (no teleport, per spec).
                         skkbot2::log::info(
                             "PLAY startpos wait: spawn=({:.0f},{:.0f}) not on recorded route (within {}/{}) - "
                             "holding armed state until live coverage",
@@ -1567,6 +1980,11 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 engine->startPosActive = false;
                 engine->clearStartPosWarning();
 
+                // Generalized non-standard-start support: re-anchor the timeline
+                // to wherever the character actually stands. This is what makes a
+                // MID-RUN recording playable (record with the bot already in the
+                // level, then start playback from the same spot) and lets a
+                // from-start macro be played from any later position.
                 const bool positionAligned = alignByPosition(refX, refY);
                 if (!positionAligned && midRun) {
                     skkbot2::log::warn("PLAY aborted mid-run macro: data starts at tick {} p1=({:.0f},{:.0f}) but the "
@@ -1577,8 +1995,29 @@ class $modify(MacroPlayLayer, PlayLayer) {
                     engine->haltExecution();
                 }
 
+                // Playback continuity across a practice checkpoint respawn (or
+                // a PLAY armed while the player is already past the start):
+                // recorded perFrame/input/anchor streams start at the level
+                // start (tick 0) even when the recording kept data across a
+                // practice death (stream stitched: [0..respawnTick-1] from
+                // attempt A, [respawnTick..] from attempt B). Keeping the
+                // indices at 0 would re-consume stale attempt-A/level-start
+                // data and pin the player far from the live respawn position
+                // (massive drift, portal section teleports). Seek every
+                // playback cursor to the first record at/after the current
+                // checkpoint levelTime tick and continue from there. Skipped
+                // when position alignment already placed the cursors.
                 if (!positionAligned && engine->skMode && !engine->activePersistencePlaybackAttempt()) {
                     int respawnTick = computePlaybackTick(this);
+                    // BUG-06: `computePlaybackTick` returns the game-time label
+                    // (m_levelTime*tickRate), but the recorded streams are
+                    // labelled with the capture step clock which drifts from it
+                    // after every practice respawn (m_levelTime resets, step
+                    // clock does not). Seeking by the raw game tick lands on the
+                    // DYING tail of the previous segment (~130px behind the
+                    // checkpoint) and re-opens the seam at the next Play respawn.
+                    // Translate through the checkpoint bundle the player just
+                    // respawned from: priorTick+1 = the first retry frame.
                     if (engine->skMode) {
                         int stepRespawn = engine->respawnStepTickForGameTick(respawnTick);
                         if (stepRespawn > 1) {
@@ -1619,11 +2058,8 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 clearPlayerHolds();
             }
         } else if (engine->engineMode == MODE_CAPTURE && engine->skMode && engine->activeSk) {
-            if (!checkpointMode || !progressed || engine->storedRestorePoints.empty()) {
-                engine->activeSk->inputs.clear();
-                engine->activeSk->anchors.clear();
-                engine->activeSk->perFrames.clear();
-                engine->storedRestorePoints.clear();
+            if (wipeCapture) {
+                engine->clearFlatCaptureTimeline();
                 engine->resetRecordedHoldShadow();
                 clearPlayerHolds();
             }
@@ -1647,11 +2083,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
         auto* engine = ReplayEngine::get();
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
-        engine->stepPairCount = 0;
+        const auto restoreSerial = engine->captureRestoreSerial;
+        engine->stepPairCount = 0;  // step clock restarts with the attempt
         engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
         CheckpointObject* injectedPlatformerCheckpoint = nullptr;
-        if (m_isPlatformer && m_checkpointArray &&
+        if (m_isPlatformer && m_checkpointArray && m_checkpointArray->count() == 0 &&
             !engine->platformerCheckpointObjects.empty()) {
             injectedPlatformerCheckpoint = engine->platformerCheckpointObjects.back();
             if (m_checkpointArray->lastObject() != injectedPlatformerCheckpoint) {
@@ -1667,6 +2104,10 @@ class $modify(MacroPlayLayer, PlayLayer) {
 
         engine->pinSetupSeedBeforeReset();
         resetSimulationTimingState();
+        // Death/restart seam: GD keeps buffered presses from the death
+        // animation; the flush on the first new-attempt frame would make
+        // the respawned player jump on its own. Clear the queue and arm the
+        // phantom-suppression window (labels restart at 1 -> +8).
         m_queuedButtons.clear();
         PlayLayer::resetLevel();
         if (injectedPlatformerCheckpoint && m_checkpointArray &&
@@ -1676,11 +2117,24 @@ class $modify(MacroPlayLayer, PlayLayer) {
         }
         m_queuedButtons.clear();
         resetSimulationTimingState();
-        engine->captureReleaseSuppressUntil = 8;
-        engine->resetRecordedHoldShadow();
+        if (engine->captureRestoreSerial == restoreSerial) {
+            engine->captureReleaseSuppressUntil = 8;
+            engine->resetRecordedHoldShadow();
+        } else {
+            skkbot2::log::info(
+                "[SKK] reset сохранил post-restore hold-тень: tick={} window={}",
+                engine->lastTickIndex, engine->captureReleaseSuppressUntil);
+        }
         engine->captureDeathPending = false;
         engine->captureIgnored = false;
 
+        // Инструмент ЛД-RESET (проверка трекер-пункта «m_extraDelta = 0 на
+        // каждом resetLevel»): GD обнуляет m_extraDelta сама внутри
+        // GJBaseGameLayer::resetLevelVariables() (вызывается из
+        // PlayLayer::resetLevel), но practice-путь восстанавливает
+        // чекпоинт ПОСЛЕ этого. Логируем фактическое значение сразу после
+        // базового resetLevel — если здесь когда-нибудь != 0, первый кадр
+        // попытки получит ненулевой остаток (референс Xenia Bot.cpp:524).
         skkbot2::log::info(
             "RESET-EXTRA-DELTA: after resetLevel m_extraDelta={:.6f} "
             "practice={} progress={} platformer={}",
@@ -1696,7 +2150,7 @@ class $modify(MacroPlayLayer, PlayLayer) {
         auto* engine = ReplayEngine::get();
         engine->clearFrameStepState();
         engine->resetNoclipAccuracyStats();
-        engine->stepPairCount = 0;
+        engine->stepPairCount = 0;  // step clock restarts with the attempt
         engine->stepPairFrac = 0.0;
         engine->captureIgnored = true;
         engine->clearPlatformerCheckpoints();
@@ -1716,14 +2170,21 @@ class $modify(MacroPlayLayer, PlayLayer) {
         engine->captureDeathPending = false;
         engine->captureIgnored = false;
 
+        // Full restart: clear broken objects tracking
         BrokenObjectTracker::get().clear();
 
+        // resetLevelFromStart means "back to tick 0", even in a platformer
+        // level, so the checkpoint chain must not survive this one.
         applyReplayResetState(m_isPracticeMode, m_gameState.m_currentProgress,
                               false);
     }
 
     void loadFromCheckpoint(CheckpointObject* checkpoint) {
         auto* engine = ReplayEngine::get();
+        // Restore/restart seam: GD zeroes hold maps and the stale physical
+        // releases arrive as ordinary events afterwards. Suppress releases
+        // for a short window (presses always pass) and drop the hold shadow -
+        // prevents phantom 'up' edges that cancel held orbs/rings at replay.
         engine->captureReleaseSuppressUntil = static_cast<int>(
             m_gameState.m_levelTime * engine->runtimeTickRate()) + 1 + 8;
         engine->resetRecordedHoldShadow();
@@ -1748,7 +2209,10 @@ class $modify(MacroPlayLayer, PlayLayer) {
             m_queuedButtons.clear();
             PlayLayer::loadFromCheckpoint(checkpoint);
             m_queuedButtons.clear();
+            // Unknown checkpoint: re-disable broken objects after vanilla load
             BrokenObjectTracker::get().reDisableBroken();
+                // Unknown checkpoint: rebuild the step clock from the
+                // restored level time (1 call == 1 sub-step by definition).
                 engine->stepPairCount = std::max(0, static_cast<int>(
                     m_gameState.m_levelTime * engine->runtimeTickRate()));
                 engine->stepPairFrac = 0.0;
@@ -1758,9 +2222,23 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 return;
             }
 
+            // BUG-06 root: `tick` is the game-time label (m_levelTime*tickRate)
+            // which GD resets on every practice respawn, while the recorded
+            // perFrame/input/anchor streams are labelled with the capture step
+            // clock that NEVER resets - the two drift apart after the first
+            // practice death (test: touch at step 8551 stored as tick 8485).
+            // Cutting the stream at game-time `tick` drops the checkpoint-touch
+            // frame and every frame up to the death, re-opening the 130px seam.
+            // The boundary the stream must keep is `priorTick` (= lastTickIndex
+            // on touch = step-clock tick of the touch frame).
             engine->prepareCaptureRestore(it->second.priorTick);
             skkbot2::log::info("[CK] after prepareCaptureRestore priorTick={}", it->second.priorTick);
             skkbot2::Logger::get().flush();
+            // Wrap the whole restore in capture-ignorance: GD flushes its
+            // m_queuedButtons during load (phantom presses recorded as macro
+            // inputs = 'player jumps on respawn'), and the restore's own
+            // processCommands calls would advance the step counter past the
+            // checkpoint label. Re-assert the label AFTER vanilla finished.
             engine->captureIgnored = true;
             engine->stepPairCount = std::max(0, it->second.priorTick - 1);
             engine->stepPairFrac = 0.0;
@@ -1774,7 +2252,12 @@ class $modify(MacroPlayLayer, PlayLayer) {
             skkbot2::log::info("[CK] after restoreLockedShakeState");
             skkbot2::Logger::get().flush();
 
-            if (engine->rngLocked && it->second.rng.teleportState != 0) {
+            // Practice-restart boundary (capture): re-apply the checkpoint's
+            // captured teleport AFTER the restore so the segment continues under
+            // exactly the state the recording observed. Overrides the arm
+            // fallback latch; playback reproduces the same globals verbatim via
+            // applyRngBoundaryReseed.
+            if (engine->rngLocked) {
                 skk::restoreTripleRng({ it->second.rng.fastRandState,
                     it->second.rng.teleportState });
                 engine->pendingRngBoundary.progress = it->second.tick;
@@ -1787,15 +2270,28 @@ class $modify(MacroPlayLayer, PlayLayer) {
 
             m_queuedButtons.clear();
             skkbot2::log::info("[CK] before PlayLayer::loadFromCheckpoint");
+            logCheckpointRngPhase("capture-before-vanilla", it->second);
             skkbot2::Logger::get().flush();
             PlayLayer::loadFromCheckpoint(checkpoint);
             skkbot2::log::info("[CK] after PlayLayer::loadFromCheckpoint");
+            skkbot2::seam_probe::log("skk-after-vanilla-load", m_player1, 0.f, it->second.priorTick);
             skkbot2::Logger::get().flush();
             m_queuedButtons.clear();
             CheckpointStateManager::restore(this, it->second);
+            skkbot2::seam_probe::log("skk-after-bundle", m_player1, 0.f, it->second.priorTick);
+            logCheckpointRngPhase("capture-after-restore", it->second);
             skkbot2::log::info("[CK] after CheckpointStateManager::restore");
             skkbot2::Logger::get().flush();
+            // BUG-123 (12.11): armCheckpointMusicResync снят вместе с фиксом.
 
+            // Сначала reconciliation: оригинальный handleButton/pushButton может
+            // сразу выполнить updateJump(0), изменив vy/ground/jump-buffer.
+            // Boundary state и anchor обязаны описывать итоговое состояние, а не
+            // snapshot до boundary-input. Плейбэк физическую клавиатуру не сверяет.
+            engine->finishCaptureRestore(this, it->second.priorTick);
+            skkbot2::seam_probe::log("skk-after-reconcile", m_player1, 0.f, it->second.priorTick);
+
+            // Сохраняем финальную границу после bundle + boundary-input.
             {
                 const bool rTwoPlayer = m_levelSettings ? m_levelSettings->m_twoPlayerMode : false;
                 const bool rPlatformer = m_isPlatformer;
@@ -1803,7 +2299,8 @@ class $modify(MacroPlayLayer, PlayLayer) {
                 engine->captureResealBoundaryFrame(it->second.priorTick, m_player1, m_player2, rPlatformer, rDual);
             }
 
-            engine->finishCaptureRestore(this, it->second.priorTick);
+            skkbot2::seam_probe::log("skk-after-reseal", m_player1, 0.f, it->second.priorTick);
+            skkbot2::seam_probe::log("skk-after-reseal", m_player2, 0.f, it->second.priorTick);
 
             engine->stepPairCount = std::max(0, it->second.priorTick - 1);
             engine->stepPairFrac = 0.0;
@@ -1815,45 +2312,58 @@ class $modify(MacroPlayLayer, PlayLayer) {
             return;
         }
 
-        if (engine->engineMode == MODE_EXECUTE && !engine->practiceFixQueue.empty()) {
-            const double currentTickF = m_gameState.m_levelTime * engine->runtimeTickRate();
-            const int currentTick = static_cast<int>(std::llround(currentTickF));
-
-            int bestIdx = -1;
+        // MODE_EXECUTE: цель задаёт аргумент GD, а не время умирающей попытки.
+        if (engine->engineMode == MODE_EXECUTE) {
+            const int targetTick = static_cast<int>(
+                checkpoint->m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
+            auto saved = engine->storedRestorePoints.find(checkpoint);
+            const bool cached = saved != engine->storedRestorePoints.end();
             int bestDist = std::numeric_limits<int>::max();
-            for (int i = 0; i < static_cast<int>(engine->practiceFixQueue.size()); ++i) {
-                int dist = std::abs(engine->practiceFixQueue[i].tick - currentTick);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestIdx = i;
+            if (!cached) {
+                int bestIdx = -1;
+                for (int i = 0; i < static_cast<int>(engine->practiceFixQueue.size()); ++i) {
+                    const int dist = std::abs(engine->practiceFixQueue[i].tick - targetTick);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIdx = i;
+                    }
+                }
+                if (bestIdx >= 0 && bestDist <= 2) {
+                    auto bundle = std::move(engine->practiceFixQueue[bestIdx]);
+                    engine->practiceFixQueue.erase(engine->practiceFixQueue.begin() + bestIdx);
+                    saved = engine->storedRestorePoints.emplace(checkpoint, std::move(bundle)).first;
                 }
             }
 
-            skkbot2::log::debug("P1 consume: MODE_EXECUTE loadFromCheckpoint currentTick={} queueSize={} bestIdx={} bestDist={}",
-                currentTick, engine->practiceFixQueue.size(), bestIdx, bestDist);
-
-            if (bestIdx >= 0 && bestDist <= 2) {
-                auto bundle = std::move(engine->practiceFixQueue[bestIdx]);
-                engine->practiceFixQueue.erase(engine->practiceFixQueue.begin() + bestIdx);
-                engine->storedRestorePoints[checkpoint] = std::move(bundle);
-                auto& ref = engine->storedRestorePoints[checkpoint];
-                skkbot2::log::info("P1 consume: RESTORE tick={} priorTick={} broken={} variance={} queueRemaining={}",
-                    ref.tick, ref.priorTick, ref.brokenObjects.size(), ref.variance.size(),
-                    engine->practiceFixQueue.size());
+            if (saved != engine->storedRestorePoints.end()) {
+                auto& ref = saved->second;
+                skk::bridge::resolveBrokenObjects(ref, this);
+                skkbot2::log::info("P1 consume: RESTORE object={} targetTick={} cached={} tick={} priorTick={} broken={} variance={} queueRemaining={}",
+                    static_cast<void*>(checkpoint), targetTick, cached, ref.tick, ref.priorTick,
+                    ref.brokenObjects.size(), ref.variance.size(), engine->practiceFixQueue.size());
 
                 engine->prepareCaptureRestore(ref.priorTick);
                 engine->captureIgnored = true;
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
                 engine->stepPairFrac = 0.0;
-engine->lastTickIndex = ref.priorTick;
- engine->restoreLockedRngState(ref.rng.fastRandState);
- engine->restoreLockedShakeState(ref.rng.shakeState);
+                engine->lastTickIndex = ref.priorTick;
+                engine->restoreLockedRngState(ref.rng.fastRandState);
+                engine->restoreLockedShakeState(ref.rng.shakeState);
+                if (engine->rngLocked) {
+                    skk::restoreTripleRng({ref.rng.fastRandState, ref.rng.teleportState});
+                }
 
                 m_queuedButtons.clear();
+                logCheckpointRngPhase("play-before-vanilla", ref);
                 PlayLayer::loadFromCheckpoint(checkpoint);
                 m_queuedButtons.clear();
                 CheckpointStateManager::restore(this, ref);
+                logCheckpointRngPhase("play-after-restore", ref);
+                // BUG-123 (12.11): armCheckpointMusicResync снят вместе с фиксом.
 
+                // Playback follows the macro's stitched edge stream; vanilla
+                // checkpoint loading has already applied the serialized input
+                // latch via CheckpointStateManager::restore.
                 engine->stepPairCount = std::max(0, ref.priorTick - 1);
                 engine->stepPairFrac = 0.0;
                 engine->lastTickIndex = ref.priorTick;
@@ -1862,15 +2372,18 @@ engine->lastTickIndex = ref.priorTick;
                 resetSimulationTimingState();
                 return;
             }
-            skkbot2::log::warn("P1 consume: no match (bestDist={}), falling back to vanilla", bestDist);
-        } else if (engine->engineMode == MODE_EXECUTE) {
-            skkbot2::log::debug("P1 consume: queue empty in MODE_EXECUTE, vanilla load");
+            skkbot2::log::warn("P1 consume: нет снимка object={} targetTick={} queue={} bestDist={}, vanilla restore",
+                static_cast<void*>(checkpoint), targetTick, engine->practiceFixQueue.size(), bestDist);
         }
 
         PlayLayer::loadFromCheckpoint(checkpoint);
         m_queuedButtons.clear();
+        // BUG-123 (12.11): armCheckpointMusicResync снят вместе с фиксом.
 
+        // The vanilla checkpoint owns the captured jump-buffer mirror here.
 
+        // Re-disable broken objects after vanilla loadFromCheckpoint
+        // (GD re-enables breakables on load; our tracker keeps them destroyed)
         BrokenObjectTracker::get().reDisableBroken();
         resetSimulationTimingState();
     }
@@ -1884,6 +2397,11 @@ engine->lastTickIndex = ref.priorTick;
         resetSimulationTimingState();
     }
 
+    // Anti-SSB: the vanilla progress bar / death percent / completion stats
+    // assume the native 240 tick grid (progress = timestamp-derived position
+    // count, doubled in 2.208+). At runtime TPS != 240 feed them the
+    // time-derived percentage instead (Eclipse/GDH/ToastyLite approach),
+    // restoring the original value right after the vanilla call.
     int32_t ssbProgressFixBegin() {
         auto* engine = ReplayEngine::get();
         const int32_t saved = m_gameState.m_currentProgress;
@@ -1917,12 +2435,15 @@ engine->lastTickIndex = ref.priorTick;
             engine->completePersistenceCaptureAttempt();
         }
 
+        // levelComplete() finalizes attempt stats from m_commandIndex (a raw
+        // 240-grid tick count); at a foreign runtime TPS re-derive it from
+        // level time so the completion point is truthful (Eclipse/GDH parity).
         const bool commandIndexFix = engine &&
             skk::ssb::progressFixNeeded(engine->runtimeTickRate());
         const uint32_t savedCommandIndex = m_gameState.m_commandIndex;
         if (commandIndexFix) {
             m_gameState.m_commandIndex = static_cast<uint32_t>(
-                std::llround(m_gameState.m_levelTime * 480.0));
+                std::llround(m_gameState.m_levelTime * 480.0));  // x2: 2.208 doubling
         }
 
         PlayLayer::levelComplete();
@@ -1935,6 +2456,15 @@ engine->lastTickIndex = ref.priorTick;
             engine->disablePersistenceModeSafeguard();
             engine->haltExecution();
         } else if (wasCapturing || wasCapturingPersistence) {
+            // Completion ends the recording session in BOTH modes. The
+            // persistence-only branch (an upstream Toasty leak) neither halted
+            // nor saved, so MODE_CAPTURE stayed armed past the win screen and
+            // the next retry's restart-clear silently wiped the finished
+            // timeline — the Auto Save Mod that used to sit here was the same
+            // code commit 13774ee removed, and has now been deleted outright at
+            // the user's request. Only the HALT is kept: saving the macro here
+            // is what the SAVE button is for, and halting is an independent
+            // correctness fix that must not regress with it.
             engine->haltExecution();
             skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
         }
@@ -1971,6 +2501,9 @@ engine->lastTickIndex = ref.priorTick;
         PlayLayer::destroyPlayer(player, object);
         ssbProgressFixEnd(savedProgress);
 
+        // True-death forensic: only when the game ACTUALLY killed the player.
+        // resetLevel cleanup calls destroyPlayer too, but those never stick -
+        // logging them produced the tick-1..17 barrage of false positives.
         if (!preDead && player && player->m_isDead &&
             engine->engineMode == MODE_CAPTURE) {
             engine->captureDeathPending = true;
@@ -2015,6 +2548,13 @@ engine->lastTickIndex = ref.priorTick;
 
     void onQuit() {
         auto* engine = ReplayEngine::get();
+        // Editor playtest exit is a PlayLayer quit too, but the session is not
+        // over: the user will press playtest again, so the recording must stay
+        // armed and nothing may be discarded (persistence attempts accumulate
+        // across playtests). During playtest both layers exist at once, which
+        // is the only reliable signal on this codebase (no playtest flag is
+        // maintained elsewhere). Toasty's engine shares this quit path and
+        // wipes the macro on every playtest stop.
         bool editorPlaytest = skk::gameplay::asPlayLayer() && skk::gameplay::asEditor();
         auto quitLevel = [this, engine, editorPlaytest]() {
             engine->clearFrameStepState();
@@ -2022,7 +2562,14 @@ engine->lastTickIndex = ref.priorTick;
             engine->pendingPlaybackStart = false;
             if (engine->engineMode == MODE_CAPTURE) {
                 if (!editorPlaytest) {
+                    // Exiting ends the recording session, but the macro stays
+                    // in memory by design: halt flushes the survivor run into
+                    // main/chain and releases capture state; nothing is written
+                    // to disk, and the macro remains saveable/playable from
+                    // the menu (and re-entering the same level can continue).
                     skkbot2::log::info("RECORD: level exited - session halted, macro KEPT in memory (unsaved)");
+                    // Halt before closing the session: the RECORD-ended summary
+                    // belongs in record.log.
                     engine->haltExecution();
                     skkbot2::Logger::get().setSessionMode(skkbot2::Logger::SessionMode::None);
                 }
@@ -2035,6 +2582,13 @@ engine->lastTickIndex = ref.priorTick;
                 engine->disablePersistenceModeSafeguard();
             }
             skk::advRandomClear();
+            // The level exit discards the live checkpoint map, but the macro
+            // stays in memory and remains saveable from the menu. The save
+            // path (saveActiveMacro) reads storedRestorePoints, which would
+            // otherwise be gone by the time the user clicks Save in the GUI,
+            // silently dropping every practice-fix checkpoint recorded this
+            // session (BUG-19). Materialize them into the macro now so the
+            // pending save still sees them.
             if (engine->engineMode == MODE_CAPTURE && !editorPlaytest
                 && engine->skMode && engine->activeSk
                 && !engine->storedRestorePoints.empty()) {
@@ -2071,6 +2625,9 @@ class $modify(SetupCheckpointCapture, GJBaseGameLayer) {
             return;
         }
 
+        // This is the actual live touch of a platformer setup-checkpoint.
+        // Do not infer it from CheckpointObject creation, which may happen as
+        // GD prepares the later death-respawn.
         const int tick = static_cast<int>(
             layer->m_gameState.m_levelTime * engine->runtimeTickRate()) + 1;
         skkbot2::log::info(
@@ -2079,6 +2636,8 @@ class $modify(SetupCheckpointCapture, GJBaseGameLayer) {
     }
 };
 
+// NOTE: The former RecordingGuardPauseLayer ($modify of PauseLayer::goEdit/onQuit)
+// only existed to raise the unsaved-macro popup, which the user asked to remove.
 
 class $modify(NoclipBaseLayer, GJBaseGameLayer) {
 #ifdef GEODE_IS_MACOS

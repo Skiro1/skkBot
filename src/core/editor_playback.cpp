@@ -14,8 +14,20 @@ using namespace geode::prelude;
 
 namespace skk::editor {
 
+    // Fresh-spawn alignment for an editor playtest: mirrors the PlayLayer
+    // attempt reset path (applyReplayResetState) through the shared
+    // playback_align helpers. Called at most once per playtest; the
+    // (MODE_EXECUTE && !startPosActive && isEditorPlaytest()) loop-guard in
+    // processCommands guarantees that:
+    //  - spawn IS covered by the recording -> re-anchor cursors + tickOffset
+    //    exactly there (start-pos and mid-run macros both get their route);
+    //  - spawn is NOT covered (off-route start pos) -> park the engine in the
+    //    armed wait; the live takeover (tryLivePlaybackTakeover) arms the moment
+    //    the player physically reaches a spot the macro covers (no teleport).
     void attemptPlaytestArm(GJBaseGameLayer* layer, ReplayEngine* engine) {
         if (!layer || !engine || !engine->skMode || !engine->activeSk) {
+            // Legacy (GDR) macros have no position streams: keep the classic
+            // tick-0 playback and skip the coverage gate entirely.
             return;
         }
         if (engine->engineMode != MODE_EXECUTE || engine->startPosActive) {
@@ -36,13 +48,16 @@ namespace skk::editor {
             engine, anchors ? *anchors : emptyAnchors, refX, refY);
 
         if (targetTick < 0) {
+            // Spawn off the recorded route: hold the armed wait - the live
+            // takeover arms when the player reaches covered ground.
             skkbot2::log::info("EDITOR PLAY wait: spawn=({:.0f},{:.0f}) not covered by macro - holding until live coverage",
                 refX, refY);
             engine->parkPlaybackPending();
             return;
         }
 
-        const int baselineTick = skk::playback_align::playbackBaselineTick(layer, engine);
+        const int baselineTick = skk::playback_align::playbackBaselineTick(
+            layer, engine, skk::playback_align::AlignmentPhase::InStep);
         engine->tickOffset = targetTick - baselineTick;
         engine->startPosActive = true;
         if (auto* a = engine->activeAnchors(); a && !a->empty()) {
@@ -95,6 +110,9 @@ class $modify(MacroEditorLayer, LevelEditorLayer) {
                bot.getState() == skk::skc::State::Playback || bot.isPlaybackArmed();
     }
 
+    // Entering the editor straight from a level: drop any level-bound PLAY
+    // or RECORD (executing, armed-waiting, or queued for the next level entry).
+    // carried-over state must not persist into the editor.
     bool init(GJGameLevel* level, bool noUI) {
         auto* engine = ReplayEngine::get();
         if (engine) {
@@ -157,6 +175,18 @@ class $modify(MacroEditorLayer, LevelEditorLayer) {
     void onStopPlaytest() {
         skk::gameplay::setEditorPlaytestActive(false);
         auto& bot = skk::skc::Bot::get();
+        // FULL stop, not a cursor reset. It used to call bot.restart() and leave
+        // m_state == Playback, so the bot stayed "playing" with no level: the
+        // transport kept reading PLAYING, a queued action could still be armed,
+        // and any button holding survived the exit. Bot::stop() clears the state,
+        // the pending action AND the armed flag, restores the tick rate, and
+        // releases both players' buttons - which matters most here, because a
+        // jump held at the moment you leave playtest is exactly the thing that
+        // makes the editor feel broken afterwards.
+        //
+        // The recorded macro itself is NOT discarded: Bot::stop() keeps m_macro,
+        // so a run recorded in the editor and exited mid-flight can still be
+        // saved. Only the session ends.
         const bool skcWasLive =
             bot.isEnabled() || bot.isPlaybackArmed() ||
             bot.getPendingAction() != skk::skc::PendingAction::None;
@@ -174,12 +204,23 @@ class $modify(MacroEditorLayer, LevelEditorLayer) {
                        engine->pendingAction != ReplayEngine::PendingAction::None)) {
             skkbot2::log::info("EDITOR PLAY: playtest stopped - halting playback");
             engine->haltExecution();
+            // haltExecution() clears pendingPlaybackStart but NOT the queued
+            // Record/Play. A queue left over from the editor would otherwise sit
+            // there and fire on the next real PlayLayer::init - i.e. the next
+            // level the user opens, unasked. That is the same class of "state
+            // outlives the session" this whole function exists to prevent.
             engine->clearPendingAction();
         }
+        // Drop any custom timing state (expected-ticks patch, scheduler carry)
+        // a TPS/Speed override left engaged, so it cannot leak into the editor
+        // build mode or a later level.
         resetSimulationTimingState();
         LevelEditorLayer::onStopPlaytest();
     }
 
+    // The editor playtest ends on player death. While the bot is engaged
+    // (armed-waiting or actively replaying) the character must survive to the
+    // end of the recorded route, so swallow death for the playtest session.
     void playerTookDamage(PlayerObject* player) {
         if (skk::gameplay::isEditorPlaytest() && isBotEngaged()) {
             skkbot2::log::debug("EDITOR PLAY: swallowed player damage");
