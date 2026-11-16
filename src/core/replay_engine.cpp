@@ -32,25 +32,6 @@
 #endif
 
 
-// Every PHYSICAL key press the player makes, logged.
-//
-// The macro's own clicks never come through here: playback pushes straight into
-// m_queuedButtons (physicsbypass.cpp:403, skc_hooks.cpp:426), so anything that
-// arrives on UILayer::keyDown is a human by construction. That makes this the
-// one place where "was that me or the player?" is a fact rather than a guess -
-// and it is the same shape as syncAccuracyFromGame(), which adopts CBS/COS out
-// of GD's live fields and logs the moment they move. Here the thing being
-// adopted is the player's own hands.
-//
-// Individual lines are capped, not the counter. During recording a player taps
-// constantly and the lines would bury everything else; during playback the cap
-// is what makes a stray press visible rather than the hundredth one.
-//
-// Defined here, at the top of the file, because everything below this point sits
-// inside a namespace that would turn these into different symbols than the ones
-// skkBot.hpp declares - and the linker failure that caused looks like nothing at
-// all ("unresolved external symbol skkbot2::notePlayerInput") while the cause is
-// three hundred lines away from where the compiler complains.
 namespace skkbot2 {
 namespace {
 struct PlayerInputTally {
@@ -63,16 +44,12 @@ struct PlayerInputTally {
 };
 
 PlayerInputTally g_playerInput;
-}  // namespace
+}
 
 void notePlayerInput(char const* kind, int key) {
     auto& tally = g_playerInput;
     ++tally.total;
 
-    // Both bots' state is asked for rather than one being picked. SKK's state lives
-    // in ReplayEngine::engineMode (get() hands back a pointer, as everywhere else
-    // in this file); SKC keeps its own enum. The local is not named `skk` -
-    // that would shadow the namespace holding SKC.
     auto* skkEngine = ReplayEngine::get();
     const bool skkPlaying = skkEngine && skkEngine->engineMode == MODE_EXECUTE;
     const bool skkRecording = skkEngine && skkEngine->engineMode == MODE_CAPTURE;
@@ -91,17 +68,6 @@ void notePlayerInput(char const* kind, int key) {
     const bool active = skkPlaying || skcPlaying || skkRecording || skcRecording;
     const bool playing = skkPlaying || skcPlaying;
 
-    // During playback a press from the human is the interesting case, and the
-    // one that can corrupt a run. Say whether it will be swallowed rather than
-    // letting the reader assume: Ignore Inputs clears the queue before the
-    // macro's commands are pushed (skc_hooks.cpp:413), and with it off the press
-    // interleaves and the run drifts. Both are documented behaviour; which one
-    // is active decides whether the line matters.
-    //
-    // Escape is special: this hook does NOT swallow it - UILayer still receives
-    // it and RobTop's own code pauses the game with it. Calling that "swallowed"
-    // sent the BUG-69 investigation looking for a swallowed-pause defect while
-    // the pause menu was on screen the whole time.
     const char* verdict =
         key == 27
             ? "GD pauses the game on Escape - playback is frozen in the pause menu"
@@ -140,44 +106,25 @@ void dumpPlayerInputTally(char const* reason) {
         tally.printed, tally.suppressed);
     tally = PlayerInputTally {};
 }
-}  // namespace skkbot2
+}
 
 namespace {
-    // Level-wide portal list cache shared by findTeleportEntryPortal and the
-    // pre-warm at playback start (so the first ~40ms build never lands on a
-    // seam tick — the PLAY_HOT pin=40ms at tick 539 was the cache build on
-    // the start-warp seam). Portals are static for a level; the list is
-    // rebuilt only when the m_objects array pointer or its count changes.
     CCArray* gPortalCacheArray = nullptr;
     size_t gPortalCacheCount = 0;
     std::vector<TeleportPortalObject*> gPortalCache;
 
-    // === PLAYBACK JUMP TRACER ====================================================
-    // Auto-activates a detailed per-tick trace around any visible "jump" detected
-    // at the frame boundary (isLastTick). Logs full state: live pos/vy/vyb/rot
-    // before reconcile, recorded target, what reconcile sets, and all visual flags.
-    //
-    // Root-cause hypothesis from reference-bot study: GDH pins only position
-    // (velocity_fix=OFF, never rotation), silicate pins nothing.  Our
-    // reconcilePerFrames pins pos+vy+vyb+rot+gravity+dash+ring EVERY tick —
-    // this unique over-pin can fight GD's physics and produce a visible hop.
-    // ============================================================================
-    static int  gFrameLastTick      = -1;    // tick of previous isLastTick
-    static float gFrameLastPx       = 0.f;   // visible position after last frame
+    static int  gFrameLastTick      = -1;
+    static float gFrameLastPx       = 0.f;
     static float gFrameLastPy       = 0.f;
     static float gFrameLastRot      = 0.f;
     static double gFrameLastVy      = 0.0;
-    static int  gFrameCount         = 0;     // visual frame counter
+    static int  gFrameCount         = 0;
 
-    static int  gTraceWindowEnd     = -1;    // tick: active trace window ends here
-    static constexpr int kTraceWindowLen = 40; // frames to trace after jump detected
-    static constexpr float kJumpThresholdPx = 10.0f;  // frame-to-frame visible jump
-    // Rendered-drift logging cadence (Этап 0): sample every N ticks at the
-    // isLastTick visual boundary so the actual post-reconcile offset is visible
-    // even when it stays below any "visible" threshold.
+    static int  gTraceWindowEnd     = -1;
+    static constexpr int kTraceWindowLen = 40;
+    static constexpr float kJumpThresholdPx = 10.0f;
     static constexpr int kRenderDriftReportEveryTicks = 180;
 
-    // Format a single-line P1 snapshot for the tracer.
     static void logP1TraceLine(
         const char* tag, int tick,
         float liveX, float liveY, double liveVy, double liveVyb, float liveRot,
@@ -197,7 +144,7 @@ namespace {
             dx, dy, dVy, dVyb, dRot,
             gravNeg, ud, dash, ringId);
     }
-}  // namespace
+}
 
 static void prePhyWarmPortalCache(GJBaseGameLayer* playLayer) {
     auto* objects = playLayer ? playLayer->m_objects : nullptr;
@@ -226,20 +173,9 @@ static void prePhyWarmPortalCache(GJBaseGameLayer* playLayer) {
 void refreshRngState(bool isRestart = false);
 
 namespace {
-    // When true, handleButton is being called from per-frame sync (processCommands)
-    // for a physical release that GD missed. Suppress normal GD processing but
-    // still record the release into the macro stream.
     bool g_perFrameReleaseSync = false;
-    // Same as above but for a press event — the physical key went down but GD
-    // never fired handleButton (.e.g. key was held through death/respawn).
     bool g_perFramePressSync = false;
 
-    // DIAGNOSTIC: set around the vanilla GJBaseGameLayer::handleButton call
-    // inside our hook, so the pushButton/releaseButton probes can tell whether
-    // the press originated from GD's own dispatch (real user input passing
-    // through vanilla) or from a direct PlayerObject::pushButton invocation
-    // elsewhere. Distinguishes 'user self-press inside vanilla' from an
-    // external synthesized jump.
     bool g_diagInVanillaHandleButton = false;
 
     cocos2d::CCPoint g_substepP1Position = { 0.f, 0.f };
@@ -251,8 +187,6 @@ namespace {
     namespace tick_util {
         int current(GJBaseGameLayer* layer, ReplayEngine* engine) {
             auto* playLayer = PlayLayer::get();
-            // Editor playtest has no PlayLayer: fall back to the explicit layer
-            // the drive-loop passes (the hooked GJBaseGameLayer running physics).
             GJBaseGameLayer* active = playLayer ? static_cast<GJBaseGameLayer*>(playLayer) : layer;
             if (!active) return 0;
             if (engine && engine->stepClock) {
@@ -263,10 +197,6 @@ namespace {
         }
     }
 
-    // BUG-79 start trace: where exactly does the macro's FIRST click land
-    // relative to the level clock? distance input.tick - effectiveTick is the
-    // macro's own lede; anything further out should match the [START-WIN]
-    // frozen-window line in physicsbypass.cpp. Once per session, INFO.
     static void logFirstPlaybackInput(ReplayEngine* engine, int inputTick,
                                       int referenceTick, double levelTime,
                                       size_t index, size_t total) {
@@ -547,31 +477,14 @@ void ReplayEngine::simulateQueuedSubstepTick(
 class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     struct Fields {
         bool macroInput = false;
-        // Playback commands that must be visible in m_queuedButtons for the
-        // readers that consult the QUEUE instead of the hold map (dash-ring
-        // activation). They are collected at dispatch time and re-pushed right
-        // before this step's vanilla drain, because the drain also has to drop
-        // the user's own clicks - see processQueuedButtons.
         std::vector<PlayerButtonCommand> queueMirror;
-        // True while vanilla is draining the queue. The input-only path
-        // dispatches AFTER the drain, so a queued copy there would be applied a
-        // step late; those events are deliberately not mirrored.
         bool drainingQueue = false;
-        // BUG-109: инстансы портала 2926 для substep-проб собираются НА
-        // УРОВЕНЬ. Раньше жили в function-local static (per-process) и
-        // переживали выход из уровня - висячие указатели; краш 16:19 -
-        // чтение по 0xD8 с нулевым элементом в этом векторе.
         std::vector<GameObject*> portalProbeInstances;
         bool portalProbeInit = false;
     };
 
     bool resolvePlaybackPlayer2(bool player2) {
         auto* engine = ReplayEngine::get();
-        // SK inputs are captured AT handleButton and store the raw param the
-        // game itself received (probe-proven: with the control-flip setting
-        // the param maps to the opposite player object inside handleButton).
-        // Replaying that param verbatim reproduces the exact object routing;
-        // the legacy UI-level pre-flip is only correct for GDR-era sources.
         if (!engine || !engine->skMode) {
             if (resolveFlipState()) {
                 player2 = !player2;
@@ -623,12 +536,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         const bool rawPlayer2 = player2;
         player2 = resolvePlaybackPlayer2(player2);
 
-        // Determine current accuracy mode
         AccuracyMode accMode = engine->skMode
             ? (engine->activeSk ? engine->activeSk->accuracyMode : engine->selectedAccuracyMode)
             : (engine->activeMacro ? engine->activeMacro->accuracyMode : engine->selectedAccuracyMode);
 
-        // Vanilla / COS / CBS: direct handleButton + queue mirror
         if (static_cast<int>(tick) < gTraceWindowEnd) {
             auto* trcPlayLayer = PlayLayer::get();
             skkbot2::log::info("[TRC IN ] t={} button={} pressed={} p2param={} p2resolved={} posBefore=({:.1f},{:.1f})",
@@ -643,18 +554,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, player2);
         m_fields->macroInput = false;
         engine->triggerAudio(player2, button, down);
-        // Queue mirror: real touches travel UILayer -> m_queuedButtons ->
-        // processQueuedButtons, and some game-side readers (dash-ring
-        // activation) consult the QUEUE, not just the hold map. The direct
-        // call above sets the map; this copy rides the vanilla queue so
-        // queue-readers see the same events as in the recording. Vanilla
-        // consumption routes back through our EXECUTE hook and is swallowed
-        // there (map already correct), so this is side-effect free.
-        //
-        // The copy is parked in queueMirror and flushed by processQueuedButtons
-        // immediately before the drain: pushing it here instead would let the
-        // step's own "drop the user's clicks" pass erase it (that was the
-        // bug - the mirror never reached a single reader).
         if (button >= 1 && button <= 3 && !m_fields->drainingQueue) {
             PlayerButtonCommand command = {};
             command.m_button = static_cast<PlayerButton>(button);
@@ -715,21 +614,11 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         auto* engine = ReplayEngine::get();
         auto* playLayer = PlayLayer::get();
 
-        // Drive the step clock for a PlayLayer attempt OR an editor playtest
-        // (LevelEditorLayer playtest funnels through this base-layer update).
         if (!playLayer && !skk::gameplay::isEditorPlaytest()) {
             skkbot2::step_trace::finish();
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
-        // Step-grid clock boundary: every processCommands call IS one physics
-        // sub-step in a PlayLayer (probe-proven: one call per forced step,
-        // half/last are not pair flags, and m_currentStep stays 0 in this
-        // batched pipeline). An editor playtest is different: GD funnels the
-        // same calls at ~180/s with dt=1/180, so one call is only ~1.33 macro
-        // ticks. Advance by dt*tickRate (keeping the fractional remainder) so the
-        // playback grid stays locked to the level's game time instead of
-        // drifting ~25% slow (the "speedhack-like" slowdown).
         if (engine->stepClock) {
             if (skk::gameplay::isEditorPlaytest()) {
                 engine->stepPairFrac += static_cast<double>(dt) * engine->runtimeTickRate();
@@ -741,22 +630,11 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // Выравниваем editor ПОСЛЕ фактического дробного инкремента: один вызов
-        // может продвинуть 0/1/несколько macro-тиков. Предсказывать его как +1
-        // нельзя. Reset/live arm остаются в фазе BeforeStep.
         if (skk::gameplay::isEditorPlaytest() &&
             engine->engineMode == MODE_EXECUTE && !engine->startPosActive) {
             skk::editor::attemptPlaytestArm(this, engine);
         }
 
-        // EDITOR PLAYTEST CADENCE PROBE: in the editor the physics timing
-        // machinery (SpeedControlScheduler / PhysicsControlLayer / getModifiedDelta)
-        // is PlayLayer-gated and stays vanilla, so GD funnels processCommands at
-        // ~180/s with dt=1/180 instead of 240/s with dt=1/240. One call is NOT
-        // one macro tick there: the step clock now advances by dt*tickRate (see
-        // the compensation above). This probe verifies the grid stays locked to
-        // the level's game time - a residual cadence mismatch would still show
-        // up as a "speedhack-like" slowdown of the whole run.
         if (skk::gameplay::isEditorPlaytest()) {
             static double sLast = 0.0;
             static int sCalls = 0;
@@ -788,24 +666,11 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // Substep-grid probe: how GD interleaves half/last processCommands
-        // calls against levelTime and m_currentStep during capture and
-        // playback. Budget mode (first N calls of a session) plus a permanent
-        // window around the last playback death (probeAroundTick) so a REplay
-        // and a fresh RECORD of the same span can be diffed line by line.
         const bool activeMode = engine->engineMode == MODE_CAPTURE ||
                                 engine->engineMode == MODE_EXECUTE;
-        // BUG-102 v3 hotfix: SKC record/play NEVER touch the SKK engineMode -
-        // the SKC bot is a sibling engine (State::Record/Playback on its own
-        // State), so the 04.11 sessions ran with SKK MODE_DISABLED, the probe
-        // never armed and the 11:29/11:35 logs have no probe lines at all.
         const bool skcActive = skk::skc::Bot::get().isRecording() ||
                                skk::skc::Bot::get().isPlaying();
         const bool anyActive = activeMode || skcActive;
-        // [HB] tick heartbeat: one line every 480 ticks of any active session
-        // (SKK capture/execute or SKC record/play) with a flush. A silent
-        // crash has no crashlog - the last [HB] line localises the death to a
-        // 480-tick interval, the surrounding [CK]/[SKC] logs narrow it down.
         if (anyActive) {
             static int sHbCounter = 0;
             if ((++sHbCounter % 480) == 0) {
@@ -820,12 +685,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 skkbot2::Logger::get().flush();
             }
         }
-        // [HBd] dense heartbeat: a respawn (progress going DOWN) arms ~900
-        // ticks in which EVERY processCommands call logs one flushed line.
-        // Both live crash logs died within 1-2 ticks of a checkpoint respawn,
-        // and the [HB] 480-tick cadence cannot localise that - the dense
-        // window pins the death to an exact tick (and the surrounding
-        // [WT]/[CK]/cFE markers then name the function).
         {
             static int sHbLastProgress = -1;
             static int sHbDense = 0;
@@ -842,20 +701,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
         const bool budgetProbe = engine->substepProbe > 0 && activeMode;
-        // BUG-102 v3: arm the window probe on an arbitrary tick from saved
-        // settings, not only around a playback death. The 04.11 divergences
-        // are LIVE at a deterministic tick (rec flips the portal f=417, play
-        // f=421) with bit-identical coordinates AND bit-identical levelTime
-        // (verified from trace bins), so the probe window must answer WHICH
-        // channel differs there: the half/last grouping phase of the feed
-        // (vanilla portal contact quantizes against half-ticks) or the
-        // moving-object timeline. Set `skc-probe-tick` in the mod's saved
-        // values (+= mod.json extras) to the tick of interest.
         if (engine->probeAroundTick < 0 && engine->probeAroundTicks.empty() && anyActive) {
             static bool sProbeTickRead = false;
             if (!sProbeTickRead) {
                 sProbeTickRead = true;
-                // Щедро: несколько окон сразу - "skc-probe-ticks" = "416,516,1237".
                 const std::string list = geode::Mod::get()->getSavedValue<std::string>(
                     "skc-probe-ticks", "");
                 std::string cur;
@@ -903,31 +752,13 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         if (budgetProbe) {
             --engine->substepProbe;
         }
-        // BUG-102 v3: позиция подшага внутри кадра дисплея - счётчик
-        // сбрасывается в update-хуке раз в кадр (skc_batch_probe.hpp).
-        // Инкремент на КАЖДЫЙ вызов processCommands: вне probe-окна счётчик
-        // тоже должен быть жив - gravity-flip строки печатают batch в любой
-        // точке уровня, а окно не всегда накрывает флип (1057 вне 476-524).
         skkbot2::skcprobe::noteStep();
         if (budgetProbe || windowProbe) {
-            // info: debug lines never reach the tiny flush buffer, and the
-            // window comparison (rec session vs play session on the same
-            // tick) is exactly what the diverging level needs to answer.
-            // Label: SKC keeps its own state enum (SKK engineMode stays
-            // MODE_DISABLED in SKC-only sessions), so pick per engine.
             const char* modeLabel =
                 skcActive ? (skk::skc::Bot::get().isRecording() ? "rec-skc"
                                                                : "play-skc")
                           : (engine->engineMode == MODE_CAPTURE ? "rec-skk"
                                                                 : "play-skk");
-            // BUG-102 v3: m_objectID - это ТИП объекта, инстансов 2926
-            // в уровне много (сессия 14:35: кэш из portal-see поймал
-            // чужой инстанс в (5042,3165) scale 0.76 rot 90, а
-            // активный портал оседает в (2492,3150) scale 0.89
-            // rot 270). Один раз собираем ВСЕ инстансы и печатаем
-            // ближайший к игроку - его rect и есть гейт флипа.
-            // BUG-109: сбор пер-уровневый (Fields), не per-process static -
-            // после выхода из уровня старые указатели висячие.
             if (!m_fields->portalProbeInit) {
                 m_fields->portalProbeInit = true;
                 if (m_objects) {
@@ -945,7 +776,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 const float px = m_player1 ? m_player1->getPositionX() : 0.0f;
                 float bestDist = 1e9f;
                 for (auto* inst : m_fields->portalProbeInstances) {
-                    if (!inst) continue;  // BUG-109: null-гвард
+                    if (!inst) continue;
                     const float d = std::fabs(inst->getPositionX() - px);
                     if (d < bestDist) { bestDist = d; probePortal = inst; }
                 }
@@ -982,12 +813,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 probePortal ? static_cast<double>(probePortal->getPositionY()) : -1.0,
                 probePortal ? static_cast<double>(probePortal->getScale()) : -1.0,
                 probePortal ? static_cast<double>(probePortal->getRotation()) : -1.0);
-            // Mover timeline probe: hash of every moving object's
-            // id/pos/rot. Movers advance with the cocos action manager - if
-            // that path runs on raw frame time instead of the fixed grid,
-            // record and playback diverge at the SAME player position
-            // (drift 0.4px) yet die to an object that was 2px elsewhere.
-            // The first tick whose hash differs localizes the channel.
             if (auto* movers = m_objectsToMove) {
                 uint64_t moversHash = movers->count();
                 long long firstId = -1;
@@ -1019,10 +844,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int tick = tick_util::current(this, engine);
         double processSliceTimestamp = m_timestamp + static_cast<double>(std::max(0.0f, dt));
 
-        // Practice-restart boundary reseeds: spliced recordings re-armed the
-        // LCG at each checkpoint respawn (arm family + captured primary). When
-        // the live tick crosses a stored boundary, reproduce the same reseed so
-        // the segment that follows keeps its recorded RNG world.
         if (engine->engineMode == MODE_EXECUTE && engine->activeSk) {
             auto const& boundaries = engine->activeSk->rngBoundaries;
             while (engine->nextBoundaryIndex < boundaries.size()) {
@@ -1034,8 +855,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     ? engine->activeSk->rngSeed : engine->rngSeedVal;
                 skk::applyRngBoundaryReseed(boundary.primary, boundary.teleport,
                                            seedSalt, boundary.progress);
-                // pinTripleSeedAtReset внутри helper выводит shake из primary;
-                // файл уже хранит собственную live-цепочку, включая допустимый 0.
                 skk::shakeStateSet(boundary.shake);
                 skkbot2::log::info("rng boundary applied: tick={} progress={} live(0x{:X},0x{:X}) shake=0x{:X}",
                     boundary.tick, boundary.progress,
@@ -1066,8 +885,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
         int stepDelta = std::max(0, m_currentStep - engine->tickStartStep);
 
-        // Reset the playback jump tracer at the start of every attempt so a
-        // cross-attempt position delta is never misread as a visible hop.
         if (newTick && tick <= 1) {
             gFrameLastTick = -1;
             gTraceWindowEnd = -1;
@@ -1090,8 +907,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     engine->lastProcessSliceTimestamp,
                     processSliceTimestamp
                 )) {
-                    // Repeated-slice suppression is exactly the fps-vs-grid
-                    // boundary; make it visible instead of silently dropping.
                     if (++engine->processSliceSkips % 240 == 1) {
                         skkbot2::log::info("process-slice skip #{}: tick={} stepDelta={} ts={:.6f} lastTs={:.6f}",
                             engine->processSliceSkips, tick, stepDelta,
@@ -1106,8 +921,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         auto handleRecordingPhase = [&](int t) {
             if (!newTick) return;
             if (engine->hasMacro() && engine->levelRestarting && !m_levelEndAnimationStarted) {
-                // Don't call resetLevel() here — GD handles the restart.
-                // Calling resetLevel() again creates a death loop.
                 return;
             }
             captureTick(t);
@@ -1115,9 +928,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
         auto handlePlaybackPhase = [&](int t) {
             if (newTick && engine->hasMacro() && engine->levelRestarting && !m_levelEndAnimationStarted) {
-                // GD is already handling the reset — don't call resetLevel()
-                // again (that creates a death loop: reset → death → reset).
-                // Just return and let GD finish its restart sequence.
                 return;
             }
             executeTick(t, stepDelta);
@@ -1125,12 +935,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
         auto tickOpt = computeAndGuard();
         if (!tickOpt) {
-            // MODE_DISABLED: xdNako-style per-frame hold sync.
-            // After practice checkpoint restore, vanilla GD calls
-            // releaseAllButtons() which clears m_holdingButtons AND internal
-            // flags (m_jumping, m_hasJustHeld, etc). Direct map writes are
-            // insufficient — we must call pushButton/releaseButton through
-            // the player's API to properly set all internal state.
             auto syncPhysicalHolds = [&, layer = static_cast<GJBaseGameLayer*>(playLayer)](PlayerObject* player) {
                 if (!player) return;
 #ifdef GEODE_IS_WINDOWS
@@ -1140,7 +944,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 bool blocked = player->m_controlsDisabled;
                 auto mode = currentPhysicalHoldMode(layer);
 
-                // Jump: mapping depends on twoPlayer/platformer/dual (see physical_keys.hpp)
                 bool jumpHeld = physicalHoldActive(mode, 1, isP2, blocked);
                 bool jumpMap = hb.count(1) && hb[1];
                 if (jumpHeld && !jumpMap) {
@@ -1149,7 +952,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     player->releaseButton(PlayerButton::Jump);
                 }
 
-                // Left
                 bool leftHeld = physicalHoldActive(mode, 2, isP2, blocked);
                 bool leftMap = hb.count(2) && hb[2];
                 if (leftHeld && !leftMap) {
@@ -1158,7 +960,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     player->releaseButton(PlayerButton::Left);
                 }
 
-                // Right
                 bool rightHeld = physicalHoldActive(mode, 3, isP2, blocked);
                 bool rightMap = hb.count(3) && hb[3];
                 if (rightHeld && !rightMap) {
@@ -1167,10 +968,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     player->releaseButton(PlayerButton::Right);
                 }
 
-                // MODE_CAPTURE: route both press and release through hooked
-                // handleButton so the macro stream records them. pushButton/
-                // releaseButton only set internal state — they do NOT call
-                // handleButton, so the recording layer never sees these events.
                 if (engine->engineMode == MODE_CAPTURE && engine->hasMacro()) {
                     bool p2 = handleButtonPlayer2Param(isP2, controlFlipActive(this));
                     if (jumpHeld && !jumpMap) {
@@ -1223,19 +1020,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
-        // BUG-06: phase timing on the playback hot path. Logs whenever the
-        // bot's own per-tick work (dispatch + pre-phy pin + GD physics +
-        // post-step reconcile/logs) exceeds 5ms of wall time — the user's
-        // "пролаг ГД" on every spider-orb press. Proves whether the stall
-        // lives in bot CPU work (inputs/pin/reconcile) or is pure GD/jitter.
         std::chrono::steady_clock::time_point tInputsStart, tGdStart, tPostStart;
         int64_t hotInputsUs = 0, hotPinUs = 0, hotGdUs = 0, hotPostUs = 0;
 
         if (engine->engineMode == MODE_EXECUTE && newTick && tick >= 0) {
-            // BUG-06: build the level-wide portal list cache on the very first
-            // ticks of the run, NOT on the first seam tick (~40ms of
-            // dynamic_cast on 141k objects would otherwise hitch the start-warp
-            // seam as a visible "пролаг ГД" on every attempt).
             if (tick <= 8) {
                 prePhyWarmPortalCache(this);
             }
@@ -1244,17 +1032,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             hotInputsUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tInputsStart).count();
         }
 
-        // NOTE: The old force-reconcile of anchor[0] on every tick was wrong —
-        // it applied tick 289's state at tick 0..288, teleporting P2 to the
-        // wrong position and causing void death on file-loaded macros.
-        // Position pinning is now handled by prePhyPositionPin + reconcilePerFrames.
-        // Anchor structural reconciliation (modeOnly) still runs in executeTick
-        // via reconcileAnchors when the tick reaches each anchor.
 
-        // Pre-physics position pin: snap to previous tick's end state so
-        // collision detection (portals, orbs, pads) evaluates at correct positions.
-        // Only on newTick (first sub-step) — subsequent sub-steps must let GD
-        // advance the position naturally for correct trigger detection.
         if (newTick && engine->engineMode == MODE_EXECUTE && engine->skMode && engine->perFrameReconciliation) {
             auto tPinStart = std::chrono::steady_clock::now();
             prePhyPositionPin(tick + engine->tickOffset);
@@ -1264,8 +1042,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         tGdStart = std::chrono::steady_clock::now();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
-        // Compare raw live physics before executeTick can reconcile positions,
-        // velocity, or other recorded state. This detector never writes state.
         if (skkbot2::step_trace::enabled()) {
             skkbot2::step_trace::checkDrift(
                 this, tick + engine->tickOffset,
@@ -1278,10 +1054,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         engine->lastProcessSliceTimestamp = processSliceTimestamp;
 
         if (engine->engineMode == MODE_DISABLED) {
-            // Armed-waiting playback takeover: PLAY was pressed mid-run, so the
-            // bot does NOT reset or teleport the player - it waits until the
-            // live position is actually covered by the recording and arms in
-            // place on that tick.
             if (newTick) {
                 engine->tryLivePlaybackTakeover(this);
             }
@@ -1311,19 +1083,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // One row per completed processCommands call, after capture/playback
-        // reconciliation. The trace frame is the macro clock; batch records
-        // the game-step count consumed for this macro tick (zero for any
-        // additional substeps belonging to the same tick).
         skkbot2::step_trace::record(this, tick + engine->tickOffset,
                                     newTick ? static_cast<unsigned>(std::max(stepDelta, 0)) : 0u,
                                     newTick);
 
-        // === PLAYBACK JUMP TRACER: frame boundary detector ==================
-        // isLastTick marks the last physics step of a visual (60Hz) frame, i.e.
-        // the position the eye actually renders. A large frame-to-frame delta
-        // there IS the reported "резкий скачок". On detection we open a detailed
-        // per-tick trace window (reconcilePerFrames logs [TRC RECON] lines).
         if (isLastTick && engine->engineMode == MODE_EXECUTE && m_player1) {
             auto* p = m_player1;
             const float px = p->getPositionX();
@@ -1336,16 +1099,10 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 const float fdy = py - gFrameLastPy;
                 const float fdist = std::sqrt(fdx * fdx + fdy * fdy);
                 ++gFrameCount;
-                // Horizontal advance at 240tps over 4 substeps is small for
-                // normal speeds, but speed-hacked sections legitimately move
-                // faster; only vertical hops + sudden big deltas are the tell.
                 if (fdist > kJumpThresholdPx) {
-                    // Gap to the recording at the visible frame (if a perFrame
-                    // exists for the current effective tick).
                     float recX = 0.f, recY = 0.f;
                     bool haveRec = false;
                     if (auto* pf = engine->activePerFrames()) {
-                        // nearest perFrame at/before effTick
                         for (size_t i = 0; i < pf->size(); ++i) {
                             if (pf->at(i).tick <= effTick) { recX = pf->at(i).p1x; recY = pf->at(i).p1y; haveRec = true; }
                             else break;
@@ -1373,13 +1130,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             gFrameLastRot = rot;
             gFrameLastVy = vy;
         }
-        // === RENDERED-DRIFT METER (Этап 0) =====================================
-        // playDriftMax reads preP1x inside reconcilePerFrames (pre-position-write):
-        // it measures how far vanilla physics wandered BEFORE the recorded
-        // position is applied. It is not a visible playback residual. This meter
-        // samples the actual post-reconcile state at the visual boundary
-        // (isLastTick): (live - last applied recorded frame). A nonzero value
-        // here is a residual a user could see; phase-saw artifacts do not appear.
         auto* rdriftFrames = engine->activePerFrames();
         if (isLastTick && rdriftFrames && !rdriftFrames->empty() && m_player1) {
             const float rpx = m_player1->getPositionX();
@@ -1408,7 +1158,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
             }
         }
-        // =====================================================================
     }
 
 #ifdef GEODE_IS_MACOS
@@ -1446,7 +1195,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 engine->clearQueuedSubstepState();
                 queueAutoclickerInputs();
                 if (engine->hasMacro() && engine->levelRestarting && !m_levelEndAnimationStarted) {
-                    // Don't call resetLevel() again — GD handles the restart.
                     return GJBaseGameLayer::update(dt);
                 }
             }
@@ -1487,9 +1235,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Do not sample trajectory/anchors while either player is in a death
-        // animation. The next reset decides whether the preceding live segment
-        // is retained (practice checkpoint) or wiped (fresh attempt).
         if (engine->captureDeathPending ||
             (m_player1 && m_player1->m_isDead) || (m_player2 && m_player2->m_isDead)) {
             return;
@@ -1646,17 +1391,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // GDH-aligned reconstruction (field study 02.09): GDH's per-frame
-        // handle_update pins ONLY position (+optional vy) and lets GD derive
-        // gravity/rotation/vehicle/dash/spider from replayed inputs. Our old
-        // code force-restored the FULL state every tick (force = tick match),
-        // which fights GD's sub-step state machines - the dash-ring hold
-        // animation never completes and the spider-sprite legs render flipped
-        // while the root rotation matches. Full restore now fires only on real
-        // drift / mode change (needsReconciliation); the per-frame position+vy
-        // pin (reconcilePerFrames) still guarantees exact-walk determinism.
-        // With a live per-frame stream (EXACT-walk), anchors only reconcile on
-        // STRUCTURAL divergence (modeOnly); sparse files keep pos-drift sync.
         const bool modeOnlySync = [&] {
             if (!engine->perFrameReconciliation || !engine->skMode) {
                 return false;
@@ -1691,35 +1425,21 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         }
     }
 
-    // Re-arm the dash-ring hold on playback: recording proved the only
-    // surviving tick-boundary divergence (probe dr=1 vs 0) is GD's
-    // startDashing() edge never re-fires in the replayed session, so the
-    // ring press animation (and the pointer state feeding it) stays off.
-    // The ring is found by its objectID - the world is the same objects -
-    // and only when the player currently has NO ring (never re-trigger an
-    // in-flight dash).
     static void reattachDashRing(GJBaseGameLayer* playLayer, PlayerObject* player, int32_t ringId,
                                  int tick, int& lastAttemptTick, float recVy, float recVyb) {
         static_cast<void>(lastAttemptTick);
         if (!playLayer || !player || ringId == 0) {
             return;
         }
-        // Don't reattach if already attached (GD will detach it at the end of this tick)
         if (player->m_dashRing) {
             return;
         }
-        // Use per-frame ring ID for rising edge detection (exact activation tick
-        // from recording) instead of unreliable touch detection. The per-frame
-        // tells us the exact tick the ring was activated in the recording.
         static int s_lastAttachedRingId[2] = { 0, 0 };
         int slot = (player == playLayer->m_player2) ? 1 : 0;
         bool risingEdge = (ringId != 0 && s_lastAttachedRingId[slot] != ringId);
         s_lastAttachedRingId[slot] = ringId;
 
         auto attachRing = [&](DashRingObject* obj, const char* via) {
-            // Call startDashing only on the rising edge (exact activation tick
-            // from per-frame). Subsequent ticks just keep the pointer so GD
-            // continues the dash lifecycle naturally.
             if (risingEdge) {
                 player->startDashing(obj);
                 player->m_yVelocity = recVy;
@@ -1732,16 +1452,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 ringId, tick, via, risingEdge ? 1 : 0, player->getPositionX(), player->getPositionY(),
                 obj->getPositionX(), obj->getPositionY());
         };
-        // Direct state set instead of startDashing(): GD's startDashing()
-        // triggers endDash() on the next tick, creating a contested state
-        // where we fight with GD's dash lifecycle (broken dash physics).
-        // By setting m_dashRing directly, GD sees an active dash and
-        // processes it normally without calling endDash(). Backup only -
-        // with coherent physics the game attaches the ring itself.
-        // 2) Nearest match with the ID (never the far twin): the cache is
-        // validated by world identity (rebuilds free the objects) and by
-        // proximity (a cached twin 2000px+ away is the wrong twin, or the
-        // player moved on to another twin sharing the ID).
         static int cacheRingId = 0;
         static DashRingObject* cacheObj = nullptr;
         static void* cacheWorld = nullptr;
@@ -1809,53 +1519,8 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         }
     }
 
-    // Pre-physics position pin: snap player to the PREVIOUS tick's per-frame
-    // position BEFORE GD runs collision detection. This ensures gravity portals,
-    // orb touch zones, and pad triggers fire at the exact recorded positions.
-    //
-    // Per-frame records POST-physics state, so per-frame[tick N-1] = state at
-    // the START of tick N. Pinning to it before GD's processCommands gives
-    // collision detection the correct input position.
-    //
-    // Post-step reconcilePerFrames still runs after physics as a safety net.
-    // Locate the TeleportPortalObject that actually represents the recorded
-    // portal jump. Three independent acceptance criteria:
-    //   1. a portal object literally sits at the recorded ENTRY position
-    //      (<=300px) - the recorded pre-jump frame may be wherever the player
-    //      stood, but the portal zone object usually sits right there; and
-    //   2. a portal object's linked destination (m_orangePortal) lands near the
-    //      recorded EXIT position (<=600px) - the exact recorded landing spot.
-    //   3. a portal object (WITHOUT a linked m_orangePortal) sits AT the
-    //      recorded EXIT position (<=600px). These are "destination-standing"
-    //      teleports (observed id=3022 recv objects): the portal object IS the
-    //      landing target, linked only by group, not by m_orangePortal. GD
-    //      fires them live, so treating the jump as a real portal (instead of
-    //      an objectless seam) keeps the pre-pin from fighting the native
-    //      relocation. Without this criterion prePhyPin reported "NOT a portal"
-    //      for Summer Blitz @512 (4748px warp) and dropped the one tick that
-    //      re-appears as the persistent -1.05px/0.212vy drift in TRCRECON.
-    // If NO portal object matches any criterion, the jump is NOT a real GD
-    // portal: it is either fast legit movement at speed-hack speeds (>42px/tick
-    // cap) or a RECORDING SEAM (practice death/respawn stitched into one
-    // per-frame stream -> physically impossible 2-tick jumps, e.g. DF2 @8446
-    // 136.9px, @8944 85.1px, nearest real portal >5k px away). Popping the
-    // player at such a jump was THE visible 'teleport bug'. Callers treat
-    // nullptr as "not a portal" and fall back to the normal pin.
-    // Passing a found entry to GD's own GJBaseGameLayer::teleportPlayer
-    // reproduces the portal exactly like a real run: GD resolves the exit via
-    // m_orangePortal/group, applies y-offsets/effects and flags the player as
-    // teleported (ToastyReplay/silicate approach).
     static TeleportPortalObject* findTeleportEntryPortal(
         GJBaseGameLayer* playLayer, float ex, float ey, float tx, float ty) {
-        // Level-wide portal list cache: dynamic_cast on ALL objects (this
-        // level is 141 THOUSAND objects) per seam-window tick was a ~22ms
-        // synchronous hitch exactly where the recorded teleport/orb fires
-        // (PLAY_HOT showed pin=~22ms on every seam tick — the "пролаг ГД").
-        // A portal window spans 2 ticks (ahead + behind) and both callers run
-        // this search with DIFFERENT (entry,exit) pairs, so a per-pair memo
-        // never hit. Portals are static for a level: build the list ONCE per
-        // array, then each seam window walks only the SMALL portal list
-        // (microseconds).
         prePhyWarmPortalCache(playLayer);
         auto* objects = playLayer->m_objects;
         auto const& sPortalCache = gPortalCache;
@@ -1916,11 +1581,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 nearestDist, exitDist);
             return bestOrange;
         }
-        // Criterion 3 (BUG-04/BUG-06 SB @512): a portal WITHOUT m_orangePortal
-        // standing AT the recorded exit - the object IS the landing target
-        // (group-linked destination, e.g. id=3022). Treating it as a real
-        // portal lets GD's native teleportPlayer run; the no-orange fallback
-        // in the caller force-pins to the recorded exit otherwise.
         float const destStandDist = std::sqrt(bestDestStandDist);
         if (bestDestStand && destStandDist <= 600.0f) {
             skkbot2::log::info(
@@ -1929,14 +1589,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 nearestDist, destStandDist);
             return bestDestStand;
         }
-        // BUG-06 diag #3: no portal object near this recorded jump. Dump the
-        // objects that DO sit here — the seam is likely a REAL level teleport
-        // (spawn-clone portal, touch-trigger, or other mechanism) that GD
-        // fires live but that dynamic_cast<TeleportPortalObject*> on m_objects
-        // cannot see. The nearest-object IDs/positions reveal the mechanism.
-        // Run it at most ONCE per session: the all-objects scan + sort + giant
-        // log on the per-tick hot path caused a ~40ms main-thread hitch right
-        // at the seam tick (the "GD пролагивает" symptom on every orb press).
         {
             static bool sObjectsNearLogged = false;
             if (!sObjectsNearLogged) {
@@ -2005,11 +1657,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
         if (!pfPrev) {
-            // No perFrame at or before prevTick — find the nearest
-            // perFrame at or before effectiveTick. This covers early ticks
-            // where perFrame data starts later (e.g. first perFrame at tick 2
-            // while we're pinning tick 2 — prevTick=1 has no data, but the
-            // perFrame at tick 2 is the correct pre-physics state).
             for (size_t i = 0; i < perFrames->size(); ++i) {
                 auto const& e = perFrames->at(i);
                 if (e.tick <= effectiveTick) { pfPrev = &e; }
@@ -2020,51 +1667,14 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // BUG-06: detect a RECORDED teleport-portal jump around the current
-        // frame. At a portal the perFrame data jumps by hundreds/thousands of
-        // px between consecutive frames. GD fires the same portal during live
-        // physics, but the trigger tick can drift +/-1 vs the recording because
-        // the pre-pin only restores position+vy, not the full physics state.
-        // Consequences without this guard:
-        //   - portal fired ONE tick early live: the player already stands at the
-        //     exit, but pre-pin snaps them BACK to the recorded entry position
-        //     (3838px backward tear, the worst case on DF2 tick 1382).
-        //   - portal not fired yet live (player at the entry): pre-pin snaps them
-        //     straight to the recorded exit, teleporting through the portal it
-        //     never entered (DF2 tick 6073).
-        // So whenever a recorded portal jump is detected in the +/-1 frame
-        // window, we skip the pre-physics pin for this tick and let GD's own
-        // portal mechanics do the relocation; reconcilePerFrames absorbs the
-        // result after physics. If the live portal fails to fire, the post-step
-        // reconcile still pins to the recorded exit (only one tick later, and it
-        // shows up as a big "playback drift" for diagnosis). Splice/checkpoint
-        // jumps are unaffected: their per-frame streams do not contain a
-        // consecutive-frame jump here.
         {
-            // Portal jumps here are NOT always huge: vertical teleport portals
-            // move the player only ~100-200px (observed awd.skk tick 6317:
-            // 180px), well below the old 300px threshold -> the pin snapped the
-            // player into the recorded exit before GD's own portal fired (or
-            // back to the entry after it already fired). Maximum LEGITIMATE
-            // consecutive-frame movement is ~42px/tick (4x speed hack), so every
-            // jump above that is a teleport/stitch. 30px catches the small
-            // vertical portals (recorded 36/43px insta-jumps on awd) without
-            // false-positive on any sane recording (legit single-tick movement
-            // is <=~3px; even 4x speed hack is <=~42px/tick but then the stream
-            // is smooth because every tick is recorded, so no jump exists).
             constexpr float kPortalJumpPx = 30.0f;
             enum class PortalKind { None, Ahead, Behind, LiveGap };
             PortalKind portalKind = PortalKind::None;
             size_t const n = perFrames->size();
             size_t const idx = engine->perFramePlaybackIndex;
-            // Endpoint frames of a portal window: pEntry = pre-teleport frame,
-            // pExit = post-teleport frame. Used to decide whether the live
-            // player is still ON the entry side (pin to entry so physics
-            // reproduces the teleport) or already PAST it (skip, don't tear
-            // the player back through the portal).
             const SkPerFrame* pEntry = nullptr;
             const SkPerFrame* pExit = nullptr;
-            // Jump AHEAD: pfPrev -> next unconsumed frame.
             if (idx < n) {
                 auto const& pfNext = perFrames->at(idx);
                 if (pfNext.tick > pfPrev->tick) {
@@ -2082,9 +1692,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     }
                 }
             }
-            // Jump BEHIND: frame before pfPrev already jumped INTO the exit
-            // (recorded portal fired during the previous physics tick; live
-            // may still be on the entry side). Let GD run the portal now.
             if (portalKind == PortalKind::None && idx >= 2) {
                 auto const& pfPrev2 = perFrames->at(idx - 2);
                 float const jx = pfPrev->p1x - pfPrev2.p1x;
@@ -2100,12 +1707,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         pfPrev->p1x, pfPrev->p1y, pfPrev->tick);
                 }
             }
-            // Live player far from pin target: the recorded data is sparse
-            // (perFrame not every tick), so perFrame gaps can MISS a portal
-            // jump that already happened in live GD physics. If the live
-            // player is >threshold away from pfPrev, pinning back would cause
-            // a visible teleport; skip and let reconcilePerFrames pull to
-            // the correct post-physics position instead.
             if (portalKind == PortalKind::None && playLayer->m_player1) {
                 float const dx = playLayer->m_player1->getPositionX() - pfPrev->p1x;
                 float const dy = playLayer->m_player1->getPositionY() - pfPrev->p1y;
@@ -2119,20 +1720,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
             }
             if (portalKind != PortalKind::None && pEntry && pExit) {
-                // BUG-06 gate: only treat a big recorded jump as a REAL portal
-                // if the level actually has a TeleportPortalObject there. Fast
-                // legit movement at speed-hack speeds and recording seams
-                // (practice death/respawn stitched into one stream) produce
-                // 60-160px jumps with NO portal object nearby. These are NOT
-                // discrete-dash gaps anymore: perframe_jumps.txt proved the
-                // clean awd recording has an INSTANT recorded relocation at
-                // exactly these spots (start warp 4745px, vertical 36-148px),
-                // and the exit lands frame-perfect on real portal heights.
-                // GD live does not fire them (no portal object -> no fire), so
-                // gliding at 26px/tick over ~5 frames reads as lag/freeze to
-                // the eye (the reported symptom). Reproduce the jump EXACTLY
-                // as recorded: one instant relocation, same as a real portal.
-                // Backward/rewind exits (respawn seams) never snap backward.
                 if (!findTeleportEntryPortal(
                         playLayer, pEntry->p1x, pEntry->p1y, pExit->p1x, pExit->p1y)) {
                     if (playLayer->m_player1) {
@@ -2141,10 +1728,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         float const jx = pExit->p1x - sx;
                         float const jy = pExit->p1y - sy;
                         float const jumpLen = std::sqrt(jx * jx + jy * jy);
-                        // BUG-06: visual-state witness so a clean (GD-fired)
-                        // seam can be compared field-by-field against a bot-snap
-                        // with the SAME record jump — rotation/sprite/vel/ground
-                        // mismatches are what read as a 'sharp dirty teleport'.
                         auto seamVisual = [&](const char* tag) {
                             auto* p = playLayer->m_player1;
                             if (!p) return;
@@ -2162,12 +1745,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                                 p->m_isUpsideDown ? 1 : 0, p->m_isDashing ? 1 : 0,
                                 p->m_isOnGround ? 1 : 0);
                         };
-                        // Rewind seam guard: if the live player is already at /
-                        // past the recorded EXIT side, the stream just stitched a
-                        // respawn that lands BEHIND us; pinning to the exit would
-                        // drag the player backward across the whole level. Skip
-                        // the whole pre-phy pin this tick (reconcile then lets
-                        // the route catch up on its own).
                         float const din  = (sx - pEntry->p1x) * (sx - pEntry->p1x) +
                                            (sy - pEntry->p1y) * (sy - pEntry->p1y);
                         float const dout = (sx - pExit->p1x)  * (sx - pExit->p1x) +
@@ -2181,15 +1758,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                             portalKind = PortalKind::None;
                             return;
                         }
-                        // Never snap BACKWARD for an objectless seam: that is a
-                        // death/respawn rewind (record stitched the checkpoint
-                        // behind us), not a level teleport. Dragging the player
-                        // backward across the level was THE visible tear bug.
-                        // Real portals are handled above (object found). All
-                        // legit objectless teleports in a clean recording move
-                        // FORWARD (start warp 4745px, vertical drops 36-148px,
-                        // x stays == or advances). Skip and let reconcile pull
-                        // to the next in-order frame.
                         if (pExit->p1x < pEntry->p1x - 40.0f) {
                             engine->seamGlideUntilTick = -1;
                             seamVisual("skip_backward");
@@ -2200,27 +1768,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                             return;
                         }
                         engine->seamGlideUntilTick = -1;
-                        // BUG-06: input-driven instant relocation (spider hold,
-                        // teleport-orb, dash-orb). The clean recording has a
-                        // consecutive-frame jump that is NOT a level portal (no
-                        // TeleportPortalObject nearby), but the frame data PROVES
-                        // a recorded press lands on the same window (awd 8525/8570/
-                        // 8934/9104/6278 map 1:1 to the jump ticks in inputs_dump).
-                        // During live play GD fires these natively when the press
-                        // is dispatched — dispatchPlaybackInputsPre runs right
-                        // before this pin — and the native displacement equals the
-                        // recorded jump. The old objectless instant seam snap
-                        // (setPosition to exit + m_wasTeleported) fought that
-                        // native relocation: a hard position write landed BEFORE
-                        // GD's own orb/spider moved the player, producing the
-                        // visible double-hop/flash the user reads as "рывок ГД".
-                        // So for a press-driven jump we skip the pre-phy pin like
-                        // a portal window: let GD run its mechanic this tick and
-                        // reconcilePerFrames absorbs the result (live lands at the
-                        // recorded exit, then pinned exactly). Only truly
-                        // press-less objectless jumps (start warp 4711px, plain
-                        // vertical drops) keep the instant snap — GD never fires
-                        // those on its own.
                         if (auto* inputs = engine->activeSkInputs()) {
                             bool pressDriven = false;
                             int const lo = std::min(pEntry->tick, pExit->tick) - 1;
@@ -2243,19 +1790,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                                 return;
                             }
                         }
-                        // Objectless seam = a recorded death/respawn stitch (or
-                        // plain recorded teleport gap) with no portal object.
-                        // GD NEVER fires these live (no object to collide), so
-                        // there is nothing to wait for and no native effect to
-                        // preserve: the extra "free 1 tick, let GD fire" window
-                        // only stalled the player at the entry (reads as lag) and
-                        // always ended in the same snap. Reproduce the recorded
-                        // relocation EXACTLY as the reference bots do (per-frame
-                        // position pin, one clean tick): write the player to the
-                        // recorded exit frame immediately and mark it as GD's own
-                        // teleport so the engine renders the standard flash/slide
-                        // (same visual cue as the clean original respawn) instead
-                        // of a raw snap that reads as a lag hitch.
                         playLayer->m_player1->setPosition({ pExit->p1x, pExit->p1y });
                         playLayer->m_player1->m_yVelocity = pExit->p1vy;
                         playLayer->m_player1->m_yVelocityBeforeSlope = pExit->p1vyb;
@@ -2274,11 +1808,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             if (portalKind != PortalKind::None) {
                 bool skipPin = true;
                 if (playLayer->m_player1 && pEntry && pExit) {
-                    // Decide by the live player's position. If already at/past
-                    // the EXIT endpoint, GD fired the portal naturally (or is a
-                    // plain live-gap divergence) -> skip, do NOT tear the player
-                    // back through the portal (BUG-06 DF2 tear). If still at the
-                    // ENTRY side -> reproduce the portal ourselves below.
                     float const cx = playLayer->m_player1->getPositionX();
                     float const cy = playLayer->m_player1->getPositionY();
                     float const dIn  = (cx - pEntry->p1x) * (cx - pEntry->p1x) +
@@ -2288,26 +1817,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     skipPin = (dOut < dIn);
                 }
                 if (skipPin) {
-                    // Player already at the recorded exit (or a plain live-gap
-                    // divergence) -> let GD finish the relocation and let
-                    // reconcilePerFrames absorb the result after physics.
                     skkbot2::log::info("prePhyPin skip (portal window): effTick={} cur=({:.1f},{:.1f})",
                         effectiveTick,
                         playLayer->m_player1 ? playLayer->m_player1->getPositionX() : 0.0f,
                         playLayer->m_player1 ? playLayer->m_player1->getPositionY() : 0.0f);
                     return;
                 }
-                // Player is still on the ENTRY side at the recorded portal tick.
-                // Just pinning to the entry does NOT fire GD's portal: the pin
-                // resets the player to the zone edge every tick, the zone-overlap
-                // check (run at the START of each physics step) never sees the
-                // player inside, and GD never teleports (awd.skk 8935: stuck at
-                // the entry for ticks, then a delayed 146px snap to the exit).
-                // So fire the portal OURSELVES at this exact tick via GD's own
-                // teleportPlayer(entryPortal) -> correct exit, state and effects.
-                // If the entry object cannot be found, or the GD call does not
-                // take effect, fall back to a direct jump to the recorded exit
-                // (single in-place portal pop, marked m_wasTeleported).
                 static const SkPerFrame* sFiredEntry = nullptr;
                 static int sFiredTick = -1;
                 bool const firedAlready =
@@ -2338,11 +1853,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
                 TeleportPortalObject* entryPortal = findTeleportEntryPortal(
                     playLayer, pEntry->p1x, pEntry->p1y, pExit->p1x, pExit->p1y);
-                // Only let GD resolve the destination when the portal carries a
-                // linked m_orangePortal. A portal without one (target handled by
-                // a group) makes GD pick a RANDOM group portal as destination;
-                // for exact-record replay that would land who-knows-where, so a
-                // deterministic jump to the recorded exit is safer there.
                 if (entryPortal && entryPortal->m_orangePortal && playLayer->m_player1) {
                     sFiredEntry = pEntry;
                     sFiredTick = effectiveTick;
@@ -2371,12 +1881,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // BUG-06 diagnostics: this pin is the ONLY position write on the
-        // playback path without drift logging. If the per-frame pointer ever
-        // snaps to a "wrong" record (stale index after practice restore,
-        // splice, or a bad fallback scan below), the player jumps across the
-        // map silently. Log any spike above a generous threshold so the next
-        // report gives us the pin tick and indices.
         auto pinSpike = [&](PlayerObject* p, float pnx, float pny, int pinTick, const char* slot) {
             if (!p || playLayer->m_player1 == nullptr) {
                 return;
@@ -2398,15 +1902,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         };
 
         if (playLayer->m_player1) {
-            // BUG-06: adopt the reference-bot playback model (GDH/Toasty pin
-            // the player to the recorded frame EVERY tick, velocity-fix on).
-            // Zero drift means level triggers (orbs/pads/cuts) fire exactly
-            // like the recording and the whole level runs smooth instead of
-            // "lagging". Active seam windows already returned early above
-            // (defer/snap/fire/skip + rewind), so reaching here means this
-            // tick maps to a clean frame: pin unconditionally. Only a >60px
-            // offset (an unclassified record gap) is left to reconcilePerFrames
-            // with capped forward steps.
             float const cx = playLayer->m_player1->getPositionX();
             float const cy = playLayer->m_player1->getPositionY();
             float const dx = pfPrev->p1x - cx;
@@ -2420,11 +1915,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 playLayer->m_player1->setPosition({ pfPrev->p1x, pfPrev->p1y });
                 playLayer->m_player1->m_yVelocity = pfPrev->p1vy;
                 playLayer->m_player1->m_yVelocityBeforeSlope = pfPrev->p1vyb;
-                // Rotation must be pinned BEFORE physics too (not only in
-                // reconcilePerFrames). GD's slope/look-at math reads the live
-                // rotation attached to the node; if only reconcile sets it, the
-                // per-tick physics roll in a rotating ship/ball starts from the
-                // stale live rotation and adds a growing Δrot on long spins.
                 playLayer->m_player1->setRotation(pfPrev->p1rot);
                 if (effectiveTick < gTraceWindowEnd) {
                     logP1TraceLine(
@@ -2446,11 +1936,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
         if (pfPrev->hasPlayer2 && playLayer->m_player2) {
-            // BUG-21: a recorded (0,0) P2 frame is the DORMANT sentinel from
-            // before the P2 liveness gate existed (or a macro from before
-            // today). Pinning a live, dual-activated P2 to it teleports it
-            // across the level. GD's own liveness signal is parenting, so
-            // skip the pin for dormant frames.
             if (pfPrev->p2x == 0.0f && pfPrev->p2y == 0.0f
                 && playLayer->m_player2->getParent() != nullptr) {
                 skkbot2::log::debug(
@@ -2500,19 +1985,8 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             const float liveRotBeforePin = playLayer->m_player1 ? playLayer->m_player1->getRotation() : 0.f;
             const float dx0 = preP1x - pf.p1x;
             const float dy0 = preP1y - pf.p1y;
-            // Keep in sync with prePhyPositionPin's portal threshold (60px):
-            // anything above is a portal teleport / stitch gap that GD's own
-            // physics must resolve (pre-pin was already skipped that tick; a
-            // 180px reconcile snap right after would recreate the teleport).
             constexpr float kReconcileSkipPx = 60.0f;
             if (dx0 * dx0 + dy0 * dy0 > kReconcileSkipPx * kReconcileSkipPx) {
-                // Big live->recorded gap. If the recorded frame is AHEAD,
-                // converge with a capped step (never a single-tick snap) at
-                // 26px/tick — this covers both armed seam glides and medium
-                // divergences that never reached the portal window. If the
-                // route is BEHIND (respawn/rewind seam: stream jumped back to
-                // start/checkpoint or the merge put it behind us), skip and
-                // let the route catch up on its own — never drag backwards.
                 if (playLayer->m_player1 && pf.p1x > preP1x) {
                     float const dx1 = pf.p1x - preP1x;
                     float const dy1 = pf.p1y - preP1y;
@@ -2540,14 +2014,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
 
             if (playLayer->m_player1) {
-                // Never instant-snap across a gap on the normal path either:
-                // sub-60px seams (they never reached the portal window) and any
-                // leftover below the skip threshold used to be pinned in ONE
-                // tick, which is exactly the visible teleport-blip (52px@8541,
-                // 56px@9103). Always converge with capped forward steps; only
-                // pin exactly when the route is already within the cap. Never
-                // claw BACKWARD to a behind route (rewind seams close on their
-                // own).
                 bool leavePosition = false;
                 float pinX = pf.p1x;
                 float pinY = pf.p1y;
@@ -2563,12 +2029,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                             engine->seamGlideUntilTick = -1;
                         }
                     } else if (d1 <= ReplayEngine::kSeamGlideStepPx) {
-                        // Small backward gap (live slightly AHEAD of the route,
-                        // typically <= one tick's advance, ~2px). Claw it back
-                        // now: leaving it lets a one-substep lead turn into a
-                        // lingering forward offset on the rendered frame. Only
-                        // genuine rewind seams (large backward distance) are
-                        // exempt below.
                         engine->seamGlideUntilTick = -1;
                     } else {
                         leavePosition = true;
@@ -2577,10 +2037,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 if (!leavePosition) {
                     playLayer->m_player1->setPosition({ pinX, pinY });
                 }
-                // === PLAYBACK JUMP TRACER (auto window) ==========================
-                // Log the LIVE post-physics / pre-reconcile state vs the recorded
-                // target, so the reported "hop" can be attributed to either the
-                // physics itself (live already drifted) or the reconcile pin.
                 if (effectiveTick < gTraceWindowEnd) {
                     logP1TraceLine(
                         "RECON", effectiveTick,
@@ -2594,33 +2050,16 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         (pf.p1vis & kVisualDashing) ? 1 : 0,
                         pf.p1RingId);
                 }
-                // ==================================================================
                 playLayer->m_player1->m_yVelocity = pf.p1vy;
                 playLayer->m_player1->m_yVelocityBeforeSlope = pf.p1vyb;
                 playLayer->m_player1->setRotation(pf.p1rot);
-                // Gravity/ud state correction from p1vis (TLPD repair):
-                // GD's orb/portals sometimes fail to flip during playback due
-                // to substep timing. Force the recorded state to keep visuals
-                // deterministic. This is NOT full state restore — only gravity
-                // sign and upsideDown flag which are pure OUTPUT of collision
-                // detection and don't feed back into substep state machines.
                 {
                     const bool wantGravNeg = (pf.p1vis & kVisualGravityNegative) != 0;
                     const bool wantUD      = (pf.p1vis & kVisualUpsideDown) != 0;
                     const bool curGravNeg  = playLayer->m_player1->m_gravity < 0.0;
                     const bool curUD       = playLayer->m_player1->m_isUpsideDown;
-                    // BUG-04 study: log every forced gravity/ud application and
-                    // every disagreeing recorded frame. `lag` = how many ticks
-                    // behind the recorded target the live player sat when the
-                    // reconcile had to force the state - proves the hypothesis
-                    // that state lands one (or several) ticks LATE.
                     if (curGravNeg != wantGravNeg || curUD != wantUD) {
                         const int lag = effectiveTick - pf.tick;
-                        // Always INFO, and on BOTH bits disagreeing. The old gate
-                        // (wantUD != wantGravNeg) only fired when the two bits
-                        // disagreed with each other, which a normal gravity portal
-                        // never does — both flip together — so the exact case we are
-                        // chasing (a UFO's gravity flip not landing) logged nothing.
                         if (std::abs(lag) <= 8) {
                             skkbot2::log::info(
                                 "RECON ud: tick={} pfTick={} lag={} p1 cur(g={} ud={}) -> want(g={} ud={}) p1vis=0x{:02x}",
@@ -2647,10 +2086,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     reattachDashRing(playLayer, playLayer->m_player1, pf.p1RingId, pf.tick,
                                      engine->dashReattachLast[0], pf.p1vy, pf.p1vyb);
                 }
-                // Dash state correction from p1vis bit7: force m_isDashing
-                // to match the recording. This drives the dash orb hold
-                // animation and dash visual effects that GD may miss due to
-                // substep timing differences.
                 {
                     const bool wantDash = (pf.p1vis & kVisualDashing) != 0;
                     if (playLayer->m_player1->m_isDashing != wantDash) {
@@ -2659,20 +2094,14 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 }
             }
             if (pf.hasPlayer2 && playLayer->m_player2) {
-                // BUG-21: skip the dormant (0,0) sentinel — same guard as the
-                // pre-phy pin above, so a dual-activated live P2 is never
-                // yanked to the origin by a pre-gate recorded frame.
                 if (pf.p2x == 0.0f && pf.p2y == 0.0f
                     && playLayer->m_player2->getParent() != nullptr) {
-                    // Still reconcile the gravity/ud flags below? No — a
-                    // dormant frame's vis bits are stale too. Skip entirely.
                 } else {
                     playLayer->m_player2->setPosition({ pf.p2x, pf.p2y });
                     playLayer->m_player2->m_yVelocity = pf.p2vy;
                     playLayer->m_player2->m_yVelocityBeforeSlope = pf.p2vyb;
                     playLayer->m_player2->setRotation(pf.p2rot);
                 }
-                // P2 gravity/ud correction (mirrors P1 logic above).
                 {
                     const bool wantGravNeg = (pf.p2vis & kVisualGravityNegative) != 0;
                     const bool wantUD      = (pf.p2vis & kVisualUpsideDown) != 0;
@@ -2713,7 +2142,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     reattachDashRing(playLayer, playLayer->m_player2, pf.p2RingId, pf.tick,
                                      engine->dashReattachLast[1], pf.p2vy, pf.p2vyb);
                 }
-                // P2 dash state correction (mirrors P1 logic above).
                 {
                     const bool wantDash = (pf.p2vis & kVisualDashing) != 0;
                     if (playLayer->m_player2->m_isDashing != wantDash) {
@@ -2741,9 +2169,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             ++framesAppliedThisTick;
         }
 
-        // BUG-04 study: >1 per-frame consumed in one tick = the recorded state
-        // is being applied in a burst N ticks late. That delay is exactly the
-        // 'state lands behind the live physics' hypothesis; log bursts.
         if (framesAppliedThisTick > 1 && engine->perFrameReconciliationCatchUps < 20) {
             ++engine->perFrameReconciliationCatchUps;
             skkbot2::log::info(
@@ -2754,10 +2179,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         }
     }
 
-    // Click dispatch BEFORE the vanilla sub-step (capture consumed the click
-    // of tick T during step T; dispatching after the step delayed every
-    // playback click by one sub-step - ~2px at max speed, the residual
-    // 'dies near the end' phase error). CBS already queues pre-step.
     void dispatchPlaybackInputsPre(int tick, int stepDelta) {
         auto* engine = ReplayEngine::get();
         if (m_levelEndAnimationStarted || !engine->hasMacro()) {
@@ -2785,7 +2206,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int effectiveTick = tick + engine->tickOffset;
         engine->lastDispatchEffectiveTick = effectiveTick;
 
-        // Input dispatch only (frame-boundary).
         if (!shouldUseInputOnlySkPlayback() && !shouldUseInputOnlyGDRPlayback()) {
             m_fields->macroInput = true;
             if (engine->skMode && engine->activeSk) {
@@ -2811,8 +2231,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // After all inputs are exhausted, stop reconciliation and anchors
-        // so the game continues normally with user control.
         if (engine->playbackExhaustionNotified) {
             return;
         }
@@ -2820,19 +2238,12 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int effectiveTick = tick + engine->tickOffset;
 
         reconcileAnchors(effectiveTick);
-        // BUG-04 study: probe the raw live state BEFORE reconcile, so a stray
-        // GD gravity/ud flip that our application LATER corrects shows up as
-        // playRaw(first) vs play(after) on the same tick - the 'state applied
-        // late' fingerprint.
         engine->gravStateProbe("playRaw", effectiveTick, m_player1, m_player2);
         engine->gravDiffProbe("raw", effectiveTick, m_player1, m_player2);
         reconcilePerFrames(effectiveTick);
         engine->gravStateProbe("play", effectiveTick, m_player1, m_player2);
         engine->gravDiffProbe("applied", effectiveTick, m_player1, m_player2);
         {
-            // Play-side hold probe (mirrors the record-side one in
-            // recordSkAnchor): proves, tick by tick, that dispatched inputs
-            // actually land on the intended player object.
             auto heldBit = [](PlayerObject* p) -> int {
                 if (!p) return -1;
                 const auto& hb = p->m_holdingButtons;
@@ -2848,17 +2259,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // RNG stream lock + audit: anchors carry the level fast_rand state
-        // captured at the same post-substep point in recording. Field proof
-        // (02.09): one extra setup draw in either session shifted the whole
-        // stream by one - every random pick then returned the NEXT recorded
-        // value and randomized objects landed in alien positions. Pinning
-        // the state to the recorded value at every anchor tick makes the
-        // stream equal the recording by construction (GDH's mechanism),
-        // whatever the fps/particle noise consumed in between. First
-        // mismatches are logged with the detected lag (how many recorded
-        // states back the live value sits) to prove the lock bites.
-        // Triple RNG: also restore teleport from anchor.
         if (engine->skMode) {
             if (auto* anchors = engine->activeAnchors(); anchors && engine->playbackAnchorIndex > 0) {
                 const size_t ai = engine->playbackAnchorIndex - 1;
@@ -2883,13 +2283,9 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                         }
                         GameToolbox::fast_srand(auditAnchor.rng.fastRandState);
                     }
-                    // Triple RNG: restore teleport from anchor.
                     if (auditAnchor.rng.teleportState != 0) {
                         *skk::gdTeleportRng() = auditAnchor.rng.teleportState;
                     }
-                    // And shake, now that it is locked for both SKK and SKC.
-                    // Without this the chain drifted across the whole replay
-                    // while primary and teleport were re-pinned every tick.
                     if (auditAnchor.rng.shakeState != 0) {
                         skk::shakeStateSet(auditAnchor.rng.shakeState);
                     }
@@ -2897,10 +2293,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        // One-shot notice when the segment's inputs are exhausted while the
-        // player is still alive: every later death is "macro ended", not a
-        // desync - the log line tells the two apart.
-        // Unblock user input so the player is not frozen in-place.
         if (!engine->playbackExhaustionNotified) {
             bool exhausted = false;
             int totalInputs = 0;
@@ -2979,13 +2371,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             macSubstepDispatch();
         }
 #endif
-        // Ignore Inputs: the player's own clicks must not interleave with the
-        // macro. Clearing is still the cheapest way to drop them (the drain
-        // would swallow them at handleButton anyway, but the queue itself is
-        // read by dash-ring code), and it used to also erase the playback
-        // mirror pushed at dispatch time. Re-push that mirror right here, after
-        // the clear and before the drain, so queue-readers finally see the
-        // macro's own events on the tick they belong to.
         const bool dropUserInput =
             engine->engineMode == MODE_EXECUTE && engine->manualInputIgnoredActive();
         if (dropUserInput) {
@@ -3022,9 +2407,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
 
         auto* engine = ReplayEngine::get();
         if (skkbot2::capture_reconciliation::active()) {
-            // Внутренний reconciliation уже владеет записью boundary-input.
-            // До user/autoclicker/queue/edge-веток: не расходуем их состояние
-            // и не играем click audio второй раз. Vanilla должен выполниться.
             const bool previous = g_diagInVanillaHandleButton;
             g_diagInVanillaHandleButton = true;
             GJBaseGameLayer::handleButton(hold, button, player2);
@@ -3040,11 +2422,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             Autoclicker::get()->trackUserInput(hold, player2);
         }
 
-        // Per-frame sync release: called from processCommands when a physical
-        // key was released but GD didn't fire handleButton (no edge transition).
-        // We only need to record the release into the macro stream — skip all
-        // normal GD processing since the per-frame sync already called
-        // releaseButton to clear m_holdingButtons and internal state.
         if (g_perFrameReleaseSync && !hold && engine->engineMode == MODE_CAPTURE && engine->hasMacro()) {
             bool recordPlayer2 = player2;
             if (!keepSecondPlayerSlot(this)) {
@@ -3118,11 +2495,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Per-frame sync press: same as release sync but for hold=true. The
-        // physical key went down but GD never fired handleButton (e.g. held
-        // through death, or GD's edge detection missed the transition). The
-        // per-frame sync already called pushButton to set internal state —
-        // we just need to record the press into the macro stream.
         if (g_perFramePressSync && hold && engine->engineMode == MODE_CAPTURE && engine->hasMacro()) {
             bool recordPlayer2 = player2;
             if (!keepSecondPlayerSlot(this)) {
@@ -3240,13 +2612,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int recordSlot = recordPlayer2 ? 1 : 0;
         PlayerObject* targetPlayer = recordPlayer2 ? m_player2 : m_player1;
         bool trackHoldTransition = isTrackedHoldButton(button) && targetPlayer;
-        // Game-side control flip makes handleButton apply its player2 PARAM to
-        // the OPPOSITE player object. Reading held state from the param object
-        // misjudged real presses as duplicates ('capture drop' at the flipped
-        // era deaths) and orphaned the releases. Diff BOTH players' hold maps
-        // around the vanilla call and judge the transition on the object that
-        // actually changed; the stored input keeps the raw param so playback
-        // reproduces GD's own mapping.
         auto holdBitOf = [button](PlayerObject* p) -> int {
             if (!p) return 0;
             const auto& hb = p->m_holdingButtons;
@@ -3256,10 +2621,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int p1Before = holdBitOf(m_player1);
         int p2Before = holdBitOf(m_player2);
         bool wasHeld = trackHoldTransition ? (targetPlayer ? holdBitOf(targetPlayer) : 0) : false;
-        // Shadow of what we last recorded as held for this slot/button (see
-        // ReplayEngine::recordedHoldShadow). Game's m_holdingButtons can be
-        // cleared internally before the physical release reaches us (wave
-        // flips, gate steps), and relying on it alone silently drops releases.
         const int paramShadowIndex = recordSlot * 3 + (button - 1);
         const bool shadowHeld = trackHoldTransition && engine->recordedHoldShadow[paramShadowIndex];
         AccuracyMode accuracyMode = engine->skMode
@@ -3270,12 +2631,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
             ? engine->popCbsCaptureCommand(button, hold, player2)
             : std::optional<ReplayEngine::QueuedCaptureCommand> {};
 
-        // Raw event tap (capture): every handleButton the game really got,
-        // with the PRE-call hold bit of its target slot. The week-long 'p2
-        // press did not activate the trigger' class needs to be placed in
-        // exactly one of two boxes: (a) GD never delivered the touch (this
-        // line absent => cocos/dual touch ate it - not a capture bug), or
-        // (b) the event arrived but capture filtered/recorded it wrong.
         if (engine->engineMode == MODE_CAPTURE && button <= 2) {
             skkbot2::log::debug(
                 "raw btn: tick={} down={} button={} p2={} slot={} preHold={} dual={} dead={} ignore={}",
@@ -3286,10 +2641,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 engine->captureIgnored ? 1 : 0);
         }
 
-        // Phantom-input suppression window (post-death / post-restore flush):
-        // phantom PRESSES are dropped BEFORE vanilla so the respawned player
-        // never jumps on its own. A human press within ~33ms of a restart is
-        // not physically meaningful; GD's map stays 0 either way.
         const int eventTick = tick_util::current(this, engine);
 
         const bool prevInVanilla = g_diagInVanillaHandleButton;
@@ -3301,9 +2652,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         int p2After = holdBitOf(m_player2);
         const bool p1Changed = p1After != p1Before;
         const bool p2Changed = p2After != p2Before;
-        // Effective object = whose map actually changed under GD's internal
-        // control flip (probe-proven: every event lands on the opposite
-        // object when game var 0010 is on). Judge the transition there.
         int effSlot = recordSlot;
         if (trackHoldTransition && p2Changed && !p1Changed) {
             effSlot = 1;
@@ -3313,21 +2661,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         const int effBefore = effSlot == 1 ? p2Before : p1Before;
         const bool effChanged = (effSlot == 1 ? p2Changed : p1Changed);
 
-        // Checkpoint-restore seam: GD flushes stale buffered presses AND
-        // the stale physical releases right after loadFromCheckpoint. The
-        // suppression window drops ONLY state no-op releases: by the time the
-        // flush arrives the restore has already wiped the hold maps
-        // (clearRestoredHolds) - a flush release finds the map at 0 and
-        // nothing recorded, so effBefore==0 && !shadowHeld. Such releases are
-        // exactly what the no-transition gate would reject anyway.
-        // BUG-103 class (fixed in SKC, live evidence release@1681 walked
-        // exactly onto the window edge): a GENUINE quick release inside the
-        // window - the tap whose press was recorded at the boundary - used to
-        // be dropped WITHOUT updating recordedHoldShadow, clipping the tap
-        // tail and leaving the shadow stale for the wave-flip flush paths.
-        // A release that actually releases a recorded hold (effBefore==1 or
-        // shadowHeld) passes the window and goes through the normal edge
-        // logic below.
         if (!hold && engine->captureReleaseSuppressUntil >= eventTick) {
             if (effBefore == 1 || shadowHeld) {
                 skkbot2::log::debug(
@@ -3351,9 +2684,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         } else if (hold) {
             realTransition = effChanged ? effBefore == 0 : !wasHeld;
         } else {
-            // Release: record it when EITHER the effective object actually
-            // released (or still shows held) OR we recorded a press that has
-            // not been released yet (game can clear holds on wave flips).
             realTransition = (effChanged ? effBefore == 1 : wasHeld) || shadowHeld;
         }
         if (trackHoldTransition) {
@@ -3377,13 +2707,6 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                 stepOffset = basePhase;
             }
             if (exactCbsCommand || recordingCBS) {
-                // CBS sub-tick phase. GD's PlayerButtonCommand timestamps are
-                // step-aligned (command.m_timestamp == m_timestamp, frozen
-                // between processCommands calls), so exactCbsCommand->timestamp
-                // - tickStartTimestamp is structurally ~0 and a recorded CBS
-                // macro lost its real within-tick phase. Use the WALL-clock
-                // arrival stamp from the UILayer hooks instead — it reflects
-                // where inside the tick the key/touch physically landed.
                 double wallPhase = engine->cbsPhaseFromInputWall();
                 if (wallPhase >= 0.0) {
                     cbsTimeOffset = wallPhase;
@@ -3480,19 +2803,7 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
         PlayerObject::updateRotation(t);
     }
 
-    // DIAGNOSTIC probes on the raw player API. The infinite-hold report shows
-    // clean m_holdingButtons after a practice respawn yet the character keeps
-    // jumping by itself. m_holdingButtons is only mutated by GD's dispatch:
-    // real input => vanilla handleButton (g_diagInVanillaHandleButton true),
-    // synthesized replay => our layer->handleButton (also true), everything
-    // else (autoclicker, direct pushButton, post-restore residue) shows up as
-    // direct=false. Logging who pressed, which player, and the resulting hold
-    // map tells us if the self-jump originates OUTSIDE the button system.
     void reportButtonCall(const char* kind, int button) {
-        // Level gate FIRST: the lines below build tick stamps and dig through
-        // two m_holdingButtons maps per call, at up to ~14k calls a second in
-        // a dual playback. wouldLog(Debug) is one integer compare; everything
-        // past it is wasted when the flood is not being written.
         if (!skkbot2::Logger::get().wouldLog(skkbot2::Logger::Debug)) {
             return;
         }
@@ -3524,7 +2835,6 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
             auto it = hb.find(1);
             holdP2 = it == hb.end() ? 0 : (it->second ? 1 : 0);
         }
-        // Hot path diag debug log disabled to prevent 7 FPS disk stalls
         (void)kind; (void)tick; (void)button; (void)isP1; (void)isP2; (void)holdP1; (void)holdP2;
     }
 
@@ -3544,19 +2854,6 @@ class $modify(MacroEnginePlayerObject, PlayerObject) {
 
 };
 
-// Stamps the WALL clock on every physical input arrival. GD's own
-// PlayerButtonCommand timestamps are step-aligned (m_timestamp is frozen
-// between processCommands calls), so the only true source of a sub-tick phase
-// is the moment the raw key/touch actually lands on UILayer. These hooks fire
-// BEFORE the queued button is dispatched to handleButton (the capture path
-// then reads ReplayEngine::cbsPhaseFromInputWall()).
-// ── BUG-105b v3: raw-хуки UILayer::keyDown/handleAction ─────────────────────
-// $modify-хуки Geode передают оригиналу неверный this (прямой базовый
-// подобъект CCKeyboardDelegate +0x220 вместо CCLayer-цепочки +0x158 — ромб
-// наследования, см. docs/Баги.md BUG-105b). keyDown/handleAction хукаются
-// напрямую через safetyhook: detour получает raw this от диспетчера
-// (подобъект +0x158), оригинал зовётся через trampoline без поправок.
-// $modify MacroUiInputWall ниже остаётся только для тач-методов.
 namespace {
     safetyhook::InlineHook g_uiKeyDownHook{};
     safetyhook::InlineHook g_uiHandleActionHook{};
@@ -3570,9 +2867,6 @@ namespace {
         }
     }
 
-    // Escape-ветка оригинала keyDown: jmp [fwd+0x10], fwd = [this+0xc8].
-    // Мусор в таблице (краш-сессии 2.2091: 0xFFFF..FF / 0 / float-данные)
-    // крашит ваниль так же — валидируем до вызова, fail-closed.
     bool uiEscapeForwardTableOk(void* self) {
         uintptr_t base = geode::base::get();
         auto* p = reinterpret_cast<uint8_t*>(self);
@@ -3609,9 +2903,6 @@ namespace {
         if (key == cocos2d::enumKeyCodes::KEY_Escape && !uiEscapeForwardTableOk(self)) {
             return;
         }
-        // BUG-120: during level-entry physics freeze (pause flag set, grace/resume
-        // still active), GD's pause-menu code paths assume live physics and can
-        // silently crash the game. Swallow Escape here instead of forwarding.
         if (key == cocos2d::enumKeyCodes::KEY_Escape && skkbot2::isEntryFrozen()) {
             skkbot2::log::info(
                 "[INPUT-WALL] keyDown SKIP Escape: entry frozen, pausing suppressed");
@@ -3631,17 +2922,12 @@ namespace {
         }
         stampInputArrival();
         skkbot2::notePlayerInput(down ? "action down" : "action up", action);
-        // BUG-120: during level-entry physics freeze, GD's pause-menu code paths
-        // assume live physics and can silently crash the game. Swallow pause
-        // action here instead of forwarding.
         if (action == 10009 && down && skkbot2::isEntryFrozen()) {
             skkbot2::log::info(
                 "[INPUT-WALL] handleAction SKIP pause: entry frozen, pausing suppressed");
             skkbot2::Logger::get().flush();
             return false;
         }
-        // Ветка действий 10001..10030 оригинала читает [this+0x100] (слой);
-        // нулевой указатель крашит ваниль точно так же — пропускаем с логом.
         if (action >= 10001 && action <= 10030) {
             auto* p = reinterpret_cast<uint8_t*>(self);
             uintptr_t layerPtr = *reinterpret_cast<uintptr_t*>(p + 0x100);
@@ -3660,20 +2946,12 @@ namespace {
         return g_uiHandleActionHook.call<bool>(self, action, down, ts);
     }
 
-    // ── Диагностика BUG-105b: кто реально получает клавиатурные события ──────
-    // Живой факт (сессии 09.50/09.51): raw-хуки keyDown/handleAction установлены,
-    // пользователь играл в уровне и жал клавиши — detour'ы НЕ вызывались ни разу.
-    // Хукаем сам CCKeyboardDispatcher::dispatchToTopDelegate (cocos 0x463a0) и
-    // логируем top-делегата, которого диспетчер выбрал для события.
     void uiDispatchDetour(
         cocos2d::CCKeyboardDispatcher* self, cocos2d::enumKeyCodes key, bool down,
         std::vector<int> const& actions, double ts) {
         static int dispLogged = 0;
         if (dispLogged < 40) {
             dispLogged++;
-            // Репликация getTopDelegate (cocos 0x7270) без вызова:
-            // holder=[disp+0x38]; vec=[holder+0x38]; count=dword[vec];
-            // top = count ? arr[count-1] : null, arr=[vec+0x10].
             void* top = nullptr;
             uintptr_t topVtbl = 0;
             uintptr_t cocosBase = GetModuleHandleW(L"libcocos2d.dll")
@@ -3713,7 +2991,7 @@ namespace {
         }
         g_uiDispatchHook.call<void>(self, key, down, actions, ts);
     }
-} // namespace
+}
 
 namespace skk {
 bool installUiInputWallHooks() {
@@ -3747,7 +3025,6 @@ bool installUiInputWallHooks() {
         return false;
     }
     g_uiWallInstalled = true;
-    // Верификация: пролог действительно пропатчен (первый байт = 0xE9, jmp).
     skkbot2::log::info(
         "[INPUT-WALL] raw-хуки UILayer установлены: keyDown@0x{:X} handleAction@0x{:X} "
         "patchBytes={:02X} {:02X} {:02X}",
@@ -3755,7 +3032,6 @@ bool installUiInputWallHooks() {
         *reinterpret_cast<uint8_t*>(*keyDown),
         *reinterpret_cast<uint8_t*>(*keyDown + 1),
         *reinterpret_cast<uint8_t*>(*keyDown + 2));
-    // Диагностика: хук диспетчера (не обязателен для работы).
     auto* cocosBase = reinterpret_cast<uint8_t*>(geode::base::getCocos());
     const size_t cocosSize = cocosBase ? skk::offsets::moduleSizeOf(cocosBase) : 0;
     if (cocosBase && cocosSize) {
@@ -3778,19 +3054,10 @@ bool installUiInputWallHooks() {
     }
     return true;
 }
-} // namespace skk
+}
 
 class $modify(MacroUiInputWall, UILayer) {
-    // keyDown/handleAction хукаются raw-хуками (installUiInputWallHooks,
-    // выше) — $modify-хук Geode на тех же адресах конфликтовал бы с
-    // safetyhook за пролог функции и передавал оригиналу неверный this
-    // (ромб наследования, BUG-105b). Здесь остаются только тач-методы.
 
-    // UILayer::keyUp стал inline в бинарнике 2.2091 и больше не хукается
-    // через $modify. Каримбо wall-clock для отпускания кнопки переносим в
-    // UILayer::handleAction — это точка, через которую проходит ЛЮБОЙ игровой
-    // боттон (клавиатура и тач), включая release, перед тем как дойти до
-    // GJBaseGameLayer::handleButton.
     bool ccTouchBegan(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
         if (auto* engine = ReplayEngine::get()) {
             engine->inputArrivalWallTime = ReplayEngine::wallClockSeconds();

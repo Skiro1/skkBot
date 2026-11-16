@@ -6,34 +6,9 @@
 #include <algorithm>
 #include <cmath>
 
-// Anti-SSB (scroll speed bug) support for skkBot.
-//
-// What SSB actually is (survey of silicate/grape/GDH/Eclipse/toasty-lite):
-// the game integrates x as fl32(x + fl32(speedPx / TPS)); at large absolute x
-// the float32 rounding changes the representable increment, so the REAL per-tick
-// dx differs from the nominal one and the position<->time mapping (progress %,
-// audio phase, timeForPos) slowly disagrees with the tick grid.
-//
-// The player-side correction during skkBot playback is already covered by the
-// PerFrame layer (x/y/vy/vyBeforeSlope forced every tick - stronger than the
-// position-forcing "SSB fix" ships elsewhere). This module provides the missing
-// world-side and measurement pieces:
-//   1. time-based progress recompute at TPS != 240 (PlayLayer hooks),
-//   2. K_ssb measurement factor (analytic position->tick conversion, audio dt
-//      compensation for the future renderer),
-//   3. ScrollClock: timeForPos-delta pacing for step budgets when no per-frame
-//      stream is available (legacy input-only playback, render passes).
-//
-// NOTE: the K factor is advisory only. Never shove the player onto a computed
-// "ideal x line" - the game's accumulator re-derives x on the next tick and
-// porta/orb/spider teleports would fight the correction (the old skkBot needed
-// its 40px discontinuity rule for exactly this reason; the per-frame stream
-// makes all of that unnecessary).
 
 namespace skk::ssb {
 
-// GD's px/s scroll speeds for m_playerSpeed {0.7, 0.9, 1.1, 1.3, 1.6}
-// (DrawGridLayer::m_slowSpeed .. m_fastestSpeed / LevelTools::getSpeed).
 inline constexpr double kSpeedPx[5] = {251.1601, 311.5801, 387.4201, 468.0002, 576.0002};
 
 inline int speedIndex(float playerSpeed) {
@@ -52,9 +27,6 @@ inline int speedIndex(float playerSpeed) {
     return 4;
 }
 
-// K_ssb: actually representable per-tick dx divided by the nominal one, at the
-// player's current absolute x. Returns 1.0 when unmeasurable. Silicate's
-// "formula given by ij9", made double-safe and range-guarded.
 inline double factor(PlayerObject* player, double tps) {
     if (!player || !(tps > 0.0)) {
         return 1.0;
@@ -72,9 +44,6 @@ inline double factor(PlayerObject* player, double tps) {
     return std::clamp(real / nominal, 0.5, 2.0);
 }
 
-// Time-derived progress percent - immune to scroll drift because the game's
-// own trigger clock (m_levelTime vs the level's ideal timestamp length in
-// 240-TPS ticks) is what the audio/trigger phase actually follows.
 inline double timeProgressPercent(GJBaseGameLayer* layer) {
     if (!layer || !layer->m_level) {
         return 0.0;
@@ -89,8 +58,6 @@ inline double timeProgressPercent(GJBaseGameLayer* layer) {
     return std::clamp(percent, 0.0, 100.0);
 }
 
-// True when the vanilla %/stats bookkeeping assumes the native 240 grid and
-// must be fed time-derived values instead.
 inline double normalizedRate(double tps) {
     return (tps > 0.0) ? tps : 240.0;
 }
@@ -100,9 +67,6 @@ inline bool progressFixNeeded(double tps) {
     return std::abs(tps - 240.0) > 0.001;
 }
 
-// Grape-style pacing clock: consume the game's own position-derived elapsed
-// time per frame instead of wall-clock. Only meaningful while x is monotone
-// in time (classic levels; platformers excluded on purpose).
 class ScrollClock {
 public:
     double advance(PlayLayer* layer, double tps) {

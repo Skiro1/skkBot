@@ -8,25 +8,12 @@
 #include <mutex>
 #include <vector>
 
-// The converter module, embedded at build time from
-// libs/wamr/obot_converter_bg.wasm.
 extern "C" const unsigned char skk_ast_wasm[];
 extern "C" const unsigned int skk_ast_wasm_len;
 
 namespace skk::ast::wasm {
 namespace {
 
-// The converter is a Rust program compiled by wasm-bindgen. It talks to its
-// host through 21 imports under the module name "wbg". None of them carry
-// information we need - they exist because the bundle may poke at the DOM
-// while it sets up - so all of them are stubs, with two exceptions that must
-// be modelled honestly because the Rust side branches on them:
-//
-//   * object handles are i32 indices into a host-side array. Click wrappers
-//     live there, plus a few sentinels, and is_undefined / instanceof_Window
-//     compare against what we stored.
-//   * __wbindgen_throw is a Rust panic. We must not trap the game over it, so
-//     it is a no-op and any failure surfaces through the loader's own result.
 enum Tag : uint8_t {
     TagUndefined = 0,
     TagWindow = 1,
@@ -138,8 +125,6 @@ bool startRuntime(std::string& reason) {
     }
 
     char err[256] = {0};
-    // The embedded module lives in .rdata, and the loader is handed a mutable
-    // pointer whether it needs one or not. Hand it a copy we own.
     static std::vector<uint8_t> moduleCopy;
     moduleCopy.assign(skk_ast_wasm, skk_ast_wasm + skk_ast_wasm_len);
     wasm_module_t mod =
@@ -159,9 +144,6 @@ bool startRuntime(std::string& reason) {
         return false;
     }
 
-    // wasm-bindgen's own start hook. It initialises the Rust allocator, and the
-    // module is unusable - every allocation traps - until it has run. The web
-    // glue calls it explicitly after instantiating, so we do too.
     if (!wasm_runtime_call_wasm_a(g_env, lookup("__wbindgen_start"), 0, nullptr, 0, nullptr)) {
         reason = "wasm не прошёл инициализацию";
         return false;
@@ -178,7 +160,7 @@ bool ensureRuntime(std::string& reason) {
     return g_instance != nullptr && g_env != nullptr;
 }
 
-}  // namespace
+}
 
 bool convert(std::span<const uint8_t> data, Output& out, std::string& outReason) {
     std::string reason;
@@ -189,10 +171,6 @@ bool convert(std::span<const uint8_t> data, Output& out, std::string& outReason)
 
     const auto n = static_cast<int32_t>(data.size());
 
-    // The loader takes the bytes through the module's own allocator and returns
-    // its result through a 16-byte slot on the wasm stack. Note that
-    // __wbindgen_malloc takes TWO arguments - size and alignment - and that
-    // converter_load is void: its outcome lands in that slot.
     wasm_val_t newStack;
     wasm_val_t reserveSlot = i32(-16);
     if (!wasm_runtime_call_wasm_a(g_env, lookup("__wbindgen_add_to_stack_pointer"), 1,
@@ -228,9 +206,6 @@ bool convert(std::span<const uint8_t> data, Output& out, std::string& outReason)
         return false;
     }
 
-    // The slot holds (payload, isError). On error the payload is a handle to a
-    // JS value we cannot read, so the only honest thing to say is that the
-    // converter rejected the file.
     mem = static_cast<uint8_t*>(wasm_runtime_addr_app_to_native(g_instance, 0));
     const auto* slot = reinterpret_cast<const uint32_t*>(mem + retptr);
     const bool failed = slot[1] != 0;
@@ -242,8 +217,6 @@ bool convert(std::span<const uint8_t> data, Output& out, std::string& outReason)
     wasm_val_t tps;
     std::memset(&tps, 0, sizeof(tps));
     tps.kind = WASM_I64;
-    // tps comes back as f32, not f64. Read as a double, 240 becomes 5.59e-315,
-    // which is small enough to look like a real measurement.
     wasm_runtime_call_wasm_a(g_env, lookup("converter_get_fps"), 1, &tps, 1, &converter);
 
     if (!failed && counted) {
@@ -268,7 +241,6 @@ bool convert(std::span<const uint8_t> data, Output& out, std::string& outReason)
         }
     }
 
-    // Hand the 16 bytes back whatever happened above.
     wasm_val_t giveBack = i32(16);
     wasm_runtime_call_wasm_a(g_env, lookup("__wbindgen_add_to_stack_pointer"), 1, &newStack, 1,
                              &giveBack);
@@ -334,7 +306,6 @@ bool saveAs(std::span<const uint8_t> data, uint32_t formatId,
         return false;
     }
 
-    // A second 16-byte slot, this time for (ptr, len).
     if (!wasm_runtime_call_wasm_a(g_env, lookup("__wbindgen_add_to_stack_pointer"), 1,
                                   &newStack, 1, &reserveSlot)) {
         outReason = "не удалось выделить слот под результат";
@@ -359,11 +330,9 @@ bool saveAs(std::span<const uint8_t> data, uint32_t formatId,
         return false;
     }
     out.resize(len);
-    // Same base pointer the loader used, so the copy is a plain memcpy rather
-    // than a runtime call that may not exist in this WAMR build.
     mem = static_cast<uint8_t*>(wasm_runtime_addr_app_to_native(g_instance, 0));
     std::memcpy(out.data(), mem + ptr, len);
     return true;
 }
 
-}  // namespace skk::ast::wasm
+}

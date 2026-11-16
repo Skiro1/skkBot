@@ -18,7 +18,6 @@
 
 namespace skk {
 
-// ── GD data globals ───────────────────────────────────────────────
 
 uint64_t* gdPrimaryRng() {
     return reinterpret_cast<uint64_t*>(
@@ -30,7 +29,6 @@ uint64_t* gdTeleportRng() {
         geode::base::get() + skk::offsets::kRngTeleportGlobalRva);
 }
 
-// ── Capture / Restore ─────────────────────────────────────────────
 
 TripleRngState captureTripleRng() {
     TripleRngState s;
@@ -42,12 +40,9 @@ TripleRngState captureTripleRng() {
 void restoreTripleRng(TripleRngState const& state) {
     *gdPrimaryRng()   = state.primary;
     *gdTeleportRng()  = state.teleport;
-    // Keep the midhook bot-owned copy in lockstep so the *next* teleport
-    // read advances the same chain the global was left at.
     pinTripleSeedAtReset(state.primary, state.teleport);
 }
 
-// ── Per-object advanced random ────────────────────────────────────
 
 namespace {
     std::vector<AdvRandEntry> g_advRandom;
@@ -101,8 +96,6 @@ void advRandomReseedAt(uint32_t seedSalt, int currentProgress) {
     advRandomReseed(advRandomBase(seedSalt, currentProgress));
 }
 
-// ── Variance regeneration ─────────────────────────────────────────
-// GD formula: v = (s & 0xFFFF) / 32768.0f - 1.0f; s = LCG(s)
 void regenerateVarianceFromSeed(uint64_t seed, float* table, size_t count) {
     uint64_t s = seed;
     for (size_t i = 0; i < count; ++i) {
@@ -111,7 +104,6 @@ void regenerateVarianceFromSeed(uint64_t seed, float* table, size_t count) {
     }
 }
 
-// ── Midhook installation (Windows) ────────────────────────────────
 
 #ifdef GEODE_IS_WINDOWS
 
@@ -120,51 +112,26 @@ namespace {
     SafetyHookMid g_shakeHooks[4];
     bool g_rngHooksInstalled = false;
 
-    // Bot-owned copy for midhook callback.
     uint64_t g_teleportState = 0;
 
-    // Bot-owned shake state. GD draws shake randomness through C rand(), whose
-    // seed is not part of the streams we pin at reset, so two attempts at the
-    // same level consume different draws. Silicate overrides all four call
-    // sites for exactly this reason
-    // (silicate-main/src/hooks/GJBaseGameLayer.cpp:736-744).
-    //
-    // Shared by SKK and SKC on purpose. It was previously SKC-only behind a
-    // gate, with SKK deliberately leaving shake unlocked
-    // ("shake (camera) is not locked"). A half-locked stream is worse than
-    // either: a checkpoint captured mid-attempt recorded a shake value that
-    // could not be restored, so practice replays drifted visually anyway.
     uint64_t g_shakeState = 0;
 
-    // Teleport midhook: intercept the inline LCG call.
-    // GD calls rand() inline at these sites. We intercept rax (the return
-    // value) by advancing our own state and setting rax to the output.
-    // The hook site is RIGHT AFTER the LCG step, so rax already holds the
-    // truncated 15-bit value. We skip the original call entirely.
     void teleportMidhook(safetyhook::Context& ctx) {
         g_teleportState = lcgAdvance(g_teleportState);
         ctx.rax = static_cast<uintptr_t>(lcgOutput(g_teleportState));
     }
 
-    // Shake rand() override, shared by SKK and SKC. Always active once
-    // installed: the chain is pinned deterministically at every attempt reset
-    // and snapshotted into every practice checkpoint, so there is no state
-    // left un-owned.
     void shakeRandomMidhook(safetyhook::Context& ctx) {
         g_shakeState = lcgAdvance(g_shakeState);
         ctx.rax = static_cast<uintptr_t>(lcgOutput(g_shakeState));
-        ctx.rip += 6;   // skip the original call to rand()
+        ctx.rip += 6;
     }
 
-    // Sync bot-owned copy from GD global (called after restore).
     void syncMidhookFromGlobals() {
         g_teleportState = *gdTeleportRng();
     }
 
-    // Sync GD global from bot-owned copy (called each tick to keep in sync).
     void syncGlobalsFromMidhook() {
-        // The midhook advances bot-owned state. Write back to the GD global
-        // so other GD code reading it sees consistent values.
         *gdTeleportRng() = g_teleportState;
     }
 }
@@ -185,9 +152,6 @@ bool installRngMidhooks() {
     const size_t moduleSize = 0;
 #endif
 
-    // Сайты берутся из реестра version_offsets.hpp: RVA fast-path с побайтовой
-    // сверкой + сигнатурный фолбэк. Хук не вешается на непроверенный байт —
-    // если сайт не резолвится, он пропускается с предупреждением (fail-closed).
     auto tryHook = [&](const skk::offsets::Site& site,
                        SafetyHookMid& hook,
                        void (*callback)(safetyhook::Context&)) -> bool {
@@ -218,7 +182,6 @@ bool installRngMidhooks() {
     bool ok = true;
     ok &= tryHook(skk::offsets::kRngTeleport, g_teleportHook, teleportMidhook);
 
-    // Четыре сайта C-rand() для тряски камеры (реестр, Silicate-подход).
     ok &= tryHook(skk::offsets::kRngShake1, g_shakeHooks[0], shakeRandomMidhook);
     ok &= tryHook(skk::offsets::kRngShake2, g_shakeHooks[1], shakeRandomMidhook);
     ok &= tryHook(skk::offsets::kRngShake3, g_shakeHooks[2], shakeRandomMidhook);
@@ -226,7 +189,6 @@ bool installRngMidhooks() {
 
     if (!ok) {
         skkbot2::log::warn("rng midhooks: some hooks failed - teleport lock degraded");
-        // Don't disable completely; the hooks that succeeded still work.
     }
 
     g_rngHooksInstalled = true;
@@ -235,38 +197,22 @@ bool installRngMidhooks() {
 }
 
 void pinTripleSeedAtReset(uint64_t primary, uint64_t teleport) {
-    // Write to GD globals.
     *gdPrimaryRng()   = primary;
     *gdTeleportRng()  = teleport;
 
-    // Sync bot-owned midhook copy.
     g_teleportState = teleport;
-    // Shake draws come from C rand(), which we override while an SKC session is
-    // live. Derive it from the same primary seed the attempt starts from so the
-    // chain is identical on every run of that attempt. Masked to 15 bits: the
-    // four call sites consume the truncated value.
     g_shakeState = primary & 0x7FFFULL;
 }
 
 void applyRngBoundaryReseed(uint64_t primary, uint64_t teleport,
                             uint32_t seedSalt, int progress) {
-    // Restore the GD globals + bot-owned midhook copy to the captured
-    // boundary state. Unlike pinTripleSeedAtReset this only repairs the RNG
-    // globals - the arm family is not re-applied.
     pinTripleSeedAtReset(primary, teleport);
 
-    // Re-seed per-object advanced randoms (2068/1912/3607) to the SAME base
-    // refreshRngState derived at this practice progress during capture. The
-    // LCG states themselves are not serialized into the macro, so playback
-    // must reconstruct them from the deterministic seedSalt+progress formula
-    // exactly as capture did on the respawn frame - otherwise the segment's
-    // per-object rand chain diverges and the random section looks different.
     if (progress >= 0) {
         advRandomReseedAt(seedSalt, progress);
     }
 }
 
-// Export sync functions for use by refreshRngState / checkpoint restore.
 void syncMidhookFromGlobals();
 void syncGlobalsFromMidhook();
 
@@ -274,7 +220,6 @@ uint64_t shakeStateGet() { return g_shakeState; }
 void shakeStateSet(uint64_t state) { g_shakeState = state; }
 
 #else
-// Non-Windows: stubs.
 bool installRngMidhooks() { return false; }
 void pinTripleSeedAtReset(uint64_t primary, uint64_t teleport) {
     *gdPrimaryRng()   = primary;

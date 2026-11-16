@@ -9,27 +9,10 @@
 #include <cstring>
 #include <fstream>
 
-// Ceilings. The format stores the input and death counts as bare varints, so a
-// corrupt or hostile file can claim ~2^64 events.
 static constexpr uint64_t kMaxInputs = 4'000'000;
 static constexpr uint64_t kMaxDeaths = 1'000'000;
-static constexpr uint64_t kMaxString = 0xFFFF;  // the reference refuses longer
+static constexpr uint64_t kMaxString = 0xFFFF;
 
-// Every imported frame is shifted by this much before it reaches SKC.
-//
-// Applied at conversion time, not at parse time, so parse() stays a faithful
-// reading of the file and the shift is a single, visible decision.
-//
-// NOTE ON DIRECTION: this is negative on purpose. The observed symptom is that
-// an imported first jump lands at 144 where our own working macro of the same
-// level jumps at 141, and the player dies at 229 having used two inputs. -1
-// moves 144 to 143, towards the working value; +1 was tried first and moves
-// away from it.
-//
-// Still unverified against a playback, and a constant shift only ever fixes a
-// CONSTANT divergence. The two macros compared earlier drift apart rather than
-// sitting a fixed distance apart (-2, +3, +6, -1, +13), so this may well move
-// nothing. It is a one-character change either way.
 static constexpr int64_t kFrameShift = -1;
 
 namespace {
@@ -87,10 +70,6 @@ public:
         m_pos += n;
     }
 
-    // GDR's binarystream memcpy's the raw object and then reverses the bytes on
-    // a little-endian host, so anything that is neither varint nor string is
-    // stored BIG-endian. A plain reinterpret_cast would read 8.9e-305 where the
-    // framerate 240.0 belongs.
     bool bigEndian(double& out) {
         if (remaining() < 8) {
             m_ok = false;
@@ -121,7 +100,7 @@ private:
     bool m_ok = true;
 };
 
-}  // namespace
+}
 
 bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
                       std::string& outReason) {
@@ -147,8 +126,6 @@ bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
     out.version = static_cast<int>(version);
 
     out.inputTag = r.str();
-    // input_has_extension is exactly `!tag.empty()` in the reference (gdr.hpp:142).
-    // An empty tag means NO per-input block at all.
     out.hasInputExtension = !out.inputTag.empty();
 
     out.author = r.str();
@@ -161,11 +138,6 @@ bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
 
     r.bigEndian(out.framerate);
 
-    // The seed is a SIGNED int and getBytes() does `uint64_t value = data`, so
-    // a negative seed sign-extends into a full 10-byte LEB128. Truncating back to
-    // int32 is what reproduces the original value - a real megahack export of
-    // Rauchkammer 2 carries seed -327972610, which as a raw varint reads as
-    // 18446744071724944991.
     uint64_t seed = 0;
     r.varint(seed);
     out.seed = static_cast<int>(static_cast<uint32_t>(seed));
@@ -235,12 +207,10 @@ bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
         uint64_t delta = 0;
         bool down = false;
         if (out.platformer) {
-            // [.. delta | button(2b) | down]
             down = (packed & 1) != 0;
             button = static_cast<uint8_t>((packed >> 1) & 3);
             delta = packed >> 3;
         } else {
-            // [.. delta | down] - the button is NOT stored, every event is Jump.
             down = (packed & 1) != 0;
             delta = packed >> 1;
         }
@@ -264,8 +234,6 @@ bool skk::gdr2::parse(std::span<const uint8_t> data, skk::gdr2::Replay& out,
 
     if (!r.ok()) return fail("gdr2: truncated input stream");
 
-    // The file stores all P1 inputs then all P2 inputs; playback wants a single
-    // frame-ordered stream.
     std::stable_sort(out.inputs.begin(), out.inputs.end(),
                      [](const Input& a, const Input& b) { return a.frame < b.frame; });
     return true;
@@ -281,10 +249,6 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     if (!std::isfinite(replay.framerate) || replay.framerate <= 1.0) {
         return fail("gdr2: unusable framerate " + std::to_string(replay.framerate));
     }
-    // GDR2 stores the mode in its own header and the input stream already
-    // carries buttons 1..3, so a platformer replay imports like any other. The
-    // flag travels with the macro and playback refuses a level of the other
-    // mode instead of silently desyncing.
     out = skc::Macro{};
     out.header.tps = replay.framerate;
     out.platformerMode = replay.platformer;
@@ -292,19 +256,6 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     out.header.platformerMode = out.platformerMode;
     out.header.platformerKnown = true;
 
-    // A declared platformer bit is cross-checked against the stream it
-    // governs. A platformer run MOVES horizontally, so left/right presses are
-    // a substantial share of the presses AND both directions appear (the same
-    // two gates as Bot::adopt's heuristic for flagless formats, BUG-65).
-    // Measured contradiction: 'Transfinite Void 1033.gdr2' (a "Macros
-    // Converter by XBOCTATUK" export of a Silicate capture) declares
-    // platformer=1 in its header byte while the stream carries 267 jump
-    // presses and a single right press with separate P1/P2 streams - the
-    // textbook shape of a CLASSIC two-player recording, which the converter
-    // mislabeled.
-    // Trusted literally, the bit made PLAY refuse the macro in its own classic
-    // level forever. The stream is what gets replayed, so when the two
-    // contradict, the stream wins and the override is logged loudly.
     if (replay.platformer) {
         size_t jumpPresses = 0, leftPresses = 0, rightPresses = 0;
         for (const auto& in : replay.inputs) {
@@ -332,19 +283,12 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
 
     out.actions.reserve(replay.inputs.size());
 
-    // Normalise per (button, player2) channel. Other bots emit releases with no
-    // press before them, and repeated releases on one channel - both present in
-    // real exports: RAUCHKAMMER 2-EC.gdr2 opens with a release at frame 1, and
-    // the megahack export ends with two releases in a row. SKC's validator
-    // rejects exactly those, so drop them instead of failing the whole import.
     std::size_t droppedRelease = 0, droppedDuplicate = 0;
     for (const auto& in : replay.inputs) {
         if (in.frame > 0xFFFFFFFFull) {
             return fail("gdr2: frame " + std::to_string(in.frame) +
                         " exceeds SKC's 32-bit frame counter");
         }
-        // Signed shift: a negative value must be able to bring the first frame
-        // back towards zero, and the result must not wrap around.
         const int64_t shifted = static_cast<int64_t>(in.frame) + kFrameShift;
         if (shifted < 0 || shifted > 0xFFFFFFFFll) {
             return fail("gdr2: frame " + std::to_string(in.frame) +
@@ -355,8 +299,6 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
                                           in.down, in.player2});
     }
 
-    // Stray releases are dropped and a collapsed tap is rebuilt as a same-frame
-    // up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

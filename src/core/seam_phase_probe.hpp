@@ -11,8 +11,6 @@
 #include <vector>
 
 namespace skkbot2::seam_probe {
-// Только измерение: окна переживают переход record→play, чтобы увидеть и
-// непрерывный проход тех же кадров. Ограничение защищает долгие сессии.
 inline std::vector<int> skcCenters;
 inline std::vector<int> skkCenters;
 inline int skkGeneration = -1;
@@ -58,8 +56,6 @@ inline bool wanted(PlayerObject* player, int f) {
 
 inline void log(char const* phase, PlayerObject* player, float dt = 0.f,
                 int checkpointFrame = -1, int button = 0) {
-    // При vanilla load часы ещё называют умершую ветку. Окно выбираем по
-    // известной цели CP, не меняя сами часы; печатаем обе метки.
     const int f = checkpointFrame >= 0 ? checkpointFrame : frame();
     if (!wanted(player, f)) return;
     auto* layer = PlayLayer::get();
@@ -79,4 +75,4 @@ inline void log(char const* phase, PlayerObject* player, float dt = 0.f,
         static_cast<unsigned>(player->m_stateJumpBuffered),
         it != player->m_holdingButtons.end() && it->second, layer->m_queuedButtons.size());
 }
-} // namespace skkbot2::seam_probe
+}

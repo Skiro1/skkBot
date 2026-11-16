@@ -13,9 +13,6 @@ static bool holdButtonHeld(PlayerObject* player, int button) {
     return it != player->m_holdingButtons.end() && it->second;
 }
 
-// BUG-136: snapshot one collision-log dictionary as (uniqueID -> object)
-// pairs. Keys were written by storeCollision via setObject(obj, intId), so
-// allKeys() yields CCInteger wrappers.
 static void captureCollisionLogDict(
     cocos2d::CCDictionary* dict,
     std::vector<std::pair<int, GameObject*>>& out) {
@@ -33,10 +30,6 @@ static void captureCollisionLogDict(
     }
 }
 
-// BUG-136: rebuild one collision-log dictionary from the snapshot pairs.
-// Mirrors the SKC seam bridge helper (skc_checkpoint.cpp); apply() runs only
-// on the live capture path (hasFullPlayer gate), so the captured pointers
-// stay valid in the restored world.
 static void restoreCollisionLogDict(
     cocos2d::CCDictionary* dict,
     const std::vector<std::pair<int, GameObject*>>& src) {
@@ -315,8 +308,6 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
 
     cp.totalTime = p->m_totalTime;
     cp.lastCheckpointTime = p->m_lastCheckpointTime;
-    // m_lastJumpTime (wall-clock, std::chrono) deliberately NOT captured:
-    // it must never leave the live world (BUG-89 / BUG-91).
     cp.lastFlipTime = p->m_lastFlipTime;
     cp.lastSpiderFlipTime = p->m_lastSpiderFlipTime;
     cp.gameModeChangedTime = p->m_gameModeChangedTime;
@@ -407,7 +398,6 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
     cp.unkA29 = p->m_unkA29;
     cp.unkA99 = p->m_unkA99;
 
-    // Containers / maps (Deep Practice Fix)
     cp.potentialSlopeMap = p->m_potentialSlopeMap;
     cp.jumpPadRelated = p->m_touchedForceIds;
     cp.ringRelatedSet = p->m_usedRings;
@@ -437,8 +427,6 @@ FullPlayerCheckpoint FullPlayerCheckpoint::store(PlayerObject* p) {
             auto* node = static_cast<PointNode*>(arr->objectAtIndex(i));
             cp.waveTrailPoints.push_back(node->m_point);
         }
-        // The streak's own draw state, not just its points: without these the
-        // rebuilt HardStreak renders with defaults (see header note).
         cp.waveTrailCurrentPoint = p->m_waveTrail->m_currentPoint;
         cp.waveTrailWaveSize = p->m_waveTrail->m_waveSize;
         cp.waveTrailPulseSize = p->m_waveTrail->m_pulseSize;
@@ -514,8 +502,6 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
 
     p->m_totalTime = totalTime;
     p->m_lastCheckpointTime = lastCheckpointTime;
-    // m_lastJumpTime (wall-clock) deliberately NOT restored - GD recomputes
-    // it from live clicks (BUG-89 / BUG-91).
     p->m_lastFlipTime = lastFlipTime;
     p->m_lastSpiderFlipTime = lastSpiderFlipTime;
     p->m_gameModeChangedTime = gameModeChangedTime;
@@ -530,13 +516,6 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_lastCollisionTop = lastCollisionTop;
     p->m_lastCollisionLeft = lastCollisionLeft;
     p->m_lastCollisionRight = lastCollisionRight;
-    // BUG-136: the previous step's collision ids and the log dictionaries -
-    // the same hidden collision phase the SKC seam bridge restores. GD's
-    // restore leaves these from the dead attempt's world; storeCollision
-    // dedups the next step against the previous id and the top/bottom log
-    // counts gate collision branches. Переназначение указателя top самой GD
-    // в2.2091 не подтверждено; alias остаётся страховкой снимка, не основанием
-    // менять владение словарями или создавать новые словари при restore.
     p->m_prevCollisionBottom = prevCollisionBottom;
     p->m_prevCollisionTop = prevCollisionTop;
     restoreCollisionLogDict(p->m_collisionLogTop, collisionLogTop);
@@ -611,7 +590,6 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
     p->m_unkA29 = unkA29;
     p->m_unkA99 = unkA99;
 
-    // Containers / maps (Deep Practice Fix)
     p->m_potentialSlopeMap = potentialSlopeMap;
     p->m_touchedForceIds = jumpPadRelated;
     p->m_usedRings = ringRelatedSet;
@@ -632,27 +610,12 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
 
     if (p->m_waveTrail && p->m_waveTrail->m_pointArray) {
         auto* arr = p->m_waveTrail->m_pointArray;
-        // BUG-120 (B): arm the CCCallFunc probe around the restore — the
-        // crash fired right after a checkpoint restore re-pointed the trail.
         skkbot2::crashprobe::armWindow(3.0);
         skkbot2::log::info(
             "[CPWT] restore trail this=0x{:x} stored={} beforeCnt={}",
             (uintptr_t)p->m_waveTrail, waveTrailPoints.size(), arr->count());
         skkbot2::Logger::get().flush();
         arr->removeAllObjects();
-        // BUG-120 (B) FIX (09.11): PointNode::create does NOT exist in the
-        // Windows GD binary (broma marks it Out of line for every platform;
-        // the only construction site in the whole GD.exe is the inlined
-        // constructor INSIDE HardStreak::addPoint: operator new(0x40), vtable
-        // 0x140 7837E0, m_point at +0x38). Geode's ERROR_INLINE instantiation
-        // compiled Create inside OUR TU — nodes were allocated by OUR module
-        // allocator (memtrack) with OUR TU-generated vtable. Any later vanilla
-        // free path (HardStreak clip loop, stopStroke -> removeAllObjects)
-        // released them through the GD runtime -> page-heap fault in
-        // PointNode deleting-dtor (bug wlt: live crashes 08:29/08:46/09:02/09:24).
-        // Fix: replay the stored points through the vanilla addPoint path —
-        // GD builds every node itself (correct allocator + vtable). Our
-        // SkkHardStreakOpt::addPoint hook logs each one as [HS-A].
         for (auto& pt : waveTrailPoints) {
             p->m_waveTrail->addPoint(pt);
         }
@@ -660,22 +623,12 @@ void FullPlayerCheckpoint::apply(PlayerObject* p) const {
             "[CPWT] restore via addPoint done stored={} cnt={}",
             waveTrailPoints.size(), arr->count());
         skkbot2::Logger::get().flush();
-        // Re-pin the streak's draw state. This apply runs AFTER
-        // forceCurrentModeVisual, which rebuilt m_waveTrail via
-        // toggleDartMode(true) — a fresh HardStreak with reset flags. Without
-        // m_drawStreak/m_currentPoint/m_waveSize the respawned wave trail
-        // either does not draw at all or starts from the wrong origin, so the
-        // trail visibly vanishes/jumps after a practice restart.
         p->m_waveTrail->m_currentPoint = waveTrailCurrentPoint;
         p->m_waveTrail->m_waveSize = waveTrailWaveSize;
         p->m_waveTrail->m_pulseSize = waveTrailPulseSize;
         p->m_waveTrail->m_isSolid = waveTrailIsSolid;
         p->m_waveTrail->m_isFlipped = waveTrailIsFlipped;
         p->m_waveTrail->m_drawStreak = waveTrailDrawStreak;
-        // HardStreak is a CCNode whose own position is the streak's origin.
-        // The rebuilt streak inherits no position, so the first frame after a
-        // restore would draw from (0,0); pin it to the player like GD's own
-        // update does for darts (silicate does the same in its render hook).
         p->m_waveTrail->setPosition(p->m_position);
     }
 }

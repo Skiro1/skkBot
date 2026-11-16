@@ -15,7 +15,6 @@ struct FullPlayerCheckpoint {
     static FullPlayerCheckpoint store(PlayerObject* p);
     void apply(PlayerObject* p) const;
 
-    // --- Position & Rotation ---
     float p_x = 0.f, p_y = 0.f;
     float p_rotation = 0.f;
     float rotationSpeed = 0.f;
@@ -23,7 +22,6 @@ struct FullPlayerCheckpoint {
     float lastPortalX = 0.f, lastPortalY = 0.f;
     float lastGroundedX = 0.f, lastGroundedY = 0.f;
 
-    // --- Velocity ---
     double yVelocity = 0.0;
     double fallSpeed = 0.0;
     double platformerXVelocity = 0.0;
@@ -40,7 +38,6 @@ struct FullPlayerCheckpoint {
     float yVelocityRelated3 = 0.f;
     float slopeVelocity = 0.f;
 
-    // --- Physics ---
     double gravity = 1.0;
     double speedMultiplier = 1.0;
     double snapDistance = 0.0;
@@ -51,7 +48,6 @@ struct FullPlayerCheckpoint {
     float unk648 = 0.f, unk838 = 0.f;
     float somethingPlayerSpeedTime = 0.f, playerSpeedAC = 0.f;
 
-    // --- Slope ---
     float slopeAngle = 0.f;
     float slopeAngleRadians = 0.f;
     double slopeRotation = 0.0;
@@ -64,11 +60,9 @@ struct FullPlayerCheckpoint {
     double maybeChangedDirectionAngle = 0.0;
     double unkUnused2 = 0.0;
 
-    // --- Dash ---
     double dashX = 0.0, dashY = 0.0, dashAngle = 0.0, dashStartTime = 0.0;
     double blackOrbRelated = 0.0;
 
-    // --- Timers ---
     double totalTime = 0.0;
     double lastCheckpointTime = 0.0;
     double lastJumpTime = 0.0;
@@ -81,14 +75,8 @@ struct FullPlayerCheckpoint {
     float audioScale = 0.f;
     float unkAngle1 = 0.f;
 
-    // --- Collision ---
     int lastCollisionBottom = 0, lastCollisionTop = 0;
     int lastCollisionLeft = 0, lastCollisionRight = 0;
-    // BUG-136: GD's loadFromCheckpoint carries lastCollision* but NOT the
-    // previous step's ids (m_prevCollisionBottom/Top). The next integration
-    // step reads them (storeCollision dedups against the previous id), so a
-    // dropped prev id shifts the seam by exactly one physics step - the
-    // practice-window signature.
     int prevCollisionBottom = 0, prevCollisionTop = 0;
     int unk50C = 0, unk510 = 0;
     int collidingWithSlopeId = 0;
@@ -98,7 +86,6 @@ struct FullPlayerCheckpoint {
     int maybeSavedPlayerFrame = 0;
     int maybeSlidingTime = 0;
 
-    // --- State ints ---
     int stateOnGround = 0;
     int stateBoostX = 0, stateBoostY = 0;
     int maybeStateForce2 = 0, stateScale = 0;
@@ -119,11 +106,9 @@ struct FullPlayerCheckpoint {
     float fallStartY = 0.f;
     float slopeSlidingMaybeRotated_angle = 0.f;
 
-    // --- Flags (packed as bitmasks) ---
-    uint64_t flags1 = 0;   // wasTeleported..inputsLocked
-    uint64_t flags2 = 0;   // isShip..enable22Changes
+    uint64_t flags1 = 0;
+    uint64_t flags2 = 0;
 
-    // --- Timers (extended v2) ---
     double rotateSpeed = 0.0;
     int dashFireFrame = 0;
     bool holdingRight = false;
@@ -146,7 +131,6 @@ struct FullPlayerCheckpoint {
     bool unkA29 = false;
     bool unkA99 = false;
 
-    // --- Containers / maps (Deep Practice Fix) ---
     std::unordered_map<int, GameObject*> potentialSlopeMap;
     std::map<int, bool> jumpPadRelated;
     std::unordered_set<int> ringRelatedSet;
@@ -155,35 +139,19 @@ struct FullPlayerCheckpoint {
     std::vector<cocos2d::CCObject*> touchingRings;
     std::string currentRobotAnimation;
 
-    // --- Collision log (BUG-136, silicate-grade) ---
-    // Четыре словаря (uniqueID -> object), только внутри живого уровня.
-    // Их содержимое восстанавливают и SKK apply(), и узкий SKC-мост.
-    // alias: 0 = отдельный top, 1/2/3 = совпадение с bottom/left/right.
-    // Это страховочная метрика, не доказанный контракт GD: raw2.2091
-    // collidedWithObjectInternal пишет в отдельные top/bottom словари;
-    // переназначение top из исторической реконструкции2.2081 не подтверждено.
     std::vector<std::pair<int, GameObject*>> collisionLogTop;
     std::vector<std::pair<int, GameObject*>> collisionLogBottom;
     std::vector<std::pair<int, GameObject*>> collisionLogLeft;
     std::vector<std::pair<int, GameObject*>> collisionLogRight;
     int collisionLogTopAlias = 0;
 
-    // --- Click release state (GDH pattern) ---
     std::array<bool, 3> clickReleased = { true, true, true };
 
-    // --- Color ---
     cocos2d::ccColor3B playerColor1 = { 0, 0, 0 };
     cocos2d::ccColor3B playerColor2 = { 0, 0, 0 };
     cocos2d::ccColor3B originalMainColor = { 0, 0, 0 };
     cocos2d::ccColor3B originalSecondColor = { 0, 0, 0 };
 
-    // --- Wave trail ---
-    // The point array alone is not enough: forceCurrentModeVisual re-runs
-    // toggleDartMode(true) on restore, and GD REPLACES m_waveTrail with a
-    // fresh HardStreak (new point array, default flags). Re-pinning just the
-    // points leaves the streak with its reset state, so it renders wrong or
-    // vanishes outright ("трейл пропал после рестарта"). Every field the draw
-    // depends on is snapshotted and re-applied after the mode rebuild.
     std::vector<cocos2d::CCPoint> waveTrailPoints;
     cocos2d::CCPoint waveTrailCurrentPoint = { 0.f, 0.f };
     float waveTrailWaveSize = 0.f;
@@ -198,7 +166,6 @@ struct FullCheckpointBundle {
     FullPlayerCheckpoint player2;
     bool hasDual = false;
 
-    // Layer-level state (silicate & EclipseMenu pattern)
     std::unordered_map<int, int> persistentItemMap;
     std::array<float, 2000> varianceValues{};
     GameObject* player1CollisionBlock = nullptr;
@@ -210,15 +177,12 @@ struct FullCheckpointBundle {
     float unk3380 = 0.f;
     skk::GameObjectPhysicsSnapshotMap gameObjectPhysics;
 
-    // RNG state
     uint64_t seedState = 0;
     uint64_t shakeRandomState = 0;
     uint64_t teleportRandomState = 0;
 
-    // Broken objects
     std::vector<GameObject*> brokenObjects;
 
-    // Object pointers (session-only, not serialized)
     int lastActivatedPortalUID = -1;
     int dashRingUID = -1;
     int collidedObjectUID = -1;
@@ -232,7 +196,6 @@ struct FullCheckpointBundle {
     int objectSnappedToUID = -1;
     int maybeLastGroundObjectUID = -1;
 
-    // calcNonEffectObjects (session-only)
     std::vector<int> calcNonEffectObjectUIDs;
     int calcNonEffectObjectsSize = 0;
 };

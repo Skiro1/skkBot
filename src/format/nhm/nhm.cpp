@@ -12,18 +12,9 @@ namespace {
 
 constexpr uint8_t kMagic[4] = {'N', 'H', 'M', '1'};
 
-// Applied to every frame on conversion, not on parse, so parse() stays a
-// faithful reading of the file.
-//
-// -1 is measured, not guessed. With 0 this macro died at frame 4844 after 98
-// clicks; GBR6 died at 4887 after 99 and -1 made it pass. Two different
-// formats dying within 43 frames and 1 click of each other is a systematic
-// offset between how these bots stamp frames and how we do, not two coincidences.
-// (SLC needed none and its first click sat at 142 like this one, which is the
-// outlier - hence the constant rather than a decision.)
 static constexpr int64_t kFrameShift = -1;
 
-}  // namespace
+}
 
 bool skk::nhm::looksLikeNhm(std::span<const uint8_t> data) {
     return data.size() >= 4 && std::memcmp(data.data(), kMagic, 4) == 0;
@@ -49,8 +40,6 @@ bool skk::nhm::parse(std::span<const uint8_t> data, skk::nhm::Replay& out,
 
     const size_t needed = 8 + static_cast<size_t>(count) * kRecordSize;
     if (needed > data.size()) {
-        // Fixed-size records make this exact: a short file is a truncated or
-        // corrupt one, never a stream that ended early.
         return fail("nhm: needs " + std::to_string(needed) + " bytes for " +
                     std::to_string(count) + " records but has " +
                     std::to_string(data.size()));
@@ -74,7 +63,6 @@ bool skk::nhm::parse(std::span<const uint8_t> data, skk::nhm::Replay& out,
 
         if (button < 1 || button > 3) ++badButtons;
 
-        // player1 is GD's own flag, so the second player is its negation.
         out.actions.push_back(
             skk::nhm::Action{frame, button, down != 0, player1 == 0});
     }
@@ -98,8 +86,6 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
     };
 
     out = skc::Macro{};
-    // NHM stores no tick rate. Neverhook records at the game's runtime tick
-    // rate, and every macro in the reference corpus is 240.
     out.header.tps = 240.0f;
     out.actions.reserve(replay.actions.size());
 
@@ -114,8 +100,6 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
             skc::Action{static_cast<uint32_t>(shifted), a.button, a.pressed, a.player2});
     }
 
-    // Stray releases are dropped here and a collapsed tap is rebuilt as a
-    // same-frame up+down (never deleted - see normalizeActionStream()).
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;
@@ -123,10 +107,6 @@ bool skk::nhm::toSkcMacro(const skk::nhm::Replay& replay, skc::Macro& out,
 
     if (out.actions.empty()) return fail("nhm: no usable inputs after normalisation");
 
-    // Report the SOURCE frame of the first action that actually survived
-    // normalisation. Reporting replay.actions.front() instead would quote the
-    // dangling release at frame 1 and compare it against the first kept click
-    // at 142, which reads as a 141-frame shift that does not exist.
     const uint64_t firstKeptRaw =
         static_cast<uint64_t>(static_cast<int64_t>(out.actions.front().frame) - kFrameShift);
 

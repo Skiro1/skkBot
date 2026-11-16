@@ -30,11 +30,9 @@ enum SkFlags : uint32_t {
     SK_FLAG_PERSISTENCE = 1 << 8,
 };
 
-// v2 per-frame visual orientation flag bits (shared between recording and
-// playback sides — used in SkPerFrame.p1vis/p2vis).
 inline constexpr uint8_t kVisualGravityNegative = 1 << 0;
 inline constexpr uint8_t kVisualUpsideDown       = 1 << 1;
-inline constexpr uint8_t kVisualModeMask         = 0x1C;  // bits 2-4
+inline constexpr uint8_t kVisualModeMask         = 0x1C;
 inline constexpr uint8_t kVisualModeShift        = 2;
 inline constexpr uint8_t kVisualSideways         = 1 << 5;
 inline constexpr uint8_t kVisualControlsDisabled = 1 << 6;
@@ -106,7 +104,6 @@ struct SkPracticeFixCheckpoint {
     std::vector<std::pair<int32_t, int32_t>> persistentItems;
     std::vector<std::pair<uint16_t, float>> variance;
     bool clickReleased[6] = { true, true, true, true, true, true };
-    // Full P1 state
     float p1_x = 0.f, p1_y = 0.f, p1_rotation = 0.f;
     double p1_yVelocity = 0.0, p1_fallSpeed = 0.0;
     double p1_platformerXVelocity = 0.0, p1_groundYVelocity = 0.0;
@@ -133,7 +130,6 @@ struct SkPracticeFixCheckpoint {
     int32_t p1_stateOnGround = 0, p1_stateForce = 0, p1_stateFlipGravity = 0, p1_reverseRelated = 0;
     uint64_t p1_flags1 = 0, p1_flags2 = 0;
     bool p1_holdingRight = false, p1_holdingLeft = false;
-    // Full P2 state
     float p2_x = 0.f, p2_y = 0.f, p2_rotation = 0.f;
     double p2_yVelocity = 0.0, p2_fallSpeed = 0.0;
     double p2_platformerXVelocity = 0.0, p2_groundYVelocity = 0.0;
@@ -181,21 +177,8 @@ struct SkPerFrame {
     float p1y = 0.f;
     double p1vy = 0.0;
     double p1vyb = 0.0;
-    // v2 visual pin: rotation and orientation flags per player (bit0 gravity
-    // sign, bit1 level upside-down). Rotational state is integral (ball/swing
-    // spin accumulates), so GD cannot self-heal it from pinned position;
-    // restoring it here is safe - rotation is an OUTPUT of GD physics, no
-    // sub-step state machine reads it back (unlike latch masks / dashing,
-    // which the anchor full-restore used to stomp).
-    //
-    // v4: bits 2-4 vehicle mode (0=cube,1=ship,2=ball,3=ufo,4=wave,5=robot,6=spider,7=swing).
-    //     bit 5 isSideways, bit 6 controlsDisabled, bit 7 isDashing.
-    //     Old V3 recordings have 0 in bits 2-7 (cube mode, safe default).
     float p1rot = 0.f;
     uint8_t p1vis = 0;
-    // v3: m_dashRing object ID (0 = none) - reattaches the dash-ring hold on
-    // playback (GD picks the ring by ID in the identical world) so the
-    // press/hold animation and m_dashRing state survive.
     int32_t p1RingId = 0;
     bool hasPlayer2 = false;
     float p2x = 0.f;
@@ -225,26 +208,12 @@ struct SkAttemptSegment {
     }
 };
 
-// Practice-restart RNG boundary. When a recording is spliced (the player dies
-// in practice mode and respawns from a checkpoint), vanilla resetLevel re-arms
-// the locked LCG (armSeed = computeLockedSeed(seed, progress) family) and the
-// checkpoint restore then overrides the primary stream to the checkpoint's
-// captured fastRandState. Each spliced segment therefore runs under that
-// combined state. Capture latches exactly these two values and playback
-// reproduces them at the same tick, otherwise the stitched macro drifts from
-// the recorded random sections (segmented == divergent).
-//
-// The boundary captures the LIVE triple RNG state on the first captured frame
-// after a practice respawn (this is what refreshRngState(arm) + the checkpoint
-// restore actually left the engine in), NOT a formula-derived value. Playback
-// restores those raw globals verbatim at the matching tick - the only way to be
-// byte-identical to the capture as the arm family is not a function of progress.
 struct SkRngBoundary {
-    int32_t tick = 0;        // macro tick of the first captured frame after the respawn
-    int32_t progress = 0;    // the checkpoint's m_currentProgress (informational)
-    uint64_t primary = 0;    // live GD+0x6C2E90 at the boundary frame
-    uint64_t shake = 0;      // live GD+0x6C2EE0 at the boundary frame
-    uint64_t teleport = 0;   // live GD+0x6C2EF8 at the boundary frame
+    int32_t tick = 0;
+    int32_t progress = 0;
+    uint64_t primary = 0;
+    uint64_t shake = 0;
+    uint64_t teleport = 0;
 };
 
 class SkMacro {
@@ -255,11 +224,6 @@ public:
     std::string levelName;
     int32_t levelId = 0;
     double framerate = 240.0;
-    // Display rate as a WIRE value, not a number: +0.0 = the macro carries no
-    // display rate (FPS was off while recording), -0.0 = "FPS on, follow the
-    // tick rate", n > 0 = pinned. Read it with
-    // skkbot2::fps::MacroDisplayRate::fromWire - comparing against zero cannot
-    // see the marker, because -0.0 == +0.0.
     double displayFps = 0.0;
     bool lockDelta = true;
     bool realTime = false;
@@ -268,8 +232,6 @@ public:
     float startPosX = 0.f;
     float startPosY = 0.f;
     bool recordedFromStartPos = false;
-    // One-shot latch: beginCapture runs BEFORE PlayLayer::init creates the
-    // start-pos object, so SP state must be (re)stamped on first capture tick.
     bool startPosStamped = false;
     AccuracyMode accuracyMode = AccuracyMode::Vanilla;
     bool platformerMode = false;
@@ -283,8 +245,6 @@ public:
     bool losslessVerified = false;
     bool macroConverted = false;
     bool bestEffort = false;
-    // v4: ticks labeled by GD physics-step pairs instead of levelTime.
-    // New captures set it; legacy files default false (time labels).
     bool usesStepClock = false;
     std::vector<SkInput> inputs;
     std::vector<SkTpsEvent> tpsEvents;
@@ -293,42 +253,12 @@ public:
     std::vector<SkCheckpoint> checkpoints;
     std::vector<SkPracticeFixCheckpoint> practiceFixCheckpoints;
     std::vector<SkAttemptSegment> persistenceAttempts;
-    // GD variance slots (GJBaseGameLayer::m_varianceValues, 2000 floats):
-    // snapshot of non-zero slots captured during recording, force-prefilled
-    // at each playback attempt so lazy random-trigger variance matches the
-    // recorded session regardless of RNG-stream luck. Session-wide (chain
-    // attempts share it).
     std::vector<SkVarianceEntry> varianceOverrides;
-    // Global fast_srand state captured at the LAST recorded attempt's setup
-    // (before vanilla resetLevel derived the object rolls). Pinning playback's
-    // RNG to it makes GD's own derivation chain reproduce the recorded world
-    // (block variance offsets, trigger picks, shake) with no midhooks.
     uint64_t setupRngSeed = 0;
-    // "Save Seed" (MACRO BOT) stamp for THIS macro's next file write.
-    // In-memory only - the SKK3 wire format never sees it (fromSkMacro maps
-    // named fields, so it is silently ignored there). 0 = not stamped: the
-    // live gui_record_seed toggle is read at serialize time (direct Save,
-    // main thread). Autosave snapshots are stamped at copy time (+1 keep /
-    // -1 strip) on the game thread, because they serialize on a worker and
-    // must not read the saved store off-thread.
     int wireSeedStamp = 0;
-    // Persistent trigger counters (GJEffectManager::m_persistentItemCountMap)
-    // as they stood when the survivor run was captured. These accumulate
-    // ACROSS attempts within one session, so a macro whose run was attempt N
-    // sees different item counts than the fresh replay session; recording and
-    // re-applying them removes that whole class of single-point world deaths.
     std::vector<std::pair<int32_t, int32_t>> persistentItems;
-    // Practice-restart boundary reseeds (see SkRngBoundary). Playback re-applies
-    // each entry's LCG reseed when the run crosses its tick.
     std::vector<SkRngBoundary> rngBoundaries;
 
-    // Non-standard-start support. The recording knows WHERE its timeline began:
-    // the tick (and p1 world position) of the very first captured frame. A macro
-    // whose origin is beyond this threshold was recorded MID-RUN (the bot was
-    // armed while the player was already in the level), so its data does not
-    // cover the prefix a tick-0 timeline assumes. Playback aligns such macros by
-    // POSITION instead of by tick. Everything is derived from the saved streams
-    // (perFrames are the densest ground truth), so no wire-format change.
     static constexpr int kMidRunStartTickThreshold = 120;
 
     int64_t recordFirstTick() const {
@@ -419,14 +349,6 @@ inline void normalizeSkPersistenceTiming(SkMacro& macro) {
     }
 }
 
-// rngBoundaries are pushed in RECORD order (each practice respawn appends), so
-// the vector is not guaranteed ascending by tick - a death that restores to an
-// earlier checkpoint can append a smaller tick AFTER a larger one. Playback
-// consumes them via an ascending-tick scan (boundary.tick <= tick), so an
-// unsorted vector applies a later-tick boundary FIRST and re-seeds the live
-// stream backward -> RNG desync from that checkpoint onward. Normalize once on
-// load: stable-sort by tick and keep only the LAST entry per tick (the final
-// attempt's captured triple is the one the surviving segment continues under).
 inline void normalizeSkRngBoundaries(SkMacro& macro) {
     auto& boundaries = macro.rngBoundaries;
     if (boundaries.size() < 2) {

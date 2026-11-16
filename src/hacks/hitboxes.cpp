@@ -1,30 +1,3 @@
-// Hitbox overlay — visual-only debug draw of GD collision boxes.
-//
-// One CCDrawNode per GJBaseGameLayer. The node is a SIBLING of m_objectLayer
-// (child of the game layer itself, silicate-style), NOT a child of the object
-// layer: GD 2.2 shader triggers and other layer effects applied to
-// m_objectLayer would otherwise distort/tint the overlay together with the
-// level picture. Object-space rects stay unchanged — every frame the node's
-// additional transform is synced to m_objectLayer's world transform
-// (concat(layerToWorld, worldToParent)), so the boxes land exactly where the
-// objects are, immune to object-layer shaders. Redrawn every frame from
-// GJBaseGameLayer::updateVisibility / postUpdate, which both PlayLayer and
-// the editor playtest run after GD recomputes the visible section bounds.
-//
-// Object iteration walks GD's own section grid (m_leftSectionIndex..
-// m_rightSectionIndex x m_bottom..m_top with m_sectionSizes) — the same view
-// culling GDH / GeodeMenu use, so the overlay stays cheap on big levels.
-//
-// Reference mods studied (D:\SKKVPN\GEODE_MODS\GDBOTS + GitHub):
-//   GDH-main           show_hitboxes.cpp       section walk, dirty-flag guard
-//   GeodeMenu          Hitboxes/HitboxNode.cpp classification, slope triangles
-//   Neverhook          Hitbox.cpp              m_objectLayer parenting, taxonomy
-//   silicate           assist/hitboxes.cpp     syncToObjectLayer (shader-proof
-//                                              parenting), zoom-corrected width
-//   ToastyReplay       hacks/hitboxes.cpp      dirty-flag RAII, editor branch
-//   Prism-Menu         — no hitbox draw at all (byte-patch only), nothing to copy.
-//
-// The feature is visual only: it never touches physics, input, or replay state.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -46,37 +19,29 @@ using namespace geode::prelude;
 namespace skk::hitboxes {
 namespace {
 
-// ---------------------------------------------------------------------------
-// Palette (ToastyReplay / GeodeMenu defaults — outline + faint fill).
-// ---------------------------------------------------------------------------
 constexpr float kBorderWidth = 0.35f;
 constexpr float kFillAlpha   = 0.20f;
 constexpr unsigned int kCircleSegments = 28;
 
-const ccColor4F kSolid     = ccc4f(0.05f, 0.20f, 0.95f, 1.0f);  // blue
-const ccColor4F kHazard    = ccc4f(0.95f, 0.10f, 0.10f, 1.0f);  // red
-const ccColor4F kPassable  = ccc4f(0.10f, 0.85f, 0.95f, 1.0f);  // cyan
-const ccColor4F kInteract  = ccc4f(0.20f, 0.85f, 0.30f, 1.0f);  // green
-const ccColor4F kPortal    = ccc4f(0.90f, 0.10f, 0.90f, 1.0f);  // magenta
-const ccColor4F kPlayer    = ccc4f(0.95f, 0.10f, 0.10f, 1.0f);  // red
-const ccColor4F kPlayerRot = ccc4f(0.53f, 0.03f, 0.03f, 1.0f);  // dark red
-const ccColor4F kPlayerIn  = ccc4f(0.05f, 0.20f, 0.95f, 1.0f);  // blue
+const ccColor4F kSolid     = ccc4f(0.05f, 0.20f, 0.95f, 1.0f);
+const ccColor4F kHazard    = ccc4f(0.95f, 0.10f, 0.10f, 1.0f);
+const ccColor4F kPassable  = ccc4f(0.10f, 0.85f, 0.95f, 1.0f);
+const ccColor4F kInteract  = ccc4f(0.20f, 0.85f, 0.30f, 1.0f);
+const ccColor4F kPortal    = ccc4f(0.90f, 0.10f, 0.90f, 1.0f);
+const ccColor4F kPlayer    = ccc4f(0.95f, 0.10f, 0.10f, 1.0f);
+const ccColor4F kPlayerRot = ccc4f(0.53f, 0.03f, 0.03f, 1.0f);
+const ccColor4F kPlayerIn  = ccc4f(0.05f, 0.20f, 0.95f, 1.0f);
 
 bool engineEnabled() {
     auto* engine = ReplayEngine::get();
     return engine && engine->showHitboxes;
 }
 
-// Filled vs outline-only is a separate sub-option (off by default — outline
-// boxes are the readable baseline, like Toasty / Neverhook / silicate).
 float fillAlpha() {
     auto* engine = ReplayEngine::get();
     return (engine && engine->hitboxFill) ? kFillAlpha : 0.0f;
 }
 
-// Visible when the user toggled it on, or when GD's own on-death hitbox flag
-// (m_hitboxesOnDeath) fires while a player is dead — mirrors GeodeMenu's
-// shouldHitboxesBeVisible so practice-mode deaths still show the killer box.
 bool shouldBeVisible(GJBaseGameLayer* gl) {
     if (engineEnabled()) return true;
     if (gl->m_hitboxesOnDeath) {
@@ -88,7 +53,6 @@ bool shouldBeVisible(GJBaseGameLayer* gl) {
 
 enum class Kind { Skip, Solid, Hazard, Passable, Interact, Portal };
 
-// Neverhook's taxonomy, extended with GeodeMenu's interactable list.
 Kind classify(GameObject* o) {
     const auto t = o->m_objectType;
 
@@ -101,10 +65,6 @@ Kind classify(GameObject* o) {
     if (t == GameObjectType::Solid || t == GameObjectType::Slope)
         return Kind::Solid;
 
-    // Vehicle + gravity + size + mirror portals get their own color.
-    // Size portals (RegularSizePortal=17 / MiniSizePortal=18) and mirror
-    // portals (InverseMirrorPortal=14 / NormalMirrorPortal=15) were missing
-    // here, so they fell through to Kind::Skip and drew nothing.
     if (t == GameObjectType::CubePortal || t == GameObjectType::ShipPortal ||
         t == GameObjectType::BallPortal || t == GameObjectType::UfoPortal ||
         t == GameObjectType::WavePortal || t == GameObjectType::RobotPortal ||
@@ -119,7 +79,6 @@ Kind classify(GameObject* o) {
         t == GameObjectType::NormalMirrorPortal)
         return Kind::Portal;
 
-    // Orbs, pads, rings, coins, speed portals (Modifier).
     if (t == GameObjectType::SecretCoin || t == GameObjectType::UserCoin ||
         t == GameObjectType::Collectible ||
         t == GameObjectType::YellowJumpPad || t == GameObjectType::PinkJumpPad ||
@@ -148,10 +107,6 @@ const ccColor4F& colorFor(Kind k) {
     }
 }
 
-// getObjectRect() recomputes when dirty and can leave m_isObjectRectDirty /
-// m_boxOffsetCalculated flipped (GD caches rect state off them). Every bot
-// guards this — a stale flip makes GD's own collision rect cache go wrong.
-// Neverhook's fast path: read the cached m_objectRect directly when clean.
 CCRect objectRect(GameObject* o) {
     if (!o->m_isObjectRectDirty) return o->m_objectRect;
     const bool saveDirty = o->m_isObjectRectDirty;
@@ -205,8 +160,6 @@ void drawObjectHitbox(CCDrawNode* node, GameObject* o, bool isEditor) {
     if (k == Kind::Skip) return;
     const ccColor4F col = colorFor(k);
 
-    // Spikes/hazards collide as a circle: m_objectRadius scaled by the bigger
-    // axis (GDH / GeodeMenu / Neverhook all do this).
     if (o->m_objectRadius != 0.0f) {
         const float radius = o->m_objectRadius *
                              std::max(o->m_scaleX, o->m_scaleY);
@@ -218,13 +171,11 @@ void drawObjectHitbox(CCDrawNode* node, GameObject* o, bool isEditor) {
 
     const CCRect r = objectRect(o);
 
-    // Slopes collide as a triangle, picked by m_slopeDirection (GeodeMenu's
-    // geometry — GDH / Eclipse use the identical switch).
     if (o->m_objectType == GameObjectType::Slope) {
         CCPoint verts[3] = {
-            ccp(r.getMaxX(), r.getMinY()),  // br
-            ccp(r.getMinX(), r.getMaxY()),  // tl
-            ccp(r.getMinX(), r.getMinY()),  // bl
+            ccp(r.getMaxX(), r.getMinY()),
+            ccp(r.getMinX(), r.getMaxY()),
+            ccp(r.getMinX(), r.getMinY()),
         };
         switch (o->m_slopeDirection) {
             case 0: case 7:
@@ -246,9 +197,6 @@ void drawObjectHitbox(CCDrawNode* node, GameObject* o, bool isEditor) {
         return;
     }
 
-    // Rotated objects use the oriented box. In play GD keeps m_orientedBox
-    // populated; in the editor the cached box can be stale so recompute
-    // (ToastyReplay / GDH branch the same way).
     if (o->m_shouldUseOuterOb ||
         (o->getRotation() != 0.0f && (static_cast<int>(o->getRotation()) % 90) != 0)) {
         OBB2D* ob = isEditor ? o->getOrientedBox() : o->m_orientedBox;
@@ -267,9 +215,6 @@ void drawPlayerHitbox(CCDrawNode* node, PlayerObject* p) {
     if (!p) return;
 
     if (p->m_isDart) {
-        // Wave (dart): GD's exact hitbox is 10x10 for normal, 6x6 for mini.
-        // Rotated box for slopes/rotated hazards + AABB for straight hazards.
-        // Wave has no inner 0.3x box in GD physics.
         const float wSize = (p->m_vehicleSize != 1.0f) ? 6.0f : 10.0f;
         const CCPoint center = p->getPosition();
         const CCRect waveRect(center.x - wSize * 0.5f, center.y - wSize * 0.5f, wSize, wSize);
@@ -282,7 +227,6 @@ void drawPlayerHitbox(CCDrawNode* node, PlayerObject* p) {
         p->updateOrientedBox();
     }
 
-    // Rotated box (dart / slope rotation) first so the outer rect draws on top.
     if (p->m_orientedBox) {
         node->drawPolygon(p->m_orientedBox->m_corners.data(), 4,
                           ccc4f(kPlayerRot.r, kPlayerRot.g, kPlayerRot.b, fillAlpha()),
@@ -291,13 +235,9 @@ void drawPlayerHitbox(CCDrawNode* node, PlayerObject* p) {
 
     drawPolygonFromRect(node, p->getObjectRect(), kPlayer);
 
-    // Inner box — the actual landing/collision core GD checks.
     drawPolygonFromRect(node, p->getObjectRect(0.3f, 0.3f), kPlayerIn);
 }
 
-// GD's own visible-section grid walk (GDH show_hitboxes.cpp:206-223,
-// GeodeMenu HitboxNode::forEachObject). Skips the collision blocks GD keeps
-// in the section arrays and the anticheat spike.
 void forEachVisibleObject(GJBaseGameLayer* gl,
                           const std::function<void(GameObject*)>& cb) {
     if (!cb || gl->m_sections.empty() || gl->m_sectionSizes.empty()) return;
@@ -340,32 +280,13 @@ void redraw(GJBaseGameLayer* gl, CCDrawNode* node) {
         if (shouldDrawObject(o)) drawObjectHitbox(node, o, isEditor);
     });
     drawPlayerHitbox(node, gl->m_player1);
-    // P2 only when it is actually running — a dormant P2 sits at (0,0)
-    // detached from the layer (see BUG-21), drawing a stray box at the origin.
     if (gl->m_player2 && gl->m_player2->isRunning())
         drawPlayerHitbox(node, gl->m_player2);
 }
 
-}  // namespace
+}
 
-// ---------------------------------------------------------------------------
-// Hook entry: rebuild the overlay every time GD recomputes section visibility.
-// The node is created lazily (the object layer does not exist until the level
-// setup finishes) and re-attached if it lost its parent.
-//
-// Shader-proof parenting (silicate's approach): the node hangs off the game
-// layer itself — a sibling of m_objectLayer — so shader triggers and other
-// effects applied to the object layer never touch the overlay. The object-
-// layer world transform is synced into the node every frame instead.
-//
-// GJBaseGameLayer::updateVisibility is inline (empty) and thus not hookable in
-// this bindings build, so the tick is attached to both concrete layers that
-// implement it — PlayLayer and the editor playtest (LevelEditorLayer), which
-// is also how GDH / EclipseMenu drive their overlays.
-// ---------------------------------------------------------------------------
 
-// Z-order: above the game UI (silicate's containerZOrder), under the editor
-// toolbox in the editor so the overlay never covers the tool panels.
 int overlayZOrder(GJBaseGameLayer* gl) {
     if (auto* lel = typeinfo_cast<LevelEditorLayer*>(gl);
         lel && lel->m_editorUI) {
@@ -374,9 +295,6 @@ int overlayZOrder(GJBaseGameLayer* gl) {
     return (gl->m_uiLayer ? gl->m_uiLayer->getZOrder() : 101) + 1;
 }
 
-// Object-space -> world: replicate m_objectLayer's world transform onto the
-// sibling node via the additional transform. Without this the boxes would sit
-// in raw object coordinates at the layer origin.
 void syncToObjectLayer(CCDrawNode* node, GJBaseGameLayer* gl) {
     if (!node || !node->getParent() || !gl->m_objectLayer) return;
     const auto layerToWorld = gl->m_objectLayer->nodeToWorldTransform();
@@ -387,7 +305,6 @@ void syncToObjectLayer(CCDrawNode* node, GJBaseGameLayer* gl) {
 
 CCDrawNode* getOrCreateNode(GJBaseGameLayer* gl, Ref<CCDrawNode>& nodeRef, const char* id) {
     if (!gl) return nullptr;
-    // Sibling of the object layer, not its child (shader immunity).
     CCNode* desiredParent = static_cast<CCNode*>(gl);
 
     if (nodeRef) {
@@ -413,9 +330,6 @@ CCDrawNode* getOrCreateNode(GJBaseGameLayer* gl, Ref<CCDrawNode>& nodeRef, const
 
 void updateHitboxes(GJBaseGameLayer* gl, CCDrawNode* node) {
     if (!node) return;
-    // Transform sync must run every frame: the object layer moves with the
-    // camera (position + zoom) and the shader-trigger pipeline can also shift
-    // it; the overlay follows without inheriting any of the layer's effects.
     syncToObjectLayer(node, gl);
     bool visible = shouldBeVisible(gl);
     static bool s_lastVisible = false;
@@ -502,4 +416,4 @@ void forceRefresh() {
     }
 }
 
-}  // namespace skk::hitboxes
+}

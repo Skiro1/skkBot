@@ -9,8 +9,6 @@
 #include <cstring>
 #include <fstream>
 
-// Guards against a corrupt countExp/repeatsExp turning into a huge allocation.
-// A section's own byte size already bounds it, so this is a second line.
 static constexpr uint64_t kMaxSectionInputs = 1u << 20;
 static constexpr uint64_t kMaxActions = 8'000'000;
 
@@ -83,7 +81,6 @@ private:
     bool m_ok = true;
 };
 
-// state = (delta << 4) | (button << 2) | (player2 << 1) | holding
 struct DecodedState {
     uint64_t delta;
     uint8_t button;
@@ -96,7 +93,7 @@ DecodedState decodeState(uint64_t s) {
                         (s & 2) != 0, (s & 1) != 0};
 }
 
-}  // namespace
+}
 
 bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                      std::string& outReason) {
@@ -105,17 +102,7 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
         return false;
     };
 
-    // Echo's reader (sub_18029E870) bounds the atom region at
-    // "file size minus (last byte == 0xCC)": the 0xCC footer is OPTIONAL.
-    // Real recordings differ - the Rauchkammer capture ends 0xCC, while the
-    // Transfinite Void capture ends 0x00 (and THE GLITCHTON.slc failed the
-    // same way before) - so demanding 0xCC unconditionally rejected half the
-    // files in the wild with "bad footer". When the last byte is not 0xCC it
-    // belongs to the atom region, and Echo simply stops the loop once fewer
-    // than 12 bytes (an atom header) remain; leftovers after the last atom
-    // are ignored and there is no end-of-file equality check to fail.
     if (data.size() < 27) {
-        // 10-byte header + the 16-byte metadata minimum Echo accepts + 1.
         return fail("slc: file is too small to hold a header and metadata");
     }
 
@@ -132,8 +119,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
 
     const uint16_t metaSize = r.u16();
     if (metaSize < 16) {
-        // Echo accepts any metaSize >= 16 and reads tps/seed at fixed offsets;
-        // the old "must be exactly 64" gate was our own invention.
         return fail("slc: metadata size " + std::to_string(metaSize) +
                     ", expected at least 16 (outdated or malformed replay?)");
     }
@@ -152,9 +137,8 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
         out.meta.randomnessAlgorithm = r.u32();
         metaConsumed = 28;
     }
-    r.skip(metaSize - metaConsumed);  // __padding (layout-agnostic)
+    r.skip(metaSize - metaConsumed);
 
-    // Atoms: uint32 id, uint64 size with the top byte holding flags.
     while (r.remaining() >= 12 && r.ok()) {
         const uint32_t atomId = r.u32();
         const uint64_t rawSize = r.u64();
@@ -167,9 +151,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
         const size_t atomEnd = r.pos() + static_cast<size_t>(atomSize);
 
         if (atomId != 1) {
-            // 0 = Null (skip), 2 = Marker (unknown to us). The reference skips
-            // the body for anything it does not recognise, and that is the
-            // behaviour that keeps custom atoms from breaking a read.
             r.skip(static_cast<size_t>(atomSize));
             continue;
         }
@@ -210,7 +191,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                             out.actions.empty() ? 0 : out.actions.back().frame;
                         const uint64_t frame = prev + st.delta;
                         if (st.button == static_cast<uint8_t>(Button::Swift)) {
-                            // Swift is a hold and release on the same frame.
                             out.actions.push_back(
                                 Action{frame, Button::Jump, true, st.player2});
                             out.actions.push_back(
@@ -228,7 +208,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
                 continue;
             }
 
-            // Special: 10 TTTT DD XXXXXXXX  (type, deltaSize, frameDelta)
             const unsigned type = (h >> 10) & 0xF;
             const unsigned sz = 1u << ((h >> 8) & 3);
             const uint64_t frameDelta = r.uintOfSize(sz);
@@ -265,10 +244,6 @@ bool skk::slc::parse(std::span<const uint8_t> data, skk::slc::Replay& out,
 
     if (!r.ok()) return fail("slc: truncated stream");
 
-    // No footer demand and no pos==end equality check: Echo's reader stops
-    // the atom loop once fewer than 12 bytes remain and accepts whatever is
-    // left over. The atom-size validation above already rejects a truncated
-    // stream, which is the failure a footer would catch.
 
     std::stable_sort(out.actions.begin(), out.actions.end(),
                      [](const Action& a, const Action& b) { return a.frame < b.frame; });
@@ -286,9 +261,6 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
         return fail("slc: unusable tps " + std::to_string(replay.meta.tps));
     }
 
-    // A replay carrying deaths or restarts is not something SKC can play: it
-    // has no death chain and no restart events, so the run would diverge at the
-    // first death with nothing in the log pointing at why.
     if (!replay.specials.empty()) {
         const auto& sp = replay.specials.front();
         const char* kind = sp.kind == SpecialKind::Death     ? "Death"
@@ -317,12 +289,6 @@ bool skk::slc::toSkcMacro(const skk::slc::Replay& replay, skc::Macro& out,
                                           a.holding, a.player2});
     }
 
-    // Every SLC edge goes in verbatim. A second press on a channel that is
-    // still held is one of the encoder's collapsed TAPS (the release happened
-    // but was not stored), and normalizeActionStream() rebuilds it as a
-    // same-frame up+down instead of deleting it. Deleting it changed the run:
-    // on Windy Road the surviving single press made GD apply the jump one
-    // physics step earlier than the identical timeline replayed as up+down.
     skc::NormalizeReport normalized;
     skc::normalizeActionStream(out.actions, normalized);
     droppedRelease = normalized.droppedRelease;

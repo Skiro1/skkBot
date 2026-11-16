@@ -14,8 +14,6 @@ namespace {
         if (!player) {
             return false;
         }
-        // find(), not operator[]: reading a map key that is absent must not
-        // insert a phantom 'false' entry into the live player's state.
         const auto& hb = player->m_holdingButtons;
         auto it = hb.find(button);
         return it != hb.end() && it->second;
@@ -33,10 +31,6 @@ namespace {
     }
 
     static void setHoldButton(PlayerObject* player, int button, bool held) {
-        // GD's natural representation: held = key present with true; not
-        // held = key ABSENT (operator[] would insert a fake 'false' entry
-        // that no live game state ever has - orb/ring pressed-animations
-        // iterate the map and rendered differently under playback).
         auto& hb = player->m_holdingButtons;
         if (held) {
             hb[button] = true;
@@ -86,14 +80,6 @@ namespace {
         else if (state.flags.swing)  player->toggleSwingMode(true, true);
         else if (state.flags.robot)  player->toggleRobotMode(true, true);
 
-        // Reference parity: this function is byte-for-byte
-        // ToastyReplay-main/src/core/checkpoint_handler.cpp:37-58. It
-        // deliberately does NOT touch m_isUpsideDown, any sprite visibility or
-        // updatePlayerScale() — restoreState writes m_isUpsideDown itself, and
-        // GDH/silicate/ToastyReplay all leave the mode sprites entirely to
-        // GD's own toggle. The extra machinery this function used to carry
-        // (flipGravity + updatePlayerScale + enforceModeSpriteVisibility) hid
-        // the robot for the whole session after a single restore.
         skkbot2::log::debug(
             "mode reconcile: was(rob={} shp={} bal={} drt={} spd={} swg={}) -> now(rob={}) robotSprite={}",
             player->m_isRobot ? 1 : 0, player->m_isShip ? 1 : 0, player->m_isBall ? 1 : 0,
@@ -272,12 +258,6 @@ void PlayerStateRestorer::restoreState(PlayerObject* player, PlayerStateBundle c
         player->m_isAccelerating = state.flags.accelerating;
         player->m_affectedByForces = state.flags.affectedByForces;
         player->m_slopeFlipGravityRelated = state.flags.slopeFlipGravityRelated;
-        // m_jumpBuffered is NOT restored from the snapshot. Vanilla GD clears
-        // it via releaseAllButtons() during loadFromCheckpoint; the snapshot
-        // was captured mid-input (jump buffered while holding the button), so
-        // restoring it re-latches "jump on next ground touch" and the player
-        // auto-jumps forever after a practice respawn (hold shows 0, yet the
-        // character jumps by itself). The live attempt must start input-clean.
 
         player->m_gravityMod = state.environment.gravityMod;
         player->m_playerSpeed = state.environment.playerSpeed;
@@ -367,12 +347,6 @@ bool PlayerStateRestorer::needsModeReconciliation(
     PlayerObject* player,
     PlayerStateBundle const& state
 ) {
-    // Structural divergence only: vehicle mode, gravity/level orientation,
-    // death. Position/rotation/velocity are deliberately EXCLUDED - they are
-    // either pinned per-tick by the per-frame stream or derived by GD's own
-    // physics from replayed inputs (GDH model). Restoring the full bundle on
-    // mere positional drift fought GD's sub-step state machines and killed the
-    // dash-ring hold animation and spider-sprite orientation.
     if (!player) {
         return false;
     }
@@ -508,10 +482,8 @@ CheckpointStateBundle CheckpointStateManager::capture(
         autoclicker->captureTimedPlayerState(true).timeUntilNextEdge
     };
 
-    // --- Practice-fix extended capture ---
     checkpoint.hasFullState = true;
 
-    // Full P1 state
     auto storeFullP1 = [&](auto& fp, PlayerObject* p) {
         if (!p) return;
         fp.p_x = p->m_position.x;
@@ -553,7 +525,6 @@ CheckpointStateBundle CheckpointStateManager::capture(
         fp.dashStartTime = p->m_dashStartTime;
         fp.totalTime = p->m_totalTime;
         fp.lastCheckpointTime = p->m_lastCheckpointTime;
-        // m_lastJumpTime (wall-clock) NOT captured (BUG-89 / BUG-91).
         fp.lastFlipTime = p->m_lastFlipTime;
         fp.lastSpiderFlipTime = p->m_lastSpiderFlipTime;
         fp.gameModeChangedTime = p->m_gameModeChangedTime;
@@ -569,7 +540,6 @@ CheckpointStateBundle CheckpointStateManager::capture(
         fp.holdingRight = p->m_holdingRight;
         fp.holdingLeft = p->m_holdingLeft;
 
-        // Pack key flags
         uint64_t f1 = 0;
         if (p->m_isShip) f1 |= 1ull << 0;
         if (p->m_isBird) f1 |= 1ull << 1;
@@ -633,15 +603,6 @@ CheckpointStateBundle CheckpointStateManager::capture(
         storeFullP1(checkpoint.fullP2, playLayer->m_player2);
     }
 
-    // BUG-13: the reduced fullP1 set above round-trips the SKK3 wire but omits
-    // the SHIP FLIGHT ANGLE (m_shipRotation/m_rotationSpeed), m_fallStartY and
-    // m_unkAngle1. A practice respawn on the ship restored the player LEVEL
-    // instead of banked, so the trajectory curved differently and the moment
-    // had to be redone from scratch. The complete FullPlayerCheckpoint carries
-    // every field; it is stored alongside (hasFullPlayer) and applied LAST in
-    // restore(), after forceCurrentModeVisual rebuilds the vehicle sprite —
-    // that rebuild can reset transforms the reduced apply just pinned, so the
-    // full re-pin must run after it.
     checkpoint.fullPlayer1 = FullPlayerCheckpoint::store(playLayer->m_player1);
     if (isDual && playLayer->m_player2) {
         checkpoint.fullPlayer2 = FullPlayerCheckpoint::store(playLayer->m_player2);
@@ -649,22 +610,18 @@ CheckpointStateBundle CheckpointStateManager::capture(
     }
     checkpoint.hasFullPlayer = true;
 
-    // RNG state
     checkpoint.seedState = rng.fastRandState;
     checkpoint.shakeRandomState = rng.shakeState;
     checkpoint.teleportRandomState = rng.teleportState;
 
-    // Broken objects
     checkpoint.brokenObjects = BrokenObjectTracker::get().getBrokenObjects();
 
-    // EMS persistent items
     if (playLayer->m_effectManager) {
         for (auto& [id, count] : playLayer->m_effectManager->m_persistentItemCountMap) {
             checkpoint.persistentItems.emplace_back(id, count);
         }
     }
 
-    // Click release state (6 bools: 3 per player)
     auto isHeld = [](PlayerObject* p, int btn) -> bool {
         if (!p) return false;
         auto it = p->m_holdingButtons.find(btn);
@@ -677,7 +634,6 @@ CheckpointStateBundle CheckpointStateManager::capture(
     checkpoint.clickReleased[4] = !isHeld(playLayer->m_player2, 2);
     checkpoint.clickReleased[5] = !isHeld(playLayer->m_player2, 3);
 
-    // Deep Practice Fix: GJBaseGameLayer / PlayLayer physics and collision block state
     checkpoint.player1CollisionBlock = playLayer->m_player1CollisionBlock;
     checkpoint.player2CollisionBlock = playLayer->m_player2CollisionBlock;
     checkpoint.extraDelta = playLayer->m_extraDelta;
@@ -687,9 +643,6 @@ CheckpointStateBundle CheckpointStateManager::capture(
     checkpoint.unk3380 = playLayer->m_unk3380;
     skk::captureGameObjectPhysics(playLayer->m_gameState.m_gameObjectPhysics, checkpoint.gameObjectPhysics);
 
-    // BUG-136: Echo layer-snapshot family. Capture only - the SKK restore
-    // path below must stay byte-identical in behavior, the SKC seam bridge
-    // applies these (skc_checkpoint.cpp).
     checkpoint.timeWarp = playLayer->m_gameState.m_timeWarp;
     checkpoint.queuedTimeWarp = playLayer->m_gameState.m_queuedTimeWarp;
     checkpoint.timeWarpRelated = playLayer->m_gameState.m_timeWarpRelated;
@@ -709,7 +662,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
         return;
     }
 
-    // Wire не содержит deep-полей; пустая live-карта, напротив, валидна.
     if (checkpoint.hasLayerState) {
         playLayer->m_player1CollisionBlock = checkpoint.player1CollisionBlock;
         playLayer->m_player2CollisionBlock = checkpoint.player2CollisionBlock;
@@ -721,12 +673,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
         skk::restoreGameObjectPhysics(checkpoint.gameObjectPhysics, playLayer->m_gameState.m_gameObjectPhysics);
     }
 
-    // BUG-136 SKK: the Echo layer-snapshot family (timeWarp/timeMod/gravity
-    // flags + attemptTime). Same data the SKC seam bridge applies; the SKK
-    // restore previously left whatever GD's loadFromCheckpoint produced.
-    // Gated on hasLayerState: a checkpoint rebuilt from the SKK3 wire has
-    // only defaults here, and overwriting live values with defaults would be
-    // a regression, not a repair.
     if (checkpoint.hasLayerState) {
         playLayer->m_gameState.m_timeWarp = checkpoint.timeWarp;
         playLayer->m_gameState.m_queuedTimeWarp = checkpoint.queuedTimeWarp;
@@ -754,9 +700,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
     }
     InputStateRestorer::restoreInputState(playLayer, checkpoint);
 
-    // Rewind the variance table to the checkpoint state: everything not in the
-    // snapshot is 'unfilled' again, so lazy rerolls come from the (locked) RNG
-    // stream at the same tick - same values as during capture.
     for (float& value : playLayer->m_varianceValues) {
         value = 0.0f;
     }
@@ -782,9 +725,7 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
         autoclicker->reset();
     }
 
-    // --- Practice-fix extended restore ---
     if (checkpoint.hasFullState) {
-        // Restore full P1 state
         auto applyFullP1 = [&checkpoint](auto& fp, PlayerObject* p) {
             if (!p) return;
             p->m_position = cocos2d::CCPoint(fp.p_x, fp.p_y);
@@ -826,7 +767,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
             p->m_dashStartTime = fp.dashStartTime;
             p->m_totalTime = fp.totalTime;
             p->m_lastCheckpointTime = fp.lastCheckpointTime;
-            // m_lastJumpTime (wall-clock) NOT restored (BUG-89 / BUG-91).
             p->m_lastFlipTime = fp.lastFlipTime;
             p->m_lastSpiderFlipTime = fp.lastSpiderFlipTime;
             p->m_gameModeChangedTime = fp.gameModeChangedTime;
@@ -837,14 +777,11 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
             p->m_lastCollisionRight = fp.lastCollisionRight;
             p->m_stateOnGround = fp.stateOnGround;
             p->m_stateForce = fp.stateForce;
-            // SKK3 CP-секция не сериализует этот scalar. Не подменяем
-            // восстановленное GD значение дефолтом файлового bundle.
             if (checkpoint.hasPlayerState) p->m_stateFlipGravity = fp.stateFlipGravity;
             p->m_reverseRelated = fp.reverseRelated;
             p->m_holdingRight = fp.holdingRight;
             p->m_holdingLeft = fp.holdingLeft;
 
-            // Unpack flags
             uint64_t f1 = fp.flags1;
             p->m_isShip = (f1 & (1ull << 0)) != 0;
             p->m_isBird = (f1 & (1ull << 1)) != 0;
@@ -902,27 +839,11 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
         };
 
         applyFullP1(checkpoint.fullP1, playLayer->m_player1);
-        // BUG-18 follow-up: fullP2 is only CAPTURED inside a dual/2p context
-        // (see store). Applying it whenever m_player2 merely exists wrote a
-        // default-constructed bundle — position (0,0), every mode flag false,
-        // zero velocity/scale — onto a live player. hasFullPlayer2 is the gate
-        // BUG-18 set up; the reduced/full P1 calls below were simply missed.
         if (playLayer->m_player2 && checkpoint.hasFullPlayer2) {
             applyFullP1(checkpoint.fullP2, playLayer->m_player2);
         }
 
-        // NOTE: there is deliberately NO forceCurrentModeVisual() here. It was a
-        // local addition no reference bot has (GDH checkpointData.hpp and
-        // silicate checkpoint/checkpoint.cpp write flags raw and never
-        // deactivate+activate the mode; ToastyReplay-main relies on
-        // reconcileVehicleVisual, which runs inside restoreState at the top of
-        // this function). Its unconditional toggleRobotMode(false) hid the robot
-        // sprite, and nothing ever showed it again — the robot stayed invisible
-        // for the rest of the session after a single restore.
 
-        // The complete snapshot re-pins every remaining field (ship angle,
-        // rotation speed, fall start, colours, wave trail) after the mode has
-        // been reconciled, so the respawn continues the recorded flight exactly.
         if (checkpoint.hasFullPlayer) {
             checkpoint.fullPlayer1.apply(playLayer->m_player1);
             if (playLayer->m_player2 && checkpoint.hasFullPlayer2) {
@@ -930,7 +851,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
             }
         }
 
-        // Restore broken objects — re-disable them so they stay destroyed
         BrokenObjectTracker::get().setBrokenObjects(checkpoint.brokenObjects);
         for (auto* obj : checkpoint.brokenObjects) {
             if (obj) {
@@ -940,7 +860,6 @@ void CheckpointStateManager::restore(GJBaseGameLayer* playLayer, CheckpointState
             }
         }
 
-        // Restore EMS persistent items
         if (playLayer->m_effectManager) {
             playLayer->m_effectManager->m_persistentItemCountMap.clear();
             for (auto& [id, count] : checkpoint.persistentItems) {

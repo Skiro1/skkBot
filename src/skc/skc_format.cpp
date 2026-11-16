@@ -18,10 +18,6 @@ using namespace geode::prelude;
 
 namespace skk::skc {
 
-// ---------------------------------------------------------------------------
-// v1 reader (zstd + LEB128). Kept alive so existing .skc files keep loading;
-// encode() no longer produces this layout.
-// ---------------------------------------------------------------------------
 namespace {
 
 void writeVarint(std::vector<uint8_t>& out, uint64_t value) {
@@ -42,8 +38,6 @@ void writeVarint(std::vector<uint8_t>& out, uint64_t value) {
         out |= static_cast<uint64_t>(byte & 0x7F) << shift;
         if ((byte & 0x80) == 0) return true;
         shift += 7;
-        // A varint longer than 10 bytes overflows uint64; a malformed stream
-        // would otherwise loop until it runs off the buffer.
         if (shift >= 70) return false;
     }
 }
@@ -65,14 +59,9 @@ void writeVarint(std::vector<uint8_t>& out, uint64_t value) {
     return out.button >= 1 && out.button <= 3;
 }
 
-// Guard against a truncated or hostile file asking us to allocate gigabytes.
 constexpr uint32_t kMaxActionCount = 5'000'000;
 
-// --- click stream -----------------------------------------------------------
 
-// 18 kind symbols: kind (3) x button (3) x player2 (2).
-// 18 real kind symbols (kind 0..2 x button 1..3 x player2) PLUS the END
-// terminator, which is what lets the header drop its click count.
 constexpr uint32_t kKindSymbolCount = kEndKind + 1u;
 
 [[nodiscard]] uint32_t packKind(ClickKind kind, uint8_t button, bool player2) {
@@ -89,7 +78,7 @@ constexpr uint32_t kKindSymbolCount = kEndKind + 1u;
     return click;
 }
 
-} // namespace
+}
 
 void Macro::sortActions() {
     std::stable_sort(actions.begin(), actions.end(),
@@ -102,41 +91,19 @@ void Macro::sortActions() {
 bool isValidHeader(const Header& header) {
     if (!std::isfinite(header.tps) || header.tps < 1.0f || header.tps > 1'000'000.0f)
         return false;
-    // 0 means "follow tps" and is the only accepted non-positive value. Anything
-    // else outside the range is a corrupt field, not a request: it would reach
-    // setAnimationInterval as 1/fps and pin the display to nonsense.
     if (!std::isfinite(header.fps) ||
         (header.fps != 0.0f && (header.fps < 1.0f || header.fps > 1'000'000.0f)))
         return false;
 
-    // This is what the magic used to do. Without a signature in the bytes, the
-    // knobs themselves have to reject a file that is not ours before a single
-    // click is decoded - the coder's very first symbol would otherwise come
-    // from arbitrary bytes and produce an arbitrary but plausible macro.
-    //
-    // Most fields are bounded enumerators, where every bit pattern lands on a
-    // defined value and nothing can be out of range: ctx is 6 bits and the
-    // decoder treats 0 as one model; deltaCodec/holdCodec are 2 bits over four
-    // codecs; the two keys are 2 bits over four; the two shifts are 2 bits
-    // starting at kShiftMin, which kShiftMax leaves room for; gapFrom is one
-    // bit over two. That leaves exactly two fields that index a table, and
-    // those are the two worth checking.
     const uint32_t scaleIdx = (header.knobs1 >> 6) & 0x03u;
     const uint32_t budgetIdx = (header.knobs2 >> 4) & 0x03u;
     return scaleIdx < KnobTable::kScaleCount && budgetIdx < KnobTable::kBudgetCount;
 }
 
 std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subticks) {
-    // Group events by (button, player2); inside a channel the presses and
-    // releases alternate, so a press consumes the very next event. The channel
-    // order is fixed (not hash-map order) so the click stream — and therefore
-    // the encoded bytes — is deterministic for a given action list.
     std::vector<Click> clicks;
     struct OrderedClick { Click click; size_t sourceIndex; };
     std::vector<OrderedClick> orderedClicks;
-    // BUG-139: порядок разных каналов в одном timestamp не кодируется внутри
-    // Paired. На таких границах release пишется отдельной командой; tie-break
-    // якорей берётся из исходного потока, а не из номера канала.
     const auto timestamp = [subticks](const Action& action) {
         return static_cast<uint64_t>(action.frame) * (subticks ? 2u : 1u) +
             (subticks && action.halfTick ? 1u : 0u);
@@ -170,9 +137,6 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
         }
         if (events.empty()) continue;
 
-        // A channel is recorded in frame order already (recordInput appends in
-        // order and the caller sorts), but sort defensively: the pairing below
-        // only works on an ordered stream.
         std::stable_sort(events.begin(), events.end(), [subticks](const Action* lhs,
                                                                   const Action* rhs) {
             const uint64_t lt = static_cast<uint64_t>(lhs->frame) * (subticks ? 2u : 1u) +
@@ -209,8 +173,6 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
                     i += 1;
                 }
             } else {
-                // A release with no press behind it: the "buttons released at
-                // frame 0" marker some recordings start with.
                 click.kind = ClickKind::ReleaseOnly;
                 i += 1;
             }
@@ -218,8 +180,6 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
         }
     }
 
-    // Sort by absolute anchor, then delta-code in that order. The anchor lives
-    // in `delta` temporarily and is replaced by the difference below.
     std::sort(orderedClicks.begin(), orderedClicks.end(),
         [](const OrderedClick& lhs, const OrderedClick& rhs) {
             return lhs.click.delta != rhs.click.delta ? lhs.click.delta < rhs.click.delta
@@ -238,8 +198,6 @@ std::vector<Click> actionsToClicks(const std::vector<Action>& actions, bool subt
 }
 
 void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report) {
-    // Channel key: (player2, button), the same six channels validateActions()
-    // and the click pairing use.
     bool held[2][3] = {};
     std::vector<Action> out;
     out.reserve(actions.size() + 8);
@@ -247,7 +205,6 @@ void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report
     for (const Action& action : actions) {
         const int button = static_cast<int>(action.button) - 1;
         if (button < 0 || button > 2) {
-            // Out of range: leave it alone so validateActions() can name it.
             out.push_back(action);
             continue;
         }
@@ -259,10 +216,6 @@ void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report
                 continue;
             }
         } else if (held[slot][button]) {
-            // Duplicate press = a tap the source format flattened onto one
-            // frame. Rebuild the release that has to have happened, on the same
-            // frame: (up, then the press below). Zero-length hold, nothing
-            // shifted.
             out.push_back(Action{action.frame, action.button, false, action.player2,
                                  action.halfTick});
             ++report.rebuiltTaps;
@@ -278,8 +231,6 @@ void normalizeActionStream(std::vector<Action>& actions, NormalizeReport& report
 
 bool validateActions(const std::vector<Action>& actions, std::string& outReason,
                      bool allowRepeatedPress) {
-    // Channel key: (player2, button). Six channels (P1 x btn1..3, P2 x
-    // btn1..3) cover everything a level can send.
     bool held[2][3] = {};
     bool seenPress[2][3] = {};
 
@@ -304,10 +255,6 @@ bool validateActions(const std::vector<Action>& actions, std::string& outReason,
 
         if (action.pressed) {
             if (held[slot][button] && !allowRepeatedPress) {
-                // Two downs without an up in between. Physically impossible for
-                // one button: it means the stream spliced two attempts (a
-                // practice restore dropped the release) or the pairing already
-                // lost track. Either way the replay cannot reproduce it.
                 outReason = "double press on button " +
                             std::to_string(action.button) +
                             (action.player2 ? " (P2)" : " (P1)") +
@@ -318,15 +265,6 @@ bool validateActions(const std::vector<Action>& actions, std::string& outReason,
             held[slot][button] = true;
             seenPress[slot][button] = true;
         } else if (seenPress[slot][button] && !held[slot][button]) {
-            // A release is only wrong when the channel has already played a
-            // FULL press/release cycle - i.e. a stray second release.
-            //
-            // A LEADING release is legal and in fact expected: recordings start
-            // with a "buttons are up at frame 0" baseline, which actionsToClicks
-            // encodes as a ReleaseOnly click (skc_format.cpp:144-146). The
-            // first version of this validator rejected it and failed its own
-            // self-test - and would have refused nearly every real macro at
-            // save time.
             outReason = "stray release on button " +
                         std::to_string(action.button) +
                         (action.player2 ? " (P2)" : " (P1)") +
@@ -334,16 +272,10 @@ bool validateActions(const std::vector<Action>& actions, std::string& outReason,
                         " - already up, no press outstanding";
             return false;
         } else {
-            // Clear the shadow. Omitting this was a real bug: the flag latched
-            // true after the first press forever, so EVERY later press on that
-            // channel was reported as a double press and no macro containing
-            // two taps could ever be saved.
             held[slot][button] = false;
         }
     }
 
-    // A trailing hold is legal (the player pressed and never let go before the
-    // recording ended), so held[] leftovers are not an error.
     outReason.clear();
     return true;
 }
@@ -380,19 +312,11 @@ std::vector<Action> clicksToActions(const std::vector<Click>& clicks, bool subti
     return actions;
 }
 
-// ---------------------------------------------------------------------------
-// v2 codec: click stream over the range coder.
-// ---------------------------------------------------------------------------
 
 namespace {
 
-// One thing encode() tries. The winner's fields go into the header, so the
-// decoder rebuilds exactly this without being told anything else.
 using Candidate = Variant;
 
-// Builds one field's model set. `mix` switches the bucket chooser over to the
-// adaptive order-0/order-1 blend; the flat codec has no buckets to mix, so the
-// flag is ignored there.
 std::unique_ptr<ValueModelSet> makeModel(const Candidate& cand, ValueCodec codec,
                                          uint32_t shift, bool mix) {
     if (codec != ValueCodec::Bucket) {
@@ -402,9 +326,6 @@ std::unique_ptr<ValueModelSet> makeModel(const Candidate& cand, ValueCodec codec
     return std::make_unique<ContextValueModel>(
         cand.contextCount, shift, cand.countScale, cand.rowBudget, mix);
 }
-// host does. Both helpers work on explicit byte shifts, so they are correct on a
-// big-endian machine too, and they produce exactly the bytes memcpy produced on
-// every little-endian build - existing .skc files keep loading unchanged.
 void writeLeFloat(uint8_t* dst, float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -443,10 +364,6 @@ void writeLeU32(uint8_t* dst, uint32_t value) {
     dst[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
 }
 
-// LZ phrase prediction for repeating click patterns.
-// When enabled, repeated sequences (e.g. spam / tight rhythmic cycles) are predicted
-// using an index table of past sequences. A successful match emits only a single 1-bit,
-// bypassing kind, delta, and hold coding entirely.
 constexpr size_t kLzHashBits = 18;
 constexpr size_t kLzHashSlots = 1u << kLzHashBits;
 constexpr size_t kLzMinMatch = 4;
@@ -483,25 +400,18 @@ void encodeClicks(std::vector<uint8_t>& out, const std::vector<Click>& clicks,
     const uint32_t deltaShift = cand.deltaShift;
     RangeEncoder enc;
 
-    // Sticky kind: a bit per click saying whether the kind/button/player2
-    // triple changed, plus a full symbol on the change.
     SymbolModel kindChangedModel(2u, 4u, cand.countScale, cand.rowBudget);
     SymbolModel kindModel(kKindSymbolCount, 1u, cand.countScale, cand.rowBudget);
     SymbolModel lzHitModel(2u, kLzBuckets, cand.countScale, cand.rowBudget);
-    // contextCount == 0 gives a single model set. Which set that is, and with
-    // what shift, is the variant's business - and the variant is what is being
-    // measured across candidates.
     auto deltaModel = makeModel(cand, cand.deltaCodec, cand.deltaShift, cand.mixGap);
     auto holdModel = makeModel(cand, cand.holdCodec, cand.holdShift, cand.mixHold);
 
     uint32_t kindCtx = 0;
-    uint32_t previousKind = ~0u;   // force a symbol on the first click
+    uint32_t previousKind = ~0u;
     uint32_t previousDelta = 0;
     uint32_t previousHold = 0;
     uint32_t previousDelta2 = 0;
     uint32_t previousCodedValue = 0;
-    // Zero means "one model", so the divisor is floored at one rather than
-    // taken from contextCount directly.
     const uint32_t buckets = contextCount ? contextCount : 1u;
 
     const auto deltaContext = [=](uint32_t prevDelta, uint32_t prevHold,
@@ -651,8 +561,6 @@ void encodeClicks(std::vector<uint8_t>& out, const std::vector<Click>& clicks,
     out = enc.finish();
 }
 
-// Decodes until the END symbol. Returns false if the stream never terminates
-// within the click ceiling (a truncated or corrupt payload).
 [[nodiscard]] bool decodeClicks(const uint8_t* data, size_t size,
                                 std::vector<Click>& clicks,
                                 const Candidate& cand,
@@ -749,7 +657,7 @@ void encodeClicks(std::vector<uint8_t>& out, const std::vector<Click>& clicks,
             const uint32_t symbol = kindModel.decode(dec, 0u);
             if (symbol == kEndKind) {
                 if (consumedOut) *consumedOut = dec.consumedBytes();
-                return true;   // clean terminator
+                return true;
             }
             previousKind = symbol;
         }
@@ -801,36 +709,20 @@ void encodeClicks(std::vector<uint8_t>& out, const std::vector<Click>& clicks,
     }
 }
 
-} // namespace
+}
 
 const std::vector<Variant>& candidateVariants() {
     using V = ValueCodec;
     using K = ContextKey;
     using G = GapFrom;
     static const std::vector<Variant> list = {
-        // Measured winners from tools/skc_sweep.cpp, one per macro, all with
-        // gapFrom = FromRelease. Measuring the gap from the previous release
-        // instead of the previous press is worth 15-30 bytes on every file
-        // tested, and it won on all seven - it is not a special case for one
-        // kind of macro, it is the better parameterisation in general.
-        //
-        // GRIEF
         Variant{0u, 5u, 5u, V::Bucket, V::Direct32, K::Modulo, K::Modulo, G::FromRelease, 1u, 256u},
-        // RAUCHKAMMER 2
         Variant{0u, 5u, 5u, V::Bucket, V::Direct32, K::Modulo, K::Modulo, G::FromRelease, 4u, 64u},
-        // amethyst and thinking share a shape: the gap gets the flat row.
         Variant{0u, 4u, 5u, V::Direct128, V::Direct32, K::Modulo, K::Modulo, G::FromRelease, 1u, 256u},
-        // kyouki
         Variant{0u, 4u, 5u, V::Bucket, V::Direct32, K::Modulo, K::Modulo, G::FromRelease, 1u, 320u},
-        // as_world, the one repetitive macro: a context split keyed on the
-        // previous hold's bucket, and the finest count scale in the table.
         Variant{16u, 4u, 3u, V::Direct128, V::Direct32, K::PrevHoldBucket, K::Modulo, G::FromRelease, 256u, 32u},
-        // artemis
         Variant{0u, 5u, 5u, V::Bucket, V::Bucket, K::Modulo, K::Modulo, G::FromRelease, 4u, 64u},
 
-        // Press-to-press winners from the previous round, kept as fallbacks: a
-        // macro whose gaps are too large for the sign bit cannot use FromRelease
-        // at all, and these are what it gets instead.
         Variant{0u, 5u, 5u, V::Bucket, V::Direct32, K::Modulo, K::Modulo, G::PressToPress, 1u, 256u},
         Variant{0u, 5u, 5u, V::Bucket, V::Direct32, K::Modulo, K::Modulo, G::PressToPress, 4u, 320u},
         Variant{0u, 4u, 5u, V::Direct128, V::Direct64, K::Modulo, K::Modulo, G::PressToPress, 1u, 320u},
@@ -842,8 +734,6 @@ const std::vector<Variant>& candidateVariants() {
     };
     return list;
 }
-// The file-type check. There is no magic: a file that is not ours has to fail
-// isValidHeader() here rather than be decoded as a stream of garbage.
 [[nodiscard]] bool parseHeader(const uint8_t* data, size_t size, Header& outHeader,
                                size_t& outPayloadOffset, Candidate& outCand) {
     if (size < kHeaderFixed) return false;
@@ -853,11 +743,6 @@ const std::vector<Variant>& candidateVariants() {
     outHeader.knobs2 = data[2];
     const bool hasTps = (outHeader.knobs2 & 0x80u) != 0u;
 
-    // The platformer extension. ctx == 0x3F is not a context count the encoder
-    // can produce, so its presence is unambiguous; the extra byte carries the
-    // real ctx plus the mode bit. "No extension" stays "mode unknown" - old
-    // files must keep playing, and a classic macro is deliberately not
-    // extended so every existing .skc remains byte-identical.
     uint32_t contextCount = outHeader.knobs0 & 0x3Fu;
     size_t rateOffset = kHeaderFixed;
     outHeader.platformerKnown = false;
@@ -869,8 +754,6 @@ const std::vector<Variant>& candidateVariants() {
         if (size < kHeaderFixed + kExtBytes) return false;
         const uint8_t ext = data[kHeaderFixed];
         contextCount = ext & 0x3Fu;
-        // One escape byte, not a chain: a real context count of 63 would make
-        // the following byte look like a second extension.
         if (contextCount == kCtxExtension) return false;
         outHeader.platformerKnown = true;
         outHeader.platformerMode = (ext & kExtPlatformer) != 0;
@@ -943,9 +826,6 @@ const std::vector<Variant>& candidateVariants() {
     return true;
 }
 
-// Tries every context/shift pair and keeps the smallest. Both encode() and
-// profile() go through this, so the breakdown always describes the model the
-// file actually got.
 struct BestPick {
     Candidate cand;
     std::vector<uint8_t> payload;
@@ -953,13 +833,8 @@ struct BestPick {
 
 BestPick pickBest(const std::vector<Click>& clicks, bool allowGapSplit) {
     BestPick best;
-    // Seed from the first candidate. Starting with an empty payload would make
-    // "smaller than the best so far" false for every trial, and the encoder
-    // would emit a header with no body at all.
     bool have = false;
     for (const auto& candBase : candidateVariants()) {
-        // A macro with gaps too large for the sign bit cannot use FromRelease at
-        // all - the candidate is skipped rather than offered and then broken.
         if (!allowGapSplit && candBase.gapFrom == GapFrom::FromRelease) continue;
         for (int lzPass = 0; lzPass < 2; ++lzPass) {
             Candidate cand = candBase;
@@ -977,20 +852,8 @@ BestPick pickBest(const std::vector<Click>& clicks, bool allowGapSplit) {
 }
 
 std::vector<uint8_t> encode(const Macro& macro) {
-    // SKC is vanilla-only now (CBS/COS removed at the user's request 01.11:
-    // the sub-step marks never survived a real record→play round trip), so the
-    // encoder never writes the mode bits or half-tick marks again. The decoder
-    // still accepts the old flags - existing files stay loadable - but any
-    // half-tick mark a stale macro object still carries is ignored here, not
-    // an error: the frame number already carries the timing.
-    const auto clicks = actionsToClicks(macro.actions, /*subticks=*/false);
+    const auto clicks = actionsToClicks(macro.actions, false);
 
-    // Encode several ways and keep whichever is smaller, recording the winner in
-    // the header. Which way wins is macro-dependent and no threshold on the
-    // click count tells them apart, so the encoder tries and measures instead
-    // of guessing - but only over the eight configurations a full sweep found
-    // worth keeping, because the full 45056-variant grid costs ten to eighty
-    // seconds per save.
     BestPick best = pickBest(clicks, gapSplitSafe(macro));
     const Candidate& c = best.cand;
 
@@ -1000,21 +863,6 @@ std::vector<uint8_t> encode(const Macro& macro) {
     for (uint32_t i = 0; i < KnobTable::kBudgetCount; ++i)
         if (KnobTable::kBudget[i] == c.rowBudget) budgetIdx = i;
 
-    // The tail appears when EITHER number differs from its default. Storing tps
-    // alone used to be the whole condition; making it "or a display rate worth
-    // keeping" costs nothing for macros that declare neither, which is all of
-    // them until someone records at a pinned rate.
-    //
-    // `std::signbit` is not decoration. The follow-tps marker is -0.0, which is
-    // EQUAL to +0.0 under `!=`, so a plain comparison would silently drop the
-    // tail for a macro recorded at fps == tps with default tps - storing
-    // nothing where the user asked for "FPS on, follow tps".
-    // Canonicalise the display rate before it goes on the wire. Mirror of the
-    // SKK3 writer and the same rule: fps == tps is stored as the -0.0 marker
-    // ("FPS on, follow the tick rate"), never as the number and never as
-    // nothing at all. An importer that fills fps with the tick rate would
-    // otherwise produce a file whose playback enables FPS at a pinned rate
-    // instead of following tps.
     float fpsWire = macro.header.fps;
     if (!std::isfinite(fpsWire)) {
         fpsWire = 0.0f;
@@ -1025,21 +873,7 @@ std::vector<uint8_t> encode(const Macro& macro) {
     const bool useDoubleTps = static_cast<double>(tpsAsFloat) != macro.header.tps;
     const bool hasTps = macro.header.tps != kDefaultTps ||
                         std::signbit(fpsWire) || fpsWire != 0.0f;
-    // The platformer extension costs one byte and is written ONLY for a
-    // platformer macro. Writing an explicit "classic" marker would cost every
-    // ordinary file a byte for a case that is not worth refusing; an
-    // unextended file decodes as "mode unknown" and is not validated.
-    // Lock Delta is the DEFAULT timing mode, so it costs no wire bit: a file
-    // with no timing bits at all decodes back to Lock Delta (the decoder's
-    // "no bit set" default). Writing the default bit anyway would grow EVERY
-    // macro by the escape + modes bytes, and a build whose modes mask predates
-    // the timing bits rejects any file carrying one - every new .skc would
-    // become unreadable for older versions for no gain. Only the non-default
-    // choice (Real Time) is worth the two bytes.
     const bool hasTimingMode = macro.realTimeMode;
-    // The modes byte only exists for the independently-definable extras now:
-    // LZ and the non-default timing mode. CBS/COS/subticks never reach the
-    // wire any more (see the comment at the top of encode).
     const bool hasModes = c.lzMode || hasTimingMode;
     const bool hasPlatformerFlag = macro.platformerKnown && macro.platformerMode;
     const bool hasExtension = hasPlatformerFlag || hasModes;
@@ -1054,8 +888,6 @@ std::vector<uint8_t> encode(const Macro& macro) {
 
     Header header;
     if (hasExtension) {
-        // 0x3F in the ctx field is the escape; the real count and the mode bit
-        // follow. c.contextCount is one of 0/6/16/24/48, never 63.
         header.knobs0 = static_cast<uint8_t>(kCtxExtension |
                                              (static_cast<uint8_t>(c.deltaCodec) << 6));
     } else {
@@ -1082,10 +914,6 @@ std::vector<uint8_t> encode(const Macro& macro) {
     header.lockDeltaMode = macro.lockDeltaMode;
     header.realTimeMode = macro.realTimeMode;
 
-    // Byte by byte. A raw memcpy would put the bytes in the host's order, which
-    // is fine on x86/ARM and wrong on a big-endian host. Emitting explicitly
-    // makes the header's byte order part of the format rather than a property
-    // of the machine that wrote the file.
     out[0] = header.knobs0;
     out[1] = header.knobs1;
     out[2] = header.knobs2;
@@ -1116,14 +944,6 @@ std::vector<uint8_t> encode(const Macro& macro) {
     }
 
     out.insert(out.end(), best.payload.begin(), best.payload.end());
-    // The rng-journal tail rides past the self-terminating stream; an empty
-    // journal appends nothing, so ordinary files stay byte-identical.
-    // "Save Seed" (MACRO BOT, Settings): the journal is SKC's seed-
-    // equivalent — the file has no dedicated seed field, this tail is what
-    // pins the recorded world's RNG. When OFF it is not written (Save and
-    // Autosave both go through encode()); the in-memory journal is untouched
-    // (playback of the loaded session keeps using it, and a re-save with the
-    // toggle back ON writes it again).
     const bool seedInFile =
         macro.wireSeedStamp != 0 ? macro.wireSeedStamp > 0
                                  : geode::Mod::get()->getSavedValue<bool>(
@@ -1135,11 +955,9 @@ std::vector<uint8_t> encode(const Macro& macro) {
 }
 
 CostProfile profile(const Macro& macro) {
-    const auto clicks = actionsToClicks(macro.actions, /*subticks=*/false);
+    const auto clicks = actionsToClicks(macro.actions, false);
     const BestPick best = pickBest(clicks, gapSplitSafe(macro));
 
-    // Re-encode the winner with the counters on. The bytes are identical, so
-    // the breakdown is the one the saved file has.
     CostProfile prof;
     std::vector<uint8_t> ignored;
     encodeClicks(ignored, clicks, best.cand, &prof);
@@ -1148,8 +966,6 @@ CostProfile profile(const Macro& macro) {
 
 namespace {
 
-// Единый путь восстановления кадров, порядка команд, legacy-флагов и RNG.
-// Rescue отличается только удалением повторных release ПОСЛЕ сортировки.
 std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
                                   size_t* droppedRelease) {
     if (!data) return std::nullopt;
@@ -1181,14 +997,6 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
 
     const size_t payloadSize = size - payloadOffset;
     if (payloadSize == 0) {
-        // A header with no body used to be accepted here as "an empty macro.
-        // Legal: CLEAR then SAVE". It is not legal, and it is not empty: the
-        // encoder always writes the END terminator (encodeClicks, "one final
-        // changed bit plus the END symbol"), so finish() always emits at least
-        // one byte even for a macro with no clicks. A bodyless file is therefore
-        // a write that was cut off - and loading it as an empty macro is exactly
-        // how a half-written save turns into a silent CLEAR of the level's
-        // inputs.
         return std::nullopt;
     }
 
@@ -1197,13 +1005,7 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
     if (!decodeClicks(data + payloadOffset, payloadSize, clicks, cand,
                       &streamBytes))
         return std::nullopt;
-    // Everything after the click stream is the optional rng-journal tail.
-    // Legacy files (and imports) have nothing there - no header bit is spent
-    // on declaring the tail, the stream itself is the boundary.
     if (streamBytes < payloadSize) {
-        // Декодер может вернуть streamBytes с read-ahead до 8 байт (замер
-        // 07.11: 'Mk3_autosave' — магия съедена, остался «хвост» после
-        // границы). Резервируем окно назад от объявленной границы.
         const size_t boundary = payloadOffset + streamBytes;
         const size_t back = std::min<size_t>(streamBytes, 8u);
         (void)skk::skc::locateAndParseRngJournal(data + boundary - back,
@@ -1214,13 +1016,6 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
     macro.actions = clicksToActions(clicks, header.subtickEncoded);
     macro.sortActions();
 
-    // SKC is vanilla-only (CBS/COS removed 01.11). Old files that still carry
-    // the mode bits and half-tick marks are accepted - the marks above were
-    // needed for the frame reconstruction - but the loaded macro is then
-    // normalized to a plain full-step stream: the frame numbers are already
-    // correct, and nothing downstream may believe a sub-step position exists
-    // (the encoder refuses to write the bits, so a stale flag here would
-    // re-save a file the same encoder then refuses to round-trip).
     if (macro.cbsMode || macro.cosMode || macro.subtickEncoded) {
         for (auto& action : macro.actions) {
             action.halfTick = false;
@@ -1255,15 +1050,12 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
         });
     }
 
-    // PressOnly штатно кодирует повторную команду press. Её происхождение
-    // нельзя восстановить из файла: не удаляем press и не вставляем release.
-    // Проверки порядка, кнопок и stray release остаются обязательными.
     std::string reason;
     if (!validateActions(macro.actions, reason, true)) return std::nullopt;
     return macro;
 }
 
-} // namespace
+}
 
 [[nodiscard]] std::optional<Macro> decode(const uint8_t* data, size_t size) {
     return decodeNative(data, size, nullptr);
@@ -1274,8 +1066,6 @@ std::optional<Header> readHeader(const std::filesystem::path& path) {
     if (!in.is_open())
         return std::nullopt;
 
-    // Read the whole file and go through the same header parser as decode(),
-    // rather than reading sizeof(Header) bytes into a struct and hoping.
     std::vector<uint8_t> data(
         (std::istreambuf_iterator<char>(in)),
         std::istreambuf_iterator<char>());
@@ -1300,8 +1090,6 @@ std::optional<Macro> loadFromFile(const std::filesystem::path& path) {
     if (auto macro = decode(data.data(), data.size()))
         return macro;
 
-    // BUG-137/138: rescue не является импортом чужого формата. Разрешено
-    // убрать stray release, но НЕ восстанавливать якобы потерянные тап-релизы.
     size_t droppedRelease = 0;
     auto macro = decodeNative(data.data(), data.size(), &droppedRelease);
     if (!macro) return std::nullopt;
@@ -1318,8 +1106,6 @@ bool saveToFile(const std::filesystem::path& path, const Macro& macro) {
     if (bytes.empty())
         return false;
 
-    // Atomic-ish write: build in a temp file, then move, so a crash mid-save
-    // can never truncate a macro the user just recorded.
     auto tmp = path;
     tmp += ".tmp";
     {
@@ -1342,13 +1128,7 @@ bool saveToFile(const std::filesystem::path& path, const Macro& macro) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// selfTest — round-trip a representative macro (holds, taps, P2, long gaps,
-// orphan releases) and require a byte-identical re-encode. Runs once at mod
-// load, same as the SKK3 per-frame codec test.
-// ---------------------------------------------------------------------------
 bool selfTest() {
-    // BUG-139: сохранение порядка P2/P1 и release/press между каналами.
     {
         Macro ordered;
         ordered.wireSeedStamp = -1;
@@ -1363,8 +1143,6 @@ bool selfTest() {
             return false;
         }
     }
-    // BUG-138: нативные команды press/press/release не являются flattened tap.
-    // Проверяем и совпадающий кадр, и разные кадры; чужой normalizer не меняем.
     for (const uint32_t secondFrame : {13663u, 13664u}) {
         Macro native;
         native.wireSeedStamp = -1;
@@ -1388,32 +1166,21 @@ bool selfTest() {
 
     Macro macro;
     macro.header.tps = 360.0f;
-    // Non-default on purpose: the fixture has to exercise the whole rate tail,
-    // not just the tps half of it. With fps at 0 the tail is still written
-    // (tps differs) but the second float is zero, and a bug that never touched
-    // it would pass every time.
     macro.header.fps = 144.0f;
-    // Press and release MUST share a channel (same button, same player) so the
-    // click pairing produces a Paired click. The earlier fixture deliberately
-    // alternated the player2 flag, which made every event an orphan release and
-    // therefore could not catch a press/release swap.
     macro.actions = {
-        { 0,     1, false, false },   // leading "released" marker
-        { 1,     1, true,  false },   // P1 jump press
-        { 2,     1, false, false },   // P1 jump release one frame later
-        { 120,   1, true,  false },   // half a second of silence, then a tap
+        { 0,     1, false, false },
+        { 1,     1, true,  false },
+        { 2,     1, false, false },
+        { 120,   1, true,  false },
         { 121,   1, false, false },
-        { 240,   3, true,  false },   // platformer right hold
+        { 240,   3, true,  false },
         { 290,   3, false, false },
-        { 300,   2, true,  true  },   // P2 left press (orphan, no release)
-        { 4000,  1, true,  false },   // long gap (~11 s @ 360)
+        { 300,   2, true,  true  },
+        { 4000,  1, true,  false },
         { 4001,  1, false, false },
     };
     macro.sortActions();
 
-    // The fixture above must actually exercise the press/release pairing: a
-    // macro that degenerates into only orphan releases (which is what a
-    // swapped pressed/player2 produced) round-trips fine but replays nothing.
     size_t presses = 0;
     for (const auto& action : macro.actions)
         if (action.pressed) ++presses;
@@ -1468,17 +1235,12 @@ bool selfTest() {
         return false;
     }
 
-    // Re-encoding must be stable: identical input, identical bytes.
     const auto reencoded = encode(*decoded);
     if (reencoded != bytes) {
         skkbot2::log::error("[SKC] self-test: re-encode is not byte-stable");
         return false;
     }
 
-    // Accuracy modes are gone from the wire: SKC is vanilla-only. This guard
-    // checks the two directions that matter now - a vanilla macro keeps the
-    // legacy wire shape unchanged, and flags/marks from an older macro never
-    // reach the wire (they decode back into the same vanilla macro).
     {
         if (decoded->cbsMode || decoded->cosMode || decoded->subtickEncoded ||
             encode(*decoded) != bytes) {
@@ -1508,13 +1270,6 @@ bool selfTest() {
         }
     }
 
-    // Timing mode is the same kind of sparse metadata: Lock Delta is the
-    // default and must stay FREE (every legacy .skc decodes to it), while the
-    // non-default Real Time choice pays for the escape + modes bytes and has to
-    // round-trip exactly. This is the regression guard: `lockDeltaMode`
-    // defaults to true, so a naive `lockDeltaMode || realTimeMode` check grew
-    // every new file by two header bytes and older builds - whose modes mask
-    // does not know the bit - refused the file.
     {
         Macro rt = macro;
         rt.lockDeltaMode = false;
@@ -1537,19 +1292,11 @@ bool selfTest() {
         }
     }
 
-    // The other direction: a macro that declares neither rate must not grow a
-    // tail. Every existing .skc on disk is in that state, and eight bytes per
-    // file is the whole difference between "the format got 4% bigger" and "it
-    // didn't". This is the check that keeps the feature free for the macros
-    // that never use it.
     {
         Macro plain = macro;
         plain.header.tps = kDefaultTps;
         plain.header.fps = 0.0f;
         const auto plainBytes = encode(plain);
-        // Same payload, header only 3 bytes instead of 11. Comparing against
-        // `bytes.size() - kTpsBytes` is the whole claim: nothing about the
-        // stream moved, only the tail went away.
         if (plainBytes.size() != bytes.size() - kTpsBytes) {
             skkbot2::log::error("[SKC] self-test: default-rate macro is {} B, "
                                 "expected {}", plainBytes.size(),
@@ -1565,18 +1312,11 @@ bool selfTest() {
         }
     }
 
-    // The THIRD state: FPS was on and equal to the tick rate. It has to survive
-    // as -0.0, and it must cost its own tail at the default tps - otherwise the
-    // playback side cannot tell "follow tps" from "FPS was off", which is the
-    // whole distinction this state exists for. -0.0 == +0.0, so both ends have
-    // to be tested with signbit.
     {
         Macro follow = macro;
         follow.header.tps = kDefaultTps;
         follow.header.fps = -0.0f;
         const auto followBytes = encode(follow);
-        // The tail must be there: a default-tps macro with no display rate is
-        // the 3-byte header, and this one is 8 bytes longer.
         Macro followPlain = follow;
         followPlain.header.fps = 0.0f;
         const auto followPlainBytes = encode(followPlain);
@@ -1600,11 +1340,6 @@ bool selfTest() {
         }
     }
 
-    // The platformer flag is an extension byte, not a new knob. It has to cost
-    // exactly one byte, survive the round-trip, and - the part that matters -
-    // leave a classic macro byte-identical: every .skc already on disk is
-    // classic and unextended, and the decoder must read that as "unknown"
-    // rather than "classic".
     {
         if (decoded->platformerKnown) {
             skkbot2::log::error("[SKC] self-test: unextended macro decoded as a "
@@ -1637,8 +1372,6 @@ bool selfTest() {
             return false;
         }
 
-        // And the same with no rate tail: the extension must not be confused
-        // with the payload when it is the only byte after the knobs.
         Macro platformerPlain = platformer;
         platformerPlain.header.tps = kDefaultTps;
         platformerPlain.header.fps = 0.0f;
@@ -1653,12 +1386,8 @@ bool selfTest() {
         }
     }
 
-    // Canonicalisation: an importer that fills fps with the tick rate must end
-    // up as the marker, not as a pinned number. Playback of the second form
-    // turns FPS on at a fixed rate instead of following tps - the same display
-    // in the common case, a different instruction in the contract.
     {
-        Macro equal = macro;  // tps 360
+        Macro equal = macro;
         equal.header.fps = 360.0f;
         const auto equalBytes = encode(equal);
         auto equalBack = decode(equalBytes.data(), equalBytes.size());
@@ -1670,9 +1399,6 @@ bool selfTest() {
         }
     }
 
-    // Fractional TPS wire contract. Values exactly representable by float32
-    // retain the existing 8-byte tail; 144.144 requires the double escape. All
-    // three must survive byte-stable encode/decode without losing digits.
     {
         for (const auto [tps, expectedTail] : {
                  std::pair<double, size_t>{240.5, kTpsBytes},
@@ -1711,28 +1437,16 @@ bool selfTest() {
         }
     }
 
-    // gapSplitSafe() must track previousHold exactly the way the ENCODER does:
-    // only a Paired click advances it, because only a Paired click carries a
-    // hold. The check used to advance it on every click, so a PressOnly click
-    // (hold 0) reset it - and a gap measured from a release still in the past
-    // then passed a check the encoder could not honour. The fixture below is
-    // that shape, and the wrong answer is not merely "a different scheme": the
-    // FromRelease candidate would code kGapSignBit + 39990 = 72758, which no
-    // longer fits the 15 magnitude bits, so a click would come back on another
-    // frame the moment that candidate won the size comparison. Verified to
-    // fail: with the old tracking restored the check accepts this macro and
-    // this self-test reports failure.
     {
         Macro trap;
         trap.header.tps = kDefaultTps;
         trap.header.fps = 0.0f;
         trap.actions = {
-            { 0,     1, true,  false },  // A press
-            { 40000, 1, false, false },  // A release: Paired, hold 40000
-            { 40100, 2, true,  false },  // B: PressOnly, hold 0
-            { 40110, 3, true,  false },  // C press: gap from A's release is
-                                         // 10 - 40000 = -39990, past the sign bit
-            { 40120, 3, false, false },  // C release
+            { 0,     1, true,  false },
+            { 40000, 1, false, false },
+            { 40100, 2, true,  false },
+            { 40110, 3, true,  false },
+            { 40120, 3, false, false },
         };
         trap.sortActions();
         if (gapSplitSafe(trap)) {
@@ -1748,8 +1462,6 @@ bool selfTest() {
                                 "round-trip through the fallback");
             return false;
         }
-        // And the refusal has to have reached the file: this macro can only be
-        // coded press-to-press.
         if (((trapBack->header.knobs2 >> 6) & 0x01u) != 0u) {
             skkbot2::log::error("[SKC] self-test: refused-scheme macro was still "
                                 "coded from the previous release");
@@ -1757,11 +1469,6 @@ bool selfTest() {
         }
     }
 
-    // The wide escape: the value model codes 0..255 in a 256-symbol row and
-    // everything above it through a uniform byte alphabet, where values at or
-    // above 0x10000 set a flag and spend four bytes instead of two. A macro
-    // whose largest number is 40100 never touches that branch, and long silences
-    // are ordinary in real macros (one real file reaches frame 93032).
     {
         Macro wide;
         wide.header.tps = kDefaultTps;
@@ -1769,7 +1476,7 @@ bool selfTest() {
         wide.actions = {
             { 0,     1, true,  false },
             { 5,     1, false, false },
-            { 70000, 2, true,  false },  // anchor delta 70000 >= 0x10000
+            { 70000, 2, true,  false },
             { 70005, 2, false, false },
         };
         wide.sortActions();
@@ -1787,9 +1494,6 @@ bool selfTest() {
         }
     }
 
-    // LZ phrase prediction self-test: verify that a highly repetitive spam macro
-    // enables lzMode, achieves dramatic compression, and round-trips 100% losslessly
-    // with byte stability.
     {
         Macro repeating;
         repeating.header.tps = 240.0;
@@ -1815,19 +1519,14 @@ bool selfTest() {
         }
     }
 
-    // Report the WIRE payload, not bytes.size() - sizeof(Header): the header is
-    // packed to 17 bytes in memory (two bools for the mode) but only 3/4/11/12
-    // on the wire, and the difference is not payload.
     size_t wireHeader = kHeaderFixed;
     if ((bytes[0] & 0x3Fu) == kCtxExtension) wireHeader += kExtBytes;
     if ((bytes[2] & 0x80u) != 0u) wireHeader += kTpsBytes;
     const size_t payloadBytes = bytes.size() - wireHeader;
 
-    // A good sanity number: 9 events must cost well under 40 bytes.
     const double bytesPerEvent =
         static_cast<double>(payloadBytes) / macro.actions.size();
 
-    // The validator must ACCEPT the fixture above (it is well formed)...
     std::string reason;
     if (!validateActions(macro.actions, reason)) {
         skkbot2::log::error("[SKC] self-test: validator rejected a GOOD stream: {}",
@@ -1835,14 +1534,11 @@ bool selfTest() {
         return false;
     }
 
-    // ...and REJECT the exact corruption a practice respawn produces. This is
-    // the shape every unusable macro so far had: a press whose release was
-    // lost when the frame clock jumped back, leaving two downs in a row.
     const std::vector<Action> corrupt = {
-        { 100, 1, true,  false },   // press
-        { 150, 1, false, false },   // release
-        { 200, 1, true,  false },   // press
-        { 374, 1, true,  false },   // press again with no release in between
+        { 100, 1, true,  false },
+        { 150, 1, false, false },
+        { 200, 1, true,  false },
+        { 374, 1, true,  false },
         { 412, 1, false, false },
     };
     if (validateActions(corrupt, reason)) {
@@ -1850,7 +1546,6 @@ bool selfTest() {
         return false;
     }
 
-    // Frames must not go backwards (the delta coder assumes they don't).
     const std::vector<Action> backwards = {
         { 400, 1, true,  false },
         { 300, 1, false, false },
@@ -1860,7 +1555,6 @@ bool selfTest() {
         return false;
     }
 
-    // A trailing hold is legal - the player pressed and never let go.
     const std::vector<Action> trailingHold = {
         { 100, 1, true, false },
         { 150, 1, false, false },
@@ -1872,18 +1566,12 @@ bool selfTest() {
         return false;
     }
 
-    // A LEADING release is the standard "buttons are up at frame 0" baseline
-    // and must stay legal - it is exactly what the fixture above starts with,
-    // and actionsToClicks encodes it as ReleaseOnly. Assert it separately so a
-    // future tightening of the validator cannot silently reject every real
-    // macro at save time again.
     if (!validateActions({ { 0, 1, false, false } }, reason)) {
         skkbot2::log::error("[SKC] self-test: validator rejected the leading release baseline: {}",
                             reason);
         return false;
     }
 
-    // ...but a stray SECOND release on a channel that already cycled is not.
     if (validateActions({ { 0, 1, false, false },
                           { 10, 1, true,  false },
                           { 20, 1, false, false },
@@ -1912,20 +1600,8 @@ bool decodeWith(const uint8_t* data, size_t size, const Variant& variant,
     if (!decodeClicks(data, size, clicks, variant)) return false;
     Macro macro;
     macro.actions = clicksToActions(clicks);
-    // Must be the same order encode() would produce. Adding tie-breakers here
-    // reorders actions that share a frame and makes a perfectly good round-trip
-    // look lossy - which is exactly what it did to two of the seven macros
-    // before this was fixed.
     macro.sortActions();
 
-    // What the magic used to do, one level down. With no signature in the bytes
-    // the header check only proves the knobs are in range, and range is all it
-    // can prove: 'AST9' happens to give three bytes that decode into a legal
-    // knob set. So the stream itself has to be what rejects the file. A macro
-    // that survives this is one whose clicks pair up, run forward and stay in
-    // range - arbitrary bytes essentially never do, which makes this a better
-    // discriminator than a two-byte constant was: it checks the whole file
-    // rather than its first two bytes.
     std::string reason;
     if (!validateActions(macro.actions, reason, true)) return false;
 
@@ -1938,20 +1614,6 @@ bool gapSplitSafe(const Macro& macro) {
     int64_t previousHold = 0;
     for (const auto& click : clicks) {
         const int64_t gap = static_cast<int64_t>(click.delta) - previousHold;
-        // Two bounds, and both were wrong in different directions.
-        //
-        // The low one admitted exactly -kGapSignBit, which encodes as
-        // kGapSignBit + kGapSignBit = 65536 and comes back masked to 15 bits -
-        // the click lands at the wrong frame. The decoder reconstructs the sign
-        // from the top bit and the magnitude from the low 15, so the magnitude
-        // must be strictly below the sign bit.
-        //
-        // The tracking one used to advance previousHold on EVERY click, while
-        // the encoder (and the decoder) only advance it after a Paired click:
-        // a PressOnly click carries hold 0 and must leave the previous release
-        // where it was. With a large hold behind it the check therefore passed
-        // gaps the encoder could not represent - the exact shape of "gapSplitSafe
-        // says yes, the encoder silently differs".
         if (gap >= static_cast<int64_t>(kGapSignBit) ||
             gap <= -static_cast<int64_t>(kGapSignBit))
             return false;
@@ -1959,4 +1621,4 @@ bool gapSplitSafe(const Macro& macro) {
     }
     return true;
 }
-} // namespace skk::skc
+}

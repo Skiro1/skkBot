@@ -17,30 +17,12 @@
 #include <algorithm>
 #include <cmath>
 
-// ---------------------------------------------------------------------------
-// Autosave while recording.
-//
-// Shape copied from ReplayEngine::saveActiveMacro (checkpoint_system.cpp):
-// snapshot on the game thread, serialize + compress + write on a detached
-// worker, single-flight guard so slow snapshots throttle the trigger instead
-// of stacking threads.
-//
-// Deliberately narrower than the real save:
-//   * no captureVarianceSnapshot / staging flush / practice-checkpoint
-//     materialization - those mutate live recording state and a rescue file
-//     must never be allowed to distort the stream it evacuates;
-//   * no name-bumping in the directory - the autosave name is fixed
-//     (`<level>_autosave`), so the file always means "the current/latest
-//     recording with that name" and never piles up _1, _2, _3 copies;
-//   * writeBinarySafe / saveToFile keep atomic-replace semantics, so a crash
-//     mid-write cannot truncate a previous good snapshot.
-// ---------------------------------------------------------------------------
 
 namespace skkbot2::autosave {
 
 namespace {
 
-bool g_cachedEnabled = false; // default OFF (user request, 31.10)
+bool g_cachedEnabled = false;
 bool g_cachedLoaded = false;
 
 std::atomic<bool> g_skkJob{false};
@@ -48,12 +30,11 @@ std::atomic<bool> g_skcJob{false};
 SnapshotWriteOrder g_skkWriteOrder;
 SnapshotWriteOrder g_skcWriteOrder;
 
-// Main-thread-only (every call site is applyCustomTickPlan / GUI).
 double g_lastSkk = -1.0e9;
 double g_lastSkc = -1.0e9;
 
-constexpr double kSkkInterval = 10.0; // wall seconds between SKK snapshots
-constexpr double kSkcInterval = 5.0;  // SKC encode is cheaper, refresh faster
+constexpr double kSkkInterval = 10.0;
+constexpr double kSkcInterval = 5.0;
 
 double nowSeconds() {
     return std::chrono::duration<double>(
@@ -69,11 +50,9 @@ fs::path directoryPrepared(std::error_code& ec) {
     return dir;
 }
 
-} // namespace
+}
 
 bool enabled() {
-    // Lazy one-time load of the persisted toggle: the first tick may happen
-    // before the settings UI ever runs.
     if (!g_cachedLoaded) {
         g_cachedLoaded = true;
         g_cachedEnabled = Mod::get()->getSavedValue<bool>("gui_autosave_record", false);
@@ -92,16 +71,6 @@ std::string skcAutosaveName() {
     return skkAutosaveName();
 }
 
-// ---------------------------------------------------------------------------
-// Rescue name = the live level's name (user request, 31.10: "автосейв
-// берет название уровня") + "_autosave". Sanitized for the filesystem exactly
-// like the render-video file names in renderer.cpp: control bytes and the
-// Windows-forbidden set collapse to '_', whitespace/dots at the edges are
-// trimmed (Windows names may not end with a dot), the length is capped on an
-// UTF-8 boundary. A name that sanitizes away to nothing falls back to the
-// mod's own plain "autosave" - never the macro name (the file means "this
-// LEVEL's rescue snapshot", not "someone's finished macro").
-// ---------------------------------------------------------------------------
 std::string skkAutosaveName() {
     std::string raw;
     if (auto* playLayer = PlayLayer::get()) {
@@ -126,7 +95,6 @@ std::string skkAutosaveName() {
     while (!raw.empty() && isEdge(raw.front())) raw.erase(raw.begin());
     while (!raw.empty() && isEdge(raw.back())) raw.pop_back();
 
-    // Byte cap generous for localized names; cut on a UTF-8 boundary.
     constexpr size_t kMaxBytes = 96;
     if (raw.size() > kMaxBytes) {
         size_t cut = kMaxBytes;
@@ -139,11 +107,6 @@ std::string skkAutosaveName() {
     return raw + "_autosave";
 }
 
-// ---------------------------------------------------------------------------
-// SKK: snapshot the whole live SkMacro (per-frame layout included), set the
-// write metadata exactly like saveActiveMacro does, then serialize + write
-// off-thread. A several-MB .skk costs nothing on the game loop this way.
-// ---------------------------------------------------------------------------
 static void skkWriteSnapshot(std::shared_ptr<SkMacro> snapshot, uint64_t revision) {
     const bool ran = g_skkWriteOrder.run(revision, snapshot->name, [&]() {
         std::error_code ec;
@@ -151,7 +114,6 @@ static void skkWriteSnapshot(std::shared_ptr<SkMacro> snapshot, uint64_t revisio
         bool ok = false;
         if (!ec) {
             normalizeSkPersistenceTiming(*snapshot);
-            // Длительность вычисляется по тому же правилу, что при обычном save.
             snapshot->duration = 0.0;
             double safeFramerate = std::isfinite(snapshot->framerate) &&
                                            snapshot->framerate > 0.0
@@ -195,8 +157,6 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
         return;
     }
 
-    // Cheap vector copies on the game thread; zstd + write on a worker (or
-    // inline when sync - a flush at stop must not race the game closing).
     std::shared_ptr<SkMacro> snapshot =
         std::make_shared<SkMacro>(*engine->activeSk);
     engine->appendCaptureStagingTo(*snapshot);
@@ -208,15 +168,11 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
             snapshot->inputs.size(), snapshot->perFrames.size(),
             snapshot->persistenceAttempts.size(), snapshot->varianceOverrides.size());
     }
-    // "Save Seed" decision frozen at snapshot time (game thread): the
-    // worker serializes off-thread and must not read the saved store.
     snapshot->wireSeedStamp =
         geode::Mod::get()->getSavedValue<bool>("gui_record_seed", true) ? 1 : -1;
     snapshot->author = GJAccountManager::get()->m_username;
     snapshot->recordTimestamp = static_cast<int64_t>(std::time(nullptr));
     snapshot->fileFormat = SkFileFormat::SKK3;
-    // Level-based rescue name, resolved on the MAIN thread (PlayLayer read);
-    // the worker only serializes + writes what it was handed.
     snapshot->name = skkAutosaveName();
     const auto revision = g_skkWriteOrder.issue();
 
@@ -227,8 +183,6 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
 
     bool expected = false;
     if (!g_skkJob.compare_exchange_strong(expected, true)) {
-        // Previous snapshot still serializing: the next tick fires again, and
-        // the delay only grows with the recording - the right back-pressure.
         return;
     }
     std::thread([snapshot = std::move(snapshot), revision]() mutable {
@@ -237,13 +191,6 @@ static void skkSnapshot(ReplayEngine* engine, bool sync = false) {
     }).detach();
 }
 
-// ---------------------------------------------------------------------------
-// SKC: the Action stream is tiny (input-only format), so the snapshot copy is
-// free; encode + atomic replace still run off-thread for uniformity.
-// No validateActions() here: this is a rescue file, and a mid-hold practice
-// seam that the validator would refuse at a real SAVE is exactly the data
-// worth keeping alive.
-// ---------------------------------------------------------------------------
 static void skcWriteSnapshot(std::shared_ptr<skk::skc::Macro> snapshot,
                              const std::string& name, uint64_t revision) {
     const bool ran = g_skcWriteOrder.run(revision, name, [&]() {
@@ -267,24 +214,17 @@ static void skcWriteSnapshot(std::shared_ptr<skk::skc::Macro> snapshot,
 
 static void skcSnapshot(skk::skc::Bot& bot, bool sync = false) {
     std::size_t count = bot.getInputCount();
-    // BUG-140: count не описывает содержимое команд/RNG после ресторов.
-    // Пустой Stop-снимок тоже должен заменить старую непустую попытку.
     if (count == 0 && !sync) return;
 
-    // Level-based rescue name, resolved on the MAIN thread (PlayLayer read).
     const std::string rescueName = skcAutosaveName();
     std::shared_ptr<skk::skc::Macro> snapshot =
         std::make_shared<skk::skc::Macro>(bot.getMacro());
-    // "Save Seed" decision frozen at snapshot time (game thread): the
-    // worker serializes off-thread and must not read the saved store.
     snapshot->wireSeedStamp =
         geode::Mod::get()->getSavedValue<bool>("gui_record_seed", true) ? 1 : -1;
 
     const auto revision = g_skcWriteOrder.issue();
 
     if (sync) {
-        // Flush-at-stop path: write inline so closing the game right after
-        // Stop cannot kill the write (a detached thread dies with it).
         skcWriteSnapshot(std::move(snapshot), rescueName, revision);
         return;
     }
@@ -300,13 +240,6 @@ static void skcSnapshot(skk::skc::Bot& bot, bool sync = false) {
 }
 
 void tickRecording() {
-    // BUG (04.11): g_cachedEnabled стартует false, а ленивая загрузка из
-    // saved.json живёт только внутри enabled() - который тик-путь не вызывает
-    // (его вызывает лишь GUI-тумблер в момент клика). Сессия, начатая после
-    // перезапуска игры с уже включённым автосейвом, молча не писала ничего:
-    // ни периодические снапшоты, ни флаш при Stop (в логе сессии 12:08 нет ни
-    // одной строки [AUTOSAVE] при gui_autosave_record=true). Загружаем через
-    // enabled() - тот самый ленивый вход.
     if (!enabled()) return;
 
     auto* engine = ReplayEngine::get();
@@ -335,19 +268,14 @@ void tickRecording() {
 void flushRecording() {
     if (!enabled()) return;
 
-    // Fire both engines immediately and SYNCHRONOUSLY: this is the stop/exit
-    // moment, a detached worker would race the game closing and the rescue
-    // file would never land (the exact "stop did not save" report, 04.11).
-    // BUG-140: Stop и worker проходят общий writer. Atomic replace сам по себе
-    // не предотвращает позднее затирание свежего снимка старым.
     auto* engine = ReplayEngine::get();
     auto& bot = skk::skc::Bot::get();
     if (bot.isRecording()) {
-        skcSnapshot(bot, /*sync=*/true);
+        skcSnapshot(bot, true);
     }
     if (engine && engine->engineMode == MODE_CAPTURE) {
-        skkSnapshot(engine, /*sync=*/true);
+        skkSnapshot(engine, true);
     }
 }
 
-} // namespace skkbot2::autosave
+}

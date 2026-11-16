@@ -168,8 +168,6 @@ SkPracticeFixCheckpoint bundleToWire(
     if (bundle.hasWireBrokenObjects) {
         w.brokenObjectUIDs = bundle.wireBrokenObjectKeys;
     } else if (auto* pl = PlayLayer::get(); pl && pl->m_objects) {
-        // m_objectID — тип блока, не идентичность. Отрицательный ключ задаёт
-        // индекс в неизменном массиве объектов уровня; positive legacy — тип.
         for (auto* obj : bundle.brokenObjects) {
             for (unsigned i = 0; obj && i < pl->m_objects->count(); ++i) {
                 if (pl->m_objects->objectAtIndex(i) == obj) {
@@ -205,7 +203,6 @@ CheckpointStateBundle wireToBundle(
     bundle.hasFullState = true;
     copyWireToFullP1(wire, bundle.fullP1);
     copyWireToFullP2(wire, bundle.fullP2);
-    // Reduced P2 несёт собственный isSecondPlayer; complete P2 в wire нет.
     bundle.hasFullPlayer2 = (wire.p2_flags1 & (1ull << 30)) != 0;
 
     bundle.hasWireBrokenObjects = true;
@@ -238,8 +235,6 @@ void resolveBrokenObjects(CheckpointStateBundle& bundle, GJBaseGameLayer* pl) {
                         match = obj;
                     }
                 }
-                // Старый файл не различает одинаковые блоки: не отключаем
-                // случайный первый объект и явно сообщаем потерю покрытия.
                 if (match && !ambiguous) { bundle.brokenObjects.push_back(match); found = true; }
             }
         }

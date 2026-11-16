@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <cstring>
 
-// Отдельный диагностический формат, не часть SKK: точные IEEE-биты обоих
-// игроков и хронологические trim/wipe/reseal. Никаких записей в состояние GD.
 namespace skkbot2::seam_journal {
 enum class Kind : uint32_t { Sample = 1, Seal = 2, Trim = 3, Wipe = 4, End = 5, Gap = 6 };
 struct Player {
@@ -26,7 +24,6 @@ inline auto encode(Event const& event) {
     std::array<uint8_t, kRowBytes> bytes{};
     size_t offset = 0;
     auto put = [&](auto value) {
-        // Поддерживаемые Geode платформы little-endian; скалярные IEEE-типы.
         std::memcpy(bytes.data() + offset, &value, sizeof(value));
         offset += sizeof(value);
     };
