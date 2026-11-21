@@ -14,3 +14,5 @@ dist/
 remove_all_comments.bat
 __pycache__/
 *.pyc
+release.bat
+remove_all_comments.bat
