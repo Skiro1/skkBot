@@ -276,6 +276,8 @@ bool skk::ttrl::toSkcMacro(const skk::ttrl::Replay& replay, skc::Macro& out,
     out.platformerKnown = true;
     out.header.platformerMode = out.platformerMode;
     out.header.platformerKnown = true;
+    out.physics21 = true;
+    out.header.physics21 = true;
     out.actions.reserve(replay.actions.size());
 
     std::size_t droppedRelease = 0, droppedDuplicate = 0;

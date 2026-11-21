@@ -126,6 +126,8 @@ bool skk::re4::toSkcMacro(const skk::re4::Replay& replay, skc::Macro& out,
 
     out = skc::Macro{};
     out.header.tps = replay.tps;
+    out.physics21 = true;
+    out.header.physics21 = true;
     out.actions.reserve(replay.actions.size());
 
     std::size_t droppedRelease = 0, droppedDuplicate = 0;

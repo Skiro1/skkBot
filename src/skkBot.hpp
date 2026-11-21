@@ -17,6 +17,7 @@
 #include "core/step_profiler.hpp"
 #include "hacks/autoclicker.hpp"
 #include "hacks/physicsbypass.hpp"
+#include "hacks/physics21.hpp"
 #include "gui/skkbot_gui.hpp"
 #include "render/renderer.hpp"
 
@@ -403,6 +404,9 @@ public:
     int captureReleaseSuppressUntil = 0;
     uint64_t gravProbeLast = 0;
     int perFrameReconciliationCatchUps = 0;
+
+    size_t multiCommandTicks = 0;
+    int firstMultiCommandTick = 0;
     int gravDiffReports = 0;
 
     static constexpr int kGravDiffReportCap = 40;
@@ -444,6 +448,8 @@ public:
 
     AccuracyMode selectedAccuracyMode = AccuracyMode::Vanilla;
     bool cosEnabled = false;
+    bool physics21 = false;
+    bool m_savedPhysics21 = false;
     int tickStartStep = 0;
     int lastStepDelta = -1;
     double tickStartTimestamp = 0.0;
@@ -825,6 +831,7 @@ public:
         auto const& gui = skkbot2::gui::get();
         activeMacro->lockDelta = gui.lockDelta && !gui.realTime;
         activeMacro->realTime = gui.realTime && !gui.lockDelta;
+        activeMacro->physics21 = this->physics21;
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeMacro->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeMacro->hasPlatformerModeMetadata = true;
@@ -850,6 +857,7 @@ public:
         auto const& gui = skkbot2::gui::get();
         activeSk->lockDelta = gui.lockDelta && !gui.realTime;
         activeSk->realTime = gui.realTime && !gui.lockDelta;
+        activeSk->physics21 = this->physics21;
         if (auto* playLayer = PlayLayer::get(); playLayer && playLayer->m_levelSettings) {
             activeSk->platformerMode = playLayer->m_levelSettings->m_platformerMode;
             activeSk->twoPlayerMode = playLayer->m_levelSettings->m_twoPlayerMode;
@@ -1225,6 +1233,17 @@ public:
                 executeIndex, activeSk->inputs.size(), playDriftMax, playDriftMaxTick,
                 renderDriftMax, renderDriftMaxTick,
                 processSliceSkips, cbsImmediateCount, cbsQueueNativeCount, cbsWaitCount);
+        }
+        if (engineMode == MODE_EXECUTE) {
+            if (this->physics21 != m_savedPhysics21) {
+                this->physics21 = m_savedPhysics21;
+                Mod::get()->setSavedValue("gui_21_physics", m_savedPhysics21);
+                skkbot2::log::info("[SKK] playback ended: restored user physics 2.1 mode: {}",
+                    m_savedPhysics21 ? "ON" : "OFF");
+                if (auto* pl = PlayLayer::get()) {
+                    skkbot2::physics21::syncState(pl);
+                }
+            }
         }
         logTimingEpilogues();
         skkbot2::dumpPlayerInputTally("run ended");
@@ -1667,6 +1686,24 @@ bool syncAccuracyFromGame() {
             skkbot2::log::info(
                 "[SKK] playback timing mode: {} (from the macro, menu follows)",
                 gui.realTime && !gui.lockDelta ? "Real Time" : "Lock Delta");
+
+            const bool macroPhysics21 =
+                (skMode && activeSk) ? activeSk->physics21
+                                     : (activeMacro ? activeMacro->physics21 : false);
+            m_savedPhysics21 = this->physics21;
+            if (this->physics21 != macroPhysics21) {
+                this->physics21 = macroPhysics21;
+                Mod::get()->setSavedValue("gui_21_physics", macroPhysics21);
+                skkbot2::log::info(
+                    "[SKK] playback physics 2.1 mode restored from macro: {}",
+                    macroPhysics21 ? "ON" : "OFF");
+                if (auto* pl = PlayLayer::get()) {
+                    skkbot2::physics21::syncState(pl);
+                }
+            }
+            skkbot2::log::info(
+                "[SKK] playback physics mode: {} (from the macro)",
+                macroPhysics21 ? "2.1" : "2.2");
             skkbot2::debug::profilerStart("skk-play");
             dropCarry();
         }
@@ -1890,6 +1927,7 @@ bool syncAccuracyFromGame() {
         playLayer->m_randomSeed = seed;
         playLayer->m_replayRandSeed = seed;
         GameToolbox::fast_srand(seed);
+        skk::advRandomReseed(seed);
     }
 
     void captureVarianceSnapshot() {
@@ -1972,11 +2010,32 @@ bool syncAccuracyFromGame() {
         }
 
         if (canUsePersistenceCapture()) {
+            auditSameTickMultiCommand(persistenceCaptureAttempt.inputs, tick, button, player2, pressed);
             activeSk->recordAction(persistenceCaptureAttempt.inputs, tick, button, player2, pressed, offset, cbsTimeOffset);
         } else if (captureStaging) {
+            auditSameTickMultiCommand(captureStaging->inputs, tick, button, player2, pressed);
             captureStaging->recordAction(tick, button, player2, pressed, offset, cbsTimeOffset);
         } else {
+            auditSameTickMultiCommand(activeSk->inputs, tick, button, player2, pressed);
             activeSk->recordAction(tick, button, player2, pressed, offset, cbsTimeOffset);
+        }
+    }
+
+    void auditSameTickMultiCommand(std::vector<SkInput> const& list,
+                                   int tick, int button, bool player2,
+                                   bool pressed) {
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            if (it->tick != tick) break;
+            if (it->actionType != button || it->isPlayer2() != player2) continue;
+            ++multiCommandTicks;
+            if (firstMultiCommandTick == 0) firstMultiCommandTick = tick;
+            if (multiCommandTicks <= 32) {
+                skkbot2::log::info(
+                    "[SKK] record: tick={} carries another btn={} p2={} command "
+                    "(down={}) - fast click in one step ({} such tick(s) so far)",
+                    tick, button, player2, pressed, multiCommandTicks);
+            }
+            return;
         }
     }
 

@@ -9,6 +9,15 @@
 #include <thread>
 #include <vector>
 #include <limits>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -133,6 +142,9 @@ namespace MovingObjects {
 		MoveThreads() {
 			for (unsigned i = 0; i < HELPERS; ++i)
 				std::thread([this] {
+#ifdef _WIN32
+					SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
 					helper_loop();
 				}).detach();
 		}
@@ -186,9 +198,11 @@ namespace MovingObjects {
 		unsigned count = 0;
 		while (count < size && objects[count])
 			++count;
-		std::vector<void*> sorted(objects, objects + count);
-		std::sort(sorted.begin(), sorted.end());
-		bool unique = std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end();
+		static thread_local std::vector<void*> s_sorted;
+		s_sorted.clear();
+		s_sorted.insert(s_sorted.end(), objects, objects + count);
+		std::sort(s_sorted.begin(), s_sorted.end());
+		bool unique = std::adjacent_find(s_sorted.begin(), s_sorted.end()) == s_sorted.end();
 		checked = { array, group_version, size, unique && count == size };
 		return unique ? count : 0;
 	}

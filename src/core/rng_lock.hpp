@@ -32,6 +32,8 @@ TripleRngState captureTripleRng();
 
 void restoreTripleRng(TripleRngState const& state);
 
+uint64_t currentAttemptSeed();
+
 void advRandomRegister(uint64_t* statePtr, int uniqueID);
 void advRandomReseed(uint64_t seedBase);
 void advRandomRestore(std::vector<uint64_t> const& savedStates);

@@ -11,6 +11,9 @@ that replaces the cocos frontend of the old skkBot.
 - **Accuracy levels**: Vanilla and CBS (Click-Between-Steps) + COS helper (vanilla GD
   mechanics, applied natively). External accuracy mods (SIP, Click-Between-Frames) are
   declared as incompatibilities
+- **2.1 Physics (BETA)**: toggle in Settings -> Accuracy. Re-enables authentic GD 2.1 physics
+  (ship gravity bug, 2D slerp ship rotation, 1.75x flip velocity boost, 11.18 ring jump height,
+  robot pad jump reset, dual repell disable), with macro preservation and automatic detection on foreign imports
 - **Triple RNG lock** (shake + teleport + per-object 2068), velocity fix (always on),
   gravity/up-down/dash state correction from player-visual bits
 - **Per-frame persistence-attempt** recording + playback, practice-mode support,
@@ -24,6 +27,8 @@ that replaces the cocos frontend of the old skkBot.
     from mid-level; stores the attempt seed for bit-exact RNG; v5 compression).
   - **Third-Party Formats (Playback only)**: Echo (`.echo`), Astral (`.ast`), GucciBot (`.gbr`), GDR2 (MegaHack, EclipseMenu) (`.gdr2`), GDH (`.re4`), Neverhook (`.nhm`), Silicate (`.slc`), ToastyReplay Lite (`.ttrl`), Xenon (`.xe`). External physics injection is safely ignored.
 - **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output,
+  **CUDA Zero-Copy Direct Interop** (zero-overhead VRAM -> NVENC transfer), **Fast Render mode**
+  (uncapped FPS, up to 1.28x realtime on 4K 130 Mbps),
   full encoder list (libx264, libx265, NVENC, AMF, QSV, AV1, VP9/VP8, MPEG-4, ProRes,
   MJPEG, ...), presets 144p–8K, 1–240 FPS, bitrate 5–300 Mbps, video + audio fade in/out,
   speedhack during render, live render monitor; audio AAC/MP3/Opus/Vorbis/

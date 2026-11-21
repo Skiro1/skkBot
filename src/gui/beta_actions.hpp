@@ -152,6 +152,21 @@ inline bool importForeignMacroIntoSkc(std::string const& ext,
             dropCarry();
             skkbot2::log::info("skkBot2: foreign import -> Timing Mode REAL TIME (auto)");
         }
+        if (auto* engine = ReplayEngine::get()) {
+            if (macro.physics21 || macro.header.physics21) {
+                macro.physics21 = true;
+                macro.header.physics21 = true;
+                engine->physics21 = true;
+                Mod::get()->setSavedValue("gui_21_physics", true);
+                if (auto* pl = PlayLayer::get()) {
+                    skkbot2::physics21::syncState(pl);
+                }
+                skkbot2::log::info("skkBot2: foreign import -> 2.1 Physics enabled (auto)");
+            } else if (engine->physics21) {
+                macro.physics21 = true;
+                macro.header.physics21 = true;
+            }
+        }
         return skk::skc::Bot::get().adopt(std::move(macro), n, levelId, levelName);
     };
 

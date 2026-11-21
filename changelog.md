@@ -1,3 +1,23 @@
+# v0.1.5 (2026-11-21)
+2.1 Physics support (Beta), renderer speedup (CUDA Zero-Copy & Fast Render), Record & Play enhancements for SKK/SKC, GUI fixes, and Geode v6.0.0-beta.1 update.
+
+## New
+- **2.1 Physics (BETA)**: toggle in Settings -> Accuracy. Restores authentic GD 2.1 physics: upside-down ship gravity bug, 2D slerp ship rotation, 1.75x vertical velocity flip impulse (gravity portals/orbs/pads), exact 11.18 ring jump height, robot pad high-jump reset, dual repell disable, and isolated clean wave rotation. *Note: this feature is in beta and may occasionally break on specific complex layouts.*
+- **Physics 2.1 in Macros**: 2.1 Physics state is serialized and preserved in both SKK (.skk3) and SKC (.skc) macros; foreign imports (RE4, TTRL, legacy Echo, GDR2) automatically recognize and enable 2.1 physics.
+- **Fast Render**: renders at maximum uncapped speed (up to 1.28x realtime on 4K 130 Mbps HEVC) by bypassing monitor VSync and window blit while keeping pause menu accessible.
+- **CUDA Zero-Copy Interop for Render**: direct VRAM -> NVENC hardware frame transfer without CPU memcpy bottlenecks (`copy = 0.000 ms`).
+- **Updated to Geode v6.0.0-beta.1**: full compatibility with the latest Geode beta release.
+
+## Improvements
+- **Improved Renderer**: asynchronous audio encoding moved off the main thread, thread priority rebalancing (encoder elevated, mover threads relaxed), movable objects memory reallocation eliminated.
+- **Improved SKC and SKK Record & Play**: robust practice checkpoint store/restore synchronization, boundary deduplication, exact header mode reconstruction.
+
+## Fixes
+- **Fixed bot menu (GUI)**: dropdown lists (Resolution, Codecs, Fonts) no longer detach or float away when scrolling with mouse wheel or scrollbar; auto-close when scrolling out of bounds or switching tabs.
+- **Fixed SKC playback 2.1 physics restoration**: macro header decoder now properly decodes and applies the 2.1 physics flag on playback.
+
+---
+
 # v0.1.41 (2026-11-16)
 Record & Play accuracy update for SKK and SKC: checkpoint capture/restore seams, boundary-input deduplication, and full diagnostics.
 

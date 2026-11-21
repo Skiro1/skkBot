@@ -56,6 +56,7 @@ set(SKKBOT2_SOURCES
     src/hacks/music_speed.cpp
     src/hacks/layout_mode.cpp
     src/hacks/safe_mode.cpp
+    src/hacks/physics21.cpp
     src/hacks/auto_checkpoint_tps.cpp
     src/trajectory/show_trajectory.cpp
     src/physics/step_grid_hooks.cpp
@@ -80,6 +81,7 @@ if (WIN32)
     list(APPEND SKKBOT2_SOURCES
         src/render/capture.cpp
         src/render/hwprobe.cpp
+        src/render/cuda_interop.cpp
         src/render/renderer.cpp
         src/render/audiocap.cpp
         src/render/effect_batch.cpp

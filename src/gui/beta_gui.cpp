@@ -427,7 +427,10 @@ void drawTopTabs(ImDrawList* draw, ImVec2 min, float width, float headerH, float
         ImGui::SetCursorScreenPos(ImVec2(hitL, min.y));
         ImGui::InvisibleButton((std::string("##beta_tab") + std::to_string(i)).c_str(),
                                ImVec2(hitR - hitL, headerH));
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) state().tab = static_cast<Tab>(i);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            state().tab = static_cast<Tab>(i);
+            dropdownOpenId() = 0;
+        }
         if (ImGui::IsItemHovered()) {
             hoveredTab = i;
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -486,6 +489,7 @@ bool sectionHeading(ImDrawList* draw, ImVec2 origin, float width, float y,
     const std::string btnId = std::string("##beta_section_head_") + idStr;
     ImGui::InvisibleButton(btnId.c_str(), ImVec2(width, hitH));
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    if (clicked) dropdownOpenId() = 0;
     const bool hovered = ImGui::IsItemHovered();
     if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
@@ -2509,27 +2513,28 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         engine->syncAccuracyFromGame();
     }
 
-    const float rowsH = (rowH + pillGap) * 2.0f + rowH;
+    const float rowsH = (rowH + pillGap) * 3.0f + rowH;
     const float seen = openT * rowsH;
     if (openT <= 0.001f || seen <= 0.001f) return 27.0f * k + kSectionGap * k;
 
     {
         draw->PushClipRect(ImVec2(gridTL.x - 16.0f * k, y0 - 16.0f * k),
                            ImVec2(gridTL.x + width + 16.0f * k, y0 + seen + 16.0f * k), true);
-        static const char* const acIds[3] = {
-            "##acc_hl_mode", "##acc_hl_cos", "##acc_hl_safe",
+        static const char* const acIds[4] = {
+            "##acc_hl_mode", "##acc_hl_cos", "##acc_hl_21_physics", "##acc_hl_safe",
         };
-        float tops[3], ho[3], av[3];
-        for (int i = 0; i < 3; ++i) {
+        float tops[4], ho[4], av[4];
+        for (int i = 0; i < 4; ++i) {
             const float ry = y0 + static_cast<float>(i) * (rowH + pillGap);
             tops[i] = ry;
             bool act = false;
             if (i == 1) act = engine->cosEnabled && !(skcSelected || skkSelected);
-            if (i == 2) act = engine->safeMode;
+            if (i == 2) act = engine->physics21;
+            if (i == 3) act = engine->safeMode;
             ho[i] = rowChannels(acIds[i], act, gridTL.x, gridTL.x + width, ry, k,
                                 av[i]);
         }
-        drawStripRun(draw, gridTL.x, gridTL.x + width, k, tops, ho, av, 3,
+        drawStripRun(draw, gridTL.x, gridTL.x + width, k, tops, ho, av, 4,
                      true, true);
         draw->PopClipRect();
     }
@@ -2538,6 +2543,8 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
                        ImVec2(gridTL.x + width + 16.0f * k, y0 + seen + 16.0f * k), true);
     const bool row1L = seen >= rowH * 0.85f;
     const bool row2L = seen >= (rowH + pillGap + rowH) * 0.85f;
+    const bool row3L = seen >= ((rowH + pillGap) * 2.0f + rowH) * 0.85f;
+    const bool row4L = seen >= ((rowH + pillGap) * 3.0f + rowH) * 0.85f;
 
     {
         const float labelSize = pxSize(9.0f * kt);
@@ -2597,13 +2604,29 @@ float drawSettingsPage(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         y += rowH + pillGap;
     }
 
+    const bool p21On = engine->physics21;
+    {
+        const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
+        drawGradientText(draw, df, titleSize, tPos, "2.1 Physics",
+                         p21On ? theme::rgbText(222, 228, 242) : capOff,
+                         p21On ? theme::rgbText(240, 245, 255) : capOff);
+        ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
+        if (toggleAt("##set_acc_21_physics", tog, p21On, true, row3L)) {
+            engine->physics21 = !engine->physics21;
+            Mod::get()->setSavedValue("gui_21_physics", engine->physics21);
+            skkbot2::Logger::get().info("skkBot2: 2.1 Physics -> {}",
+                                       engine->physics21 ? "on" : "off");
+        }
+        y += rowH + pillGap;
+    }
+
     {
         ImVec2 smTog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
         drawGradientText(draw, df, titleSize,
                          ImVec2(gridTL.x, y + (rowH - textH) * 0.5f), "Safe Mode",
                          engine->safeMode ? theme::rgbText(222, 228, 242) : capOff,
                          engine->safeMode ? theme::rgbText(240, 245, 255) : capOff);
-        if (toggleAt("##set_safe_mode", smTog, engine->safeMode, true, true)) {
+        if (toggleAt("##set_safe_mode", smTog, engine->safeMode, true, row4L)) {
             engine->safeMode = !engine->safeMode;
             Mod::get()->setSavedValue("gui_safe_mode", engine->safeMode);
             skkbot2::Logger::get().info(
@@ -3499,6 +3522,8 @@ void loadRenderSettings() {
     r.audioFadeOutSec =
         std::clamp(mod->getSavedValue<double>("gui_render_afadeout", 0.0), 0.0, 10.0);
     r.monitorEnabled = mod->getSavedValue<bool>("gui_render_monitor", false);
+    r.cudaZeroCopy = mod->getSavedValue<bool>("gui_render_cudazerocopy", false);
+    r.fastRender = mod->getSavedValue<bool>("gui_render_fastrender", false);
     st.renderEncoder = mod->getSavedValue<std::string>("gui_render_encoder", "");
 }
 
@@ -3520,6 +3545,8 @@ void saveRenderSettings() {
     mod->setSavedValue("gui_render_afadein", r.audioFadeInSec);
     mod->setSavedValue("gui_render_afadeout", r.audioFadeOutSec);
     mod->setSavedValue("gui_render_monitor", r.monitorEnabled);
+    mod->setSavedValue("gui_render_cudazerocopy", r.cudaZeroCopy);
+    mod->setSavedValue("gui_render_fastrender", r.fastRender);
     mod->setSavedValue("gui_render_encoder", st.renderEncoder);
 }
 
@@ -3594,7 +3621,7 @@ float drawVideoSection(ImDrawList* draw, ImVec2 gridTL, float width, float top,
         encItems.push_back(st.renderEncoder.empty() ? "libx264" : st.renderEncoder);
     }
 
-    const float rowsH = rowH * 7.0f + rowGap * 6.0f;
+    const float rowsH = rowH * 9.0f + rowGap * 8.0f;
     const float seen = openT * rowsH;
     if (openT <= 0.001f || seen <= 0.001f) return kSectionGap * k;
     draw->PushClipRect(ImVec2(gridTL.x - 12.0f * k, top - 12.0f * k),
@@ -3603,19 +3630,23 @@ float drawVideoSection(ImDrawList* draw, ImVec2 gridTL, float width, float top,
     float y = top;
 
     {
-        static const char* const vidIds[7] = {
+        static const char* const vidIds[9] = {
             "##vid_hl_res", "##vid_hl_fps", "##vid_hl_br", "##vid_hl_codec",
-            "##vid_hl_fi", "##vid_hl_fo", "##vid_hl_hm",
+            "##vid_hl_fi", "##vid_hl_fo", "##vid_hl_hm", "##vid_hl_cuda",
+            "##vid_hl_fast"
         };
-        float tops[7], ho[7], ac[7];
-        for (int i = 0; i < 7; ++i) {
+        float tops[9], ho[9], ac[9];
+        for (int i = 0; i < 9; ++i) {
             const float ry = top + static_cast<float>(i) * (rowH + rowGap);
             tops[i] = ry;
+            const bool active = (i == 6 && gui.renderHideMenu) ||
+                                (i == 7 && st.render.cudaZeroCopy) ||
+                                (i == 8 && st.render.fastRender);
             ho[i] = rowChannels(
-                vidIds[i], i == 6 && gui.renderHideMenu, gridTL.x,
+                vidIds[i], active, gridTL.x,
                 gridTL.x + width, ry, k, ac[i]);
         }
-        drawStripRun(draw, gridTL.x, gridTL.x + width, k, tops, ho, ac, 7,
+        drawStripRun(draw, gridTL.x, gridTL.x + width, k, tops, ho, ac, 9,
                      true, true);
     }
 
@@ -3763,6 +3794,39 @@ float drawVideoSection(ImDrawList* draw, ImVec2 gridTL, float width, float top,
             saveRenderSettings();
             skkbot2::Logger::get().info("Render: hide menu while rendering -> {}",
                                         gui.renderHideMenu ? "on" : "off");
+        }
+        y += rowH + rowGap;
+    }
+
+    {
+        const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
+        const bool on = st.render.cudaZeroCopy;
+        drawGradientText(draw, df, titleSize, tPos, "CUDA Zero-Copy (NVIDIA only)",
+                         on ? theme::rgbText(222, 228, 242) : capOff,
+                         on ? theme::rgbText(240, 245, 255) : capOff);
+        ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
+        if (toggleAt("##ren_cudazerocopy", tog, on, true, true)) {
+            st.render.cudaZeroCopy = !st.render.cudaZeroCopy;
+            saveRenderSettings();
+            applyRenderSettings();
+            skkbot2::Logger::get().info("Render: CUDA zero-copy -> {}",
+                                        st.render.cudaZeroCopy ? "on" : "off");
+        }
+        y += rowH + rowGap;
+    }
+    {
+        const ImVec2 tPos(gridTL.x, y + (rowH - textH) * 0.5f);
+        const bool on = st.render.fastRender;
+        drawGradientText(draw, df, titleSize, tPos, "Fast Render",
+                         on ? theme::rgbText(222, 228, 242) : capOff,
+                         on ? theme::rgbText(240, 245, 255) : capOff);
+        ImVec2 tog(gridTL.x + width - toggleW, y + (rowH - toggleH) * 0.5f);
+        if (toggleAt("##ren_fastrender", tog, on, true, true)) {
+            st.render.fastRender = !st.render.fastRender;
+            saveRenderSettings();
+            applyRenderSettings();
+            skkbot2::Logger::get().info("Render: Fast render -> {}",
+                                        st.render.fastRender ? "on" : "off");
         }
         y += rowH + rowGap;
     }
@@ -5117,6 +5181,8 @@ void render(bool open) {
                  ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings);
     ImGui::BeginDisabled(closing);
 
+    if (closing) dropdownOpenId() = 0;
+
     const ImVec2 min = ImGui::GetWindowPos();
     const ImVec2 max = add(min, ImGui::GetWindowSize());
     ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -5130,6 +5196,7 @@ void render(bool open) {
 
     if (view.lastTab != view.tab) {
         view.lastTab = view.tab;
+        dropdownOpenId() = 0;
         view.bodyScroll = 0.0f;
         view.timingScroll = 0.0f;
         view.noclipScroll = 0.0f;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 #include <Geode/fmod/fmod.hpp>
@@ -42,7 +43,7 @@ class AudioCapture {
 
     bool shouldUpdateFmod() const { return m_shouldUpdateFmod; }
     double fmodTime() const { return m_fmodTime; }
-    double time() const { return m_time; }
+    double time() const { return m_time.load(std::memory_order_acquire); }
     void addFmodTime(double dt) { m_fmodTime += dt; }
     void onPumped(int samples) { m_pumped += samples; }
 
@@ -53,8 +54,9 @@ class AudioCapture {
     void seedLastLevelTime(double t) { m_lastLevelTime = t; }
 
     double producedSeconds() const {
+        const int64_t consumed = m_pumpedConsumed.load(std::memory_order_relaxed);
         return m_sampleRate > 0
-                   ? static_cast<double>(m_pumpedConsumed) /
+                   ? static_cast<double>(consumed) /
                          static_cast<double>(m_sampleRate)
                    : 0.0;
     }
@@ -64,7 +66,7 @@ class AudioCapture {
             return 0.0;
         }
         const double dropped =
-            static_cast<double>(m_discardedSamples) /
+            static_cast<double>(m_discardedSamples.load(std::memory_order_relaxed)) /
             static_cast<double>(m_sampleRate);
         return std::max(0.0, m_prerollEnd - dropped);
     }
@@ -106,7 +108,8 @@ class AudioCapture {
     int m_dspBufferCount = 2;
 
     int64_t m_pumped = 0;
-    int64_t m_pumpedConsumed = 0;
+    std::atomic<int64_t> m_pumpedConsumed{0};
+    mutable std::mutex m_pcmMu;
     std::vector<float> m_pcm;
 
     float m_prevMusicVolume = -1.0f;
@@ -120,13 +123,13 @@ class AudioCapture {
 
     bool m_shouldUpdateFmod = false;
     double m_fmodTime = 0.0;
-    double m_time = 0.0;
+    std::atomic<double> m_time{0.0};
     double m_lastLevelTime = 0.0;
     bool m_seedWarned = false;
 
     bool m_anchored = false;
     double m_prerollEnd = 0.0;
-    int64_t m_discardedSamples = 0;
+    std::atomic<int64_t> m_discardedSamples{0};
     unsigned long long m_masterClockBase = 0;
 };
 

@@ -209,11 +209,14 @@ class $modify(CCDirector) {
         renderer.drawPreview();
         const double viewT0 = skkbot2::render::Renderer::nowWall();
         renderer.useWindowViewForUi();
-        renderer.noteStage(skkbot2::render::Renderer::nowWall() - viewT0, skkbot2::render::Renderer::Stage::ViewUi);
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - viewT0,
+                           skkbot2::render::Renderer::Stage::ViewUi);
         const double swapT0 = skkbot2::render::Renderer::nowWall();
         this->m_pobOpenGLView->swapBuffers();
-        renderer.noteStage(skkbot2::render::Renderer::nowWall() - swapT0, skkbot2::render::Renderer::Stage::Swap);
-        renderer.noteStage(skkbot2::render::Renderer::nowWall() - frameT0, skkbot2::render::Renderer::Stage::Frame);
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - swapT0,
+                           skkbot2::render::Renderer::Stage::Swap);
+        renderer.noteStage(skkbot2::render::Renderer::nowWall() - frameT0,
+                           skkbot2::render::Renderer::Stage::Frame);
     }
 };
 

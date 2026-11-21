@@ -218,6 +218,8 @@ private:
     size_t m_droppedEvents = 0;
     size_t m_duplicateEvents = 0;
     size_t m_suppressedEvents = 0;
+    size_t m_multiCommandFrames = 0;
+    uint32_t m_firstMultiCommandFrame = 0;
 
     bool m_holdShadow[2][4] = {};
 
@@ -226,6 +228,7 @@ private:
     bool m_suppressionArmed = false;
 
     double m_savedTickRate = 240.0;
+    bool m_savedPhysics21 = false;
 
     Macro m_macro;
     std::string m_macroName;

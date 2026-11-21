@@ -34,9 +34,14 @@ class FboCapture {
     void setFade(float fade) { m_fade = fade; }
     float fade() const { return m_fade; }
 
-    void displayPreview(float winW, float winH);
+    void displayPreview(float winW, float winH, bool blackOnly = false);
 
     unsigned sceneTexture() const { return m_sceneTex; }
+
+    void setCudaMode(bool enabled) { m_cudaMode = enabled; }
+    bool isCudaMode() const { return m_cudaMode; }
+    unsigned pboId(int slot) const { return (slot >= 0 && slot < PBO_COUNT) ? m_pbo[slot] : 0; }
+    static constexpr int pboCount() { return PBO_COUNT; }
 
     unsigned m_width = 0;
     unsigned m_height = 0;
@@ -69,7 +74,7 @@ class FboCapture {
     int m_uFadeUV = -1;
     float m_fade = 1.0f;
 
-    static constexpr int PBO_COUNT = 16;
+    static constexpr int PBO_COUNT = 10;
     unsigned m_pbo[PBO_COUNT] = {};
     uintptr_t m_fence[PBO_COUNT] = {};
     int64_t m_pts[PBO_COUNT] = {};
@@ -82,6 +87,8 @@ class FboCapture {
     std::vector<uint8_t> m_syncBuf;
     std::atomic<bool> m_syncBusy{false};
     unsigned m_syncBusySkips = 0;
+    bool m_cudaMode = false;
+    bool m_heldInCuda[PBO_COUNT] = {};
 
     double m_visitMs = 0.0;
     unsigned m_visitN = 0;

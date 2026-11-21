@@ -105,8 +105,11 @@ bool AudioCapture::attach(float musicVolume, float sfxVolume) {
     m_channels = 2;
 
     m_pumped = 0;
-    m_pumpedConsumed = 0;
-    m_pcm.clear();
+    m_pumpedConsumed.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(m_pcmMu);
+        m_pcm.clear();
+    }
     m_rmsSum = 0.0;
     m_rmsSamples = 0;
     m_rmsWinSum = 0.0;
@@ -116,11 +119,11 @@ bool AudioCapture::attach(float musicVolume, float sfxVolume) {
 
     m_shouldUpdateFmod = false;
     m_fmodTime = 0.0;
-    m_time = 0.0;
+    m_time.store(0.0, std::memory_order_release);
     m_lastLevelTime = 0.0;
     m_anchored = false;
     m_prerollEnd = 0.0;
-    m_discardedSamples = 0;
+    m_discardedSamples.store(0, std::memory_order_relaxed);
     m_masterClockBase = 0;
     if (m_master) {
         unsigned long long clock = 0;
@@ -186,8 +189,14 @@ void AudioCapture::detach() {
                   "render: muted music/SFX or nothing was playing)"
                 : "");
     }
-    m_pcm.clear();
+    {
+        std::lock_guard<std::mutex> lk(m_pcmMu);
+        m_pcm.clear();
+    }
     m_pumped = 0;
+    m_pumpedConsumed.store(0, std::memory_order_relaxed);
+    m_discardedSamples.store(0, std::memory_order_relaxed);
+    m_time.store(0.0, std::memory_order_release);
     shutdownMonitor();
     skkbot2::log::info("[RENDER] audio capture detached");
 }
@@ -237,9 +246,10 @@ void AudioCapture::pump(double levelTime) {
     }
 
     if (m_prerollEnd > 0.0) {
+        std::lock_guard<std::mutex> lk(m_pcmMu);
         const size_t frames = m_pcm.size() / 2;
         const double already =
-            static_cast<double>(m_discardedSamples) / m_sampleRate;
+            static_cast<double>(m_discardedSamples.load(std::memory_order_relaxed)) / m_sampleRate;
         const double need = m_prerollEnd - already;
         size_t drop = 0;
         if (need > 0.0) {
@@ -251,17 +261,19 @@ void AudioCapture::pump(double levelTime) {
         if (drop > 0) {
             m_pcm.erase(m_pcm.begin(),
                         m_pcm.begin() + static_cast<std::ptrdiff_t>(drop) * 2);
-            m_discardedSamples += static_cast<int64_t>(drop);
+            m_discardedSamples.fetch_add(static_cast<int64_t>(drop), std::memory_order_relaxed);
         }
-        m_time = static_cast<double>(m_pumpedConsumed + m_discardedSamples) /
-                 static_cast<double>(m_sampleRate);
+        m_time.store(static_cast<double>(m_pumpedConsumed.load(std::memory_order_relaxed) +
+                                         m_discardedSamples.load(std::memory_order_relaxed)) /
+                     static_cast<double>(m_sampleRate), std::memory_order_release);
         const double dropped =
-            static_cast<double>(m_discardedSamples) / m_sampleRate;
+            static_cast<double>(m_discardedSamples.load(std::memory_order_relaxed)) / m_sampleRate;
         if (dropped + 1.0e-6 >= m_prerollEnd) {
             skkbot2::log::info(
                 "[RENDER] audio: pre-roll done at {:.3f}s ({} sample(s) "
                 "dropped, first encoded block is pts=0 = track position "
-                "{:.3f}s, mixer at {:.3f}s)", dropped, m_discardedSamples,
+                "{:.3f}s, mixer at {:.3f}s)", dropped,
+                m_discardedSamples.load(std::memory_order_relaxed),
                 m_prerollEnd, mixerSeconds());
             m_prerollEnd = 0.0;
         }
@@ -287,28 +299,37 @@ double AudioCapture::mixerSeconds() {
 size_t AudioCapture::drain(std::vector<float>& accum, int frameSize,
                            const std::function<void(const float*, int64_t)>&
                                sink) {
-    if (m_pcm.empty()) {
+    std::vector<float> localPcm;
+    {
+        std::lock_guard<std::mutex> lk(m_pcmMu);
+        if (!m_pcm.empty()) {
+            localPcm.swap(m_pcm);
+        }
+    }
+    if (localPcm.empty() && accum.empty()) {
         return 0;
     }
-    accum.insert(accum.end(), m_pcm.begin(), m_pcm.end());
-    m_pcm.clear();
+    if (!localPcm.empty()) {
+        accum.insert(accum.end(), localPcm.begin(), localPcm.end());
+    }
 
     const size_t blockSize = static_cast<size_t>(frameSize) * m_channels;
     size_t consumed = 0;
     size_t available = accum.size();
     int64_t pts = 0;
     while (available >= blockSize) {
-        pts = static_cast<int64_t>(m_pumpedConsumed);
+        pts = m_pumpedConsumed.load(std::memory_order_relaxed);
         sink(accum.data() + consumed, pts);
         consumed += blockSize;
         available -= blockSize;
-        m_pumpedConsumed += frameSize;
+        m_pumpedConsumed.fetch_add(frameSize, std::memory_order_relaxed);
     }
     if (consumed > 0) {
         accum.erase(accum.begin(), accum.begin() + consumed);
     }
-    m_time = static_cast<double>(m_pumpedConsumed + m_discardedSamples) /
-             static_cast<double>(m_sampleRate);
+    m_time.store(static_cast<double>(m_pumpedConsumed.load(std::memory_order_relaxed) +
+                                     m_discardedSamples.load(std::memory_order_relaxed)) /
+                 static_cast<double>(m_sampleRate), std::memory_order_release);
     return consumed;
 }
 
@@ -381,20 +402,21 @@ FMOD_RESULT F_CALLBACK AudioCapture::dspRead(FMOD_DSP_STATE*, float* inBuffer,
 void AudioCapture::onData(const float* data, unsigned int samples,
                           int channels) {
     if (channels != 2) {
-        const size_t off = m_pcm.size();
-        m_pcm.resize(off + static_cast<size_t>(samples) * 2);
-        downmixToStereo(data, m_pcm.data() + off, samples, channels);
+        std::vector<float> downmixed(static_cast<size_t>(samples) * 2);
+        downmixToStereo(data, downmixed.data(), samples, channels);
         if (m_monitorSystem) {
-            pushMonitor(m_pcm.data() + off, samples);
+            pushMonitor(downmixed.data(), samples);
         }
         for (size_t i = 0; i < static_cast<size_t>(samples) * 2; i++) {
             const double v = static_cast<double>(data[i]);
             m_rmsSum += v * v;
             m_rmsWinSum += v * v;
         }
+        {
+            std::lock_guard<std::mutex> lk(m_pcmMu);
+            m_pcm.insert(m_pcm.end(), downmixed.begin(), downmixed.end());
+        }
     } else {
-        m_pcm.insert(m_pcm.end(), data,
-                     data + static_cast<size_t>(samples) * 2);
         if (m_monitorSystem) {
             pushMonitor(data, samples);
         }
@@ -402,6 +424,11 @@ void AudioCapture::onData(const float* data, unsigned int samples,
             const double v = static_cast<double>(data[i]);
             m_rmsSum += v * v;
             m_rmsWinSum += v * v;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_pcmMu);
+            m_pcm.insert(m_pcm.end(), data,
+                         data + static_cast<size_t>(samples) * 2);
         }
     }
     m_rmsSamples += static_cast<int64_t>(samples) * 2;

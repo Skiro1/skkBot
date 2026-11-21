@@ -397,6 +397,21 @@ LiveTriple captureLive() {
             shakeCanon(skk::shakeStateGet())};
 }
 
+inline bool areStatesOnSameLcgOrbit(uint64_t a, uint64_t b, uint32_t maxSteps = 128) {
+    if (a == b) return true;
+    uint64_t s = a;
+    for (uint32_t i = 1; i <= maxSteps; ++i) {
+        s = lcgAdvance(s);
+        if (s == b) return true;
+    }
+    s = b;
+    for (uint32_t i = 1; i <= maxSteps; ++i) {
+        s = lcgAdvance(s);
+        if (s == a) return true;
+    }
+    return false;
+}
+
 }
 
 
@@ -559,6 +574,7 @@ void forceLayerSeeds() {
 
 
 bool g_anchorPending = false;
+bool g_attemptAnchorLogged = false;
 
 void journalRecordTick(bool typedInput) {
     auto& bot = Bot::get();
@@ -597,6 +613,13 @@ void journalRecordTick(bool typedInput) {
     journal.push_back({frame, live.primary, live.teleport, live.shake});
     const bool structural = g_anchorPending;
     g_anchorPending = false;
+    if (!g_attemptAnchorLogged) {
+        g_attemptAnchorLogged = true;
+        skkbot2::log::info(
+            "[SKC] rng journal: attempt armed - first anchor #{} at f={} "
+            "primary={:#x} teleport={:#x} shake={:#x}",
+            journal.size(), frame, live.primary, live.teleport, live.shake);
+    }
     if (journal.size() % 64 == 1 || structural) {
         skkbot2::log::debug(
             "[SKC] rng journal anchor #{} f={}{} primary={:#x} teleport={:#x} "
@@ -639,8 +662,10 @@ void journalPlaybackTick() {
             ++g_microRelocks;
             continue;
         }
+
         skk::restoreTripleRng({entry.primary, entry.teleport});
         skk::shakeStateSet(entry.shake);
+
         ++g_rellocks;
         skkbot2::log::info(
             "[SKC] rng relock f={} anchor f={} primary {:#x} -> {:#x} "
@@ -691,6 +716,11 @@ void journalResetAttempt(uint32_t boundaryFrame, bool wipe) {
                 before, journal.size(), wipe ? "wipe" : "stitch", boundaryFrame);
         }
         g_anchorPending = true;
+        g_attemptAnchorLogged = false;
+        skkbot2::log::info(
+            "[SKC] rng journal: {} at f={} - {} anchor(s) kept, journal "
+            "re-armed for the next tick",
+            wipe ? "wiped" : "stitched", boundaryFrame, journal.size());
     }
 
     g_playCursor = 0;

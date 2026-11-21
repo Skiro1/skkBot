@@ -763,7 +763,7 @@ const std::vector<Variant>& candidateVariants() {
             const uint8_t modes = data[rateOffset];
             if (modes & ~(kModeCBS | kModeCOS | kModeSubticks |
                           kModePlatformerKnown | kModeLz |
-                          kModeLockDelta | kModeRealTime)) return false;
+                          kModeLockDelta | kModeRealTime | kModePhysics21)) return false;
             outHeader.cbsMode = (modes & kModeCBS) != 0;
             outHeader.cosMode = (modes & kModeCOS) != 0;
             outHeader.subtickEncoded = (modes & kModeSubticks) != 0;
@@ -771,6 +771,7 @@ const std::vector<Variant>& candidateVariants() {
             outHeader.lzMode = (modes & kModeLz) != 0;
             outHeader.lockDeltaMode = (modes & kModeLockDelta) != 0;
             outHeader.realTimeMode = (modes & kModeRealTime) != 0;
+            outHeader.physics21 = (modes & kModePhysics21) != 0;
             if (!outHeader.lockDeltaMode && !outHeader.realTimeMode) {
                 outHeader.lockDeltaMode = true;
             }
@@ -874,7 +875,7 @@ std::vector<uint8_t> encode(const Macro& macro) {
     const bool hasTps = macro.header.tps != kDefaultTps ||
                         std::signbit(fpsWire) || fpsWire != 0.0f;
     const bool hasTimingMode = macro.realTimeMode;
-    const bool hasModes = c.lzMode || hasTimingMode;
+    const bool hasModes = c.lzMode || hasTimingMode || macro.physics21;
     const bool hasPlatformerFlag = macro.platformerKnown && macro.platformerMode;
     const bool hasExtension = hasPlatformerFlag || hasModes;
     const size_t tpsTailBytes = useDoubleTps ? kTpsDoubleBytes : kTpsBytes;
@@ -913,6 +914,7 @@ std::vector<uint8_t> encode(const Macro& macro) {
     header.lzMode = c.lzMode;
     header.lockDeltaMode = macro.lockDeltaMode;
     header.realTimeMode = macro.realTimeMode;
+    header.physics21 = macro.physics21;
 
     out[0] = header.knobs0;
     out[1] = header.knobs1;
@@ -928,7 +930,8 @@ std::vector<uint8_t> encode(const Macro& macro) {
                 (macro.platformerKnown ? kModePlatformerKnown : 0u) |
                 (c.lzMode ? kModeLz : 0u) |
                 (macro.lockDeltaMode ? kModeLockDelta : 0u) |
-                (macro.realTimeMode ? kModeRealTime : 0u));
+                (macro.realTimeMode ? kModeRealTime : 0u) |
+                (macro.physics21 ? kModePhysics21 : 0u));
             rateOffset += kModeBytes;
         }
     }
@@ -977,16 +980,7 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
         return std::nullopt;
 
     Macro macro;
-    macro.header.tps = header.tps;
-    macro.header.fps = header.fps;
-    macro.header.platformerKnown = header.platformerKnown;
-    macro.header.platformerMode = header.platformerMode;
-    macro.header.cbsMode = header.cbsMode;
-    macro.header.cosMode = header.cosMode;
-    macro.header.subtickEncoded = header.subtickEncoded;
-    macro.header.lzMode = header.lzMode;
-    macro.header.lockDeltaMode = header.lockDeltaMode;
-    macro.header.realTimeMode = header.realTimeMode;
+    macro.header = header;
     macro.platformerKnown = header.platformerKnown;
     macro.platformerMode = header.platformerMode;
     macro.cbsMode = header.cbsMode;
@@ -994,6 +988,8 @@ std::optional<Macro> decodeNative(const uint8_t* data, size_t size,
     macro.subtickEncoded = header.subtickEncoded;
     macro.lockDeltaMode = header.lockDeltaMode;
     macro.realTimeMode = header.realTimeMode;
+    macro.physics21 = header.physics21;
+    macro.header.physics21 = header.physics21;
 
     const size_t payloadSize = size - payloadOffset;
     if (payloadSize == 0) {

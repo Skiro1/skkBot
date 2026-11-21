@@ -98,6 +98,8 @@ class Renderer {
         unsigned height = 1080;
         int fps = 60;
         int bitrateMbps = 50;
+        bool cudaZeroCopy = false;
+        bool fastRender = false;
         bool audioEnabled = false;
         std::string audioCodec = "aac";
         int audioBitrate = 320;
@@ -112,6 +114,7 @@ class Renderer {
 
     void applySettings(const RenderSettings& s);
     RenderSettings settings() const;
+    bool isFastRender() const { return m_fastRender; }
 
     const std::vector<std::string>& availableEncoders() const {
         return m_encoderNames;
@@ -152,7 +155,8 @@ public:
 
 private:
     bool startEncoder(const std::string& outPath);
-    void encodeOneFrame(const uint8_t* rgba, int64_t pts, bool alreadyOwned);
+    void encodeOneFrame(const uint8_t* rgba, int64_t pts, bool alreadyOwned, int slot = -1);
+    void encodeCudaFrame(AVFrame* hwFrame, int64_t pts, int slot = -1);
     void flush();
     void freeEncoder();
 
@@ -171,7 +175,7 @@ private:
 
     void storeWindowFbSize(float fbW, float fbH);
 
-    static constexpr size_t RING_SIZE = 16;
+    static constexpr size_t RING_SIZE = 10;
 
     static constexpr int kStopTailWaitSeconds = 8;
 
@@ -208,7 +212,7 @@ private:
     float m_pendingFadeOut = 1.0f;
 
     int m_batchLimit = 3;
-    static constexpr int kBatchMax = 14;
+    static constexpr int kBatchMax = 8;
     int m_batchFullStreak = 0;
     int m_batchShortStreak = 0;
     static constexpr int kGrowStreak = 2;
@@ -299,6 +303,7 @@ private:
         const uint8_t* ptr = nullptr;
         int slot = -1;
         bool preCopied = false;
+        AVFrame* hwFrame = nullptr;
     };
     std::vector<RingEntry> m_ring;
     std::vector<int64_t> m_ringPts;
@@ -317,6 +322,13 @@ private:
     AVFrame* mYuvFrames[ENC_FRAMES] = {};
     int m_yuvIdx = 0;
     AVPacket* mPkt = nullptr;
+
+    bool m_cudaZeroCopy = false;
+    bool m_usingCudaZeroCopy = false;
+    bool m_fastRender = false;
+    AVBufferRef* m_hwDeviceCtx = nullptr;
+    AVBufferRef* m_hwFramesCtx = nullptr;
+    AVFrame* mCudaFrames[RING_SIZE] = {};
 
     SwsContext* m_sws = nullptr;
     AVFrame* m_convFrame = nullptr;

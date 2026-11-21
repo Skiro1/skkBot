@@ -160,6 +160,7 @@ void Gui::init() {
     AccuracyMode accMode = sanitizeAccuracyMode(acc);
     engine->selectedAccuracyMode = accMode;
     engine->cosEnabled = mod->getSavedValue<bool>("gui_cos", false);
+    engine->physics21 = mod->getSavedValue<bool>("gui_21_physics", false);
     engine->syncAccuracyFromGame();
 
     auto& logger = skkbot2::Logger::get();
@@ -225,6 +226,7 @@ void Gui::saveSettings() {
                        static_cast<int>(sanitizeAccuracyMode(
                            static_cast<int>(engine->selectedAccuracyMode))));
     mod->setSavedValue("gui_cos", engine->cosEnabled);
+    mod->setSavedValue("gui_21_physics", engine->physics21);
     mod->setSavedValue("gui_macro_bot_type", static_cast<int>(macroBotType));
 
     auto& logger = skkbot2::Logger::get();
@@ -288,6 +290,8 @@ void Gui::loadRenderSettings() {
     render.fadeOut = std::clamp(mod->getSavedValue<double>("gui_render_fadeout", 0.0), 0.0, 10.0);
     render.audioFadeIn = std::clamp(mod->getSavedValue<double>("gui_render_afadein", 0.0), 0.0, 10.0);
     render.audioFadeOut = std::clamp(mod->getSavedValue<double>("gui_render_afadeout", 0.0), 0.0, 10.0);
+    render.cudaZeroCopy = mod->getSavedValue<bool>("gui_render_cudazerocopy", false);
+    render.fastRender = mod->getSavedValue<bool>("gui_render_fastrender", false);
     renderEncoder = mod->getSavedValue<std::string>("gui_render_encoder", "");
     renderHideMenu = mod->getSavedValue<bool>("gui_render_hidemenu", true);
 }
@@ -307,6 +311,8 @@ void Gui::saveRenderSettings() {
     mod->setSavedValue("gui_render_fadeout", render.fadeOut);
     mod->setSavedValue("gui_render_afadein", render.audioFadeIn);
     mod->setSavedValue("gui_render_afadeout", render.audioFadeOut);
+    mod->setSavedValue("gui_render_cudazerocopy", render.cudaZeroCopy);
+    mod->setSavedValue("gui_render_fastrender", render.fastRender);
     mod->setSavedValue("gui_render_encoder", renderEncoder);
     mod->setSavedValue("gui_render_hidemenu", renderHideMenu);
 }
@@ -339,6 +345,8 @@ void Gui::startRender() {
     rs.height = static_cast<unsigned>(std::max(0, render.height));
     rs.fps = std::max(1, render.fps);
     rs.bitrateMbps = std::max(1, render.bitrateMbps);
+    rs.cudaZeroCopy = render.cudaZeroCopy;
+    rs.fastRender = render.fastRender;
     rs.audioEnabled = render.audioEnabled;
     rs.audioCodec = render.audioCodec;
     rs.audioBitrate = std::max(32, render.audioBitrate);

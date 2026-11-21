@@ -194,6 +194,11 @@ static uint32_t computeFallbackSeed() {
 }
 
 void refreshRngState(bool isLevelStart) {
+    auto& skcBot = skk::skc::Bot::get();
+    if (skcBot.isRecording() || skcBot.isPlaying()) {
+        return;
+    }
+
     auto* engine = ReplayEngine::get();
     auto* playLayer = PlayLayer::get();
     if (!playLayer) {
@@ -209,9 +214,14 @@ void refreshRngState(bool isLevelStart) {
         if (!attemptStart && !isLevelStart && !playLayer->m_player1->m_isDead) {
             return;
         }
-        uint64_t computedSeed = !playLayer->m_player1->m_isDead
-            ? computeLockedSeed(seedBase, playLayer->m_gameState.m_currentProgress)
-            : computeFallbackSeed();
+        uint64_t computedSeed = 0;
+        if (attemptStart || isLevelStart) {
+            computedSeed = engine->macroSetupSeed();
+        } else if (!playLayer->m_player1->m_isDead) {
+            computedSeed = computeLockedSeed(seedBase, playLayer->m_gameState.m_currentProgress);
+        } else {
+            computedSeed = computeFallbackSeed();
+        }
         GameToolbox::fast_srand(computedSeed);
 
         if (isLevelStart || attemptStart) {

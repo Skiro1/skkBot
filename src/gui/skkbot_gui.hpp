@@ -123,6 +123,8 @@ struct Gui {
         double fadeOut = 0.0;
         double audioFadeIn = 0.0;
         double audioFadeOut = 0.0;
+        bool cudaZeroCopy = false;
+        bool fastRender = false;
     };
     RenderSettingsStore render;
     std::string renderEncoder;

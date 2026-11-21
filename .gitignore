@@ -12,4 +12,5 @@ build_out.log
 node_modules/
 dist/
 remove_all_comments.bat
-release.bat
+__pycache__/
+*.pyc

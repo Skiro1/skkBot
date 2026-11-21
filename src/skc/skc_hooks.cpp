@@ -325,6 +325,7 @@ class $modify(SkcPlayLayer, PlayLayer) {
         auto& bot = Bot::get();
         skkbot2::seam_probe::skcCenters.clear();
         skkbot2::seam_probe::skkCenters.clear();
+        skk::advRandomClear();
         skcResetPortalCache();
         PracticeFix::get().clear();
         FrameClock::get().reset();
@@ -467,6 +468,7 @@ class $modify(SkcPlayLayer, PlayLayer) {
             entrySec);
         if (!stitch && (bot.isRecording() || bot.isPlaying())) {
             forceLayerSeeds();
+            skk::advRandomReseed(skk::currentAttemptSeed());
             skkbot2::log::info(
                 "[SKC] layer seeds forced: m_randomSeed/m_replayRandSeed = "
                 "{:#x} after vanilla reset (skc_rng)",
@@ -516,6 +518,10 @@ class $modify(SkcPlayLayer, PlayLayer) {
             bot.restart();
         }
         PlayLayer::resetLevelFromStart();
+        if (bot.isRecording() || bot.isPlaying()) {
+            forceLayerSeeds();
+            skk::advRandomReseed(skk::currentAttemptSeed());
+        }
         bot.reapplySessionAccuracy();
         bot.resumeCaptureAfterReset();
         sanitizeSeamQueueAfterReset(this, "resetLevelFromStart");
@@ -592,6 +598,7 @@ class $modify(SkcPlayLayer, PlayLayer) {
         if (bot.isEnabled() || bot.isPlaybackArmed()) {
             bot.onLevelExit();
         }
+        skk::advRandomClear();
         skcResetPortalCache();
         PracticeFix::get().clear();
         FrameClock::get().reset();
@@ -1244,7 +1251,9 @@ class $modify(SkcBaseGameLayer, GJBaseGameLayer) {
 
             const uint32_t frame = FrameClock::get().getFrame();
             uint32_t dispatched = 0;
+            uint32_t oldestDispatched = frame;
             while (auto opt = bot.poll(frame)) {
+                if (opt->frame < oldestDispatched) oldestDispatched = opt->frame;
                 PlayerButtonCommand command = {};
                 command.m_button = static_cast<PlayerButton>(opt->button);
                 command.m_isPush = opt->pressed;
@@ -1265,6 +1274,29 @@ class $modify(SkcBaseGameLayer, GJBaseGameLayer) {
                         static_cast<double>(pos.x), static_cast<double>(pos.y),
                         (m_player1 && m_player1->m_isOnGround) ? 1 : 0,
                         heldMask(m_player1));
+                }
+            }
+            if (dispatched > 1) {
+                static uint32_t sMultiSteps = 0;
+                if (++sMultiSteps <= 64) {
+                    skkbot2::log::info(
+                        "[SKC] dispatch: step f={} applies {} command(s) at "
+                        "once (multi-command frame #{}, oldest f={})", frame,
+                        dispatched, sMultiSteps, oldestDispatched);
+                } else if (sMultiSteps == 65) {
+                    skkbot2::log::info(
+                        "[SKC] dispatch: further multi-command steps "
+                        "suppressed");
+                }
+            }
+            if (dispatched > 1 && oldestDispatched < frame) {
+                static uint32_t sBacklogSteps = 0;
+                if (++sBacklogSteps <= 32) {
+                    skkbot2::log::warn(
+                        "[SKC] dispatch backlog: step f={} swallowed "
+                        "frame(s) {}-{} in one go ({} command(s)) - cadence "
+                        "lost recorded steps", frame, oldestDispatched,
+                        frame - 1, dispatched);
                 }
             }
             (void)dispatched;

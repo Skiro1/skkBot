@@ -226,6 +226,7 @@ bool FboCapture::init(unsigned width, unsigned height) {
                      GL_STREAM_READ);
         m_fence[i] = 0;
         m_mapped[i] = nullptr;
+        m_heldInCuda[i] = false;
         m_encBusy[i].store(false, std::memory_order_relaxed);
         m_pts[i] = -1;
         m_seq[i] = 0;
@@ -269,6 +270,7 @@ void FboCapture::destroy() {
                 glDeleteSync(reinterpret_cast<GLsync>(m_fence[i]));
                 m_fence[i] = 0;
             }
+            m_heldInCuda[i] = false;
             glDeleteBuffers(1, &m_pbo[i]);
             m_pbo[i] = 0;
         }
@@ -362,7 +364,7 @@ void FboCapture::issueReadback(int64_t pts) {
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
     GLint prevReadFbo = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
-    GLint prevViewport[4];
+    GLint prevViewport[4] = {};
     glGetIntegerv(GL_VIEWPORT, prevViewport);
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[slot]);
@@ -485,7 +487,7 @@ void FboCapture::syncReadback(uint8_t* dst) {
     ccGLInvalidateStateCache();
 }
 
-void FboCapture::displayPreview(float winW, float winH) {
+void FboCapture::displayPreview(float winW, float winH, bool blackOnly) {
     if (!m_sceneFbo) {
         return;
     }
@@ -510,16 +512,18 @@ void FboCapture::displayPreview(float winW, float winH) {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    const float scale = std::min(winW / static_cast<float>(m_width),
-                                 winH / static_cast<float>(m_height));
-    const int dw = static_cast<int>(static_cast<float>(m_width) * scale);
-    const int dh = static_cast<int>(static_cast<float>(m_height) * scale);
-    const int dx = static_cast<int>(winW - dw) / 2;
-    const int dy = static_cast<int>(winH - dh) / 2;
-    glBlitFramebuffer(0, 0, static_cast<GLint>(m_width),
-                      static_cast<GLint>(m_height), dx, dy, dx + dw, dy + dh,
-                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    logGLErr("displayPreview blit");
+    if (!blackOnly) {
+        const float scale = std::min(winW / static_cast<float>(m_width),
+                                     winH / static_cast<float>(m_height));
+        const int dw = static_cast<int>(static_cast<float>(m_width) * scale);
+        const int dh = static_cast<int>(static_cast<float>(m_height) * scale);
+        const int dx = static_cast<int>(winW - dw) / 2;
+        const int dy = static_cast<int>(winH - dh) / 2;
+        glBlitFramebuffer(0, 0, static_cast<GLint>(m_width),
+                          static_cast<GLint>(m_height), dx, dy, dx + dw, dy + dh,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        logGLErr("displayPreview blit");
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevDrawFbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
@@ -542,7 +546,7 @@ bool FboCapture::pickIssueSlot(int* slot) const {
     const unsigned start = m_issued % PBO_COUNT;
     for (int i = 0; i < PBO_COUNT; i++) {
         const int s = static_cast<int>((start + i) % PBO_COUNT);
-        if (m_mapped[s] == nullptr && m_fence[s] == 0) {
+        if (m_mapped[s] == nullptr && m_fence[s] == 0 && !m_heldInCuda[s]) {
             *slot = s;
             return true;
         }
@@ -554,7 +558,7 @@ bool FboCapture::pickHarvestSlot(int* slot) const {
     int best = -1;
     unsigned bestSeq = 0;
     for (int s = 0; s < PBO_COUNT; s++) {
-        if (m_mapped[s] != nullptr || m_fence[s] == 0) {
+        if (m_mapped[s] != nullptr || m_fence[s] == 0 || m_heldInCuda[s]) {
             continue;
         }
         if (best < 0 || m_seq[s] < bestSeq) {
@@ -571,10 +575,10 @@ bool FboCapture::pickHarvestSlot(int* slot) const {
 
 bool FboCapture::hasFreeSlot() const {
     for (int s = 0; s < PBO_COUNT; s++) {
-        if (m_mapped[s] == nullptr && m_fence[s] == 0) {
+        if (m_mapped[s] == nullptr && m_fence[s] == 0 && !m_heldInCuda[s]) {
             return true;
         }
-        if (m_mapped[s] != nullptr && !m_encBusy[s].load(std::memory_order_acquire)) {
+        if (!m_encBusy[s].load(std::memory_order_acquire)) {
             return true;
         }
     }
@@ -594,18 +598,26 @@ void FboCapture::releaseSync() {
 
 void FboCapture::unmapReturnedSlots() {
     for (int s = 0; s < PBO_COUNT; s++) {
-        if (m_mapped[s] == nullptr || m_encBusy[s].load(std::memory_order_acquire)) {
+        if (m_encBusy[s].load(std::memory_order_acquire)) {
             continue;
         }
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[s]);
-        if (glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_FALSE) {
-            skkbot2::log::warn("[RENDER] glUnmapBuffer reported data loss on "
-                               "slot {} - ownership bug", s);
-        }
-        m_mapped[s] = nullptr;
-        if (m_fence[s]) {
-            glDeleteSync(reinterpret_cast<GLsync>(m_fence[s]));
-            m_fence[s] = 0;
+        if (m_mapped[s] != nullptr) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[s]);
+            if (glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_FALSE) {
+                skkbot2::log::warn("[RENDER] glUnmapBuffer reported data loss on "
+                                   "slot {} - ownership bug", s);
+            }
+            m_mapped[s] = nullptr;
+            if (m_fence[s]) {
+                glDeleteSync(reinterpret_cast<GLsync>(m_fence[s]));
+                m_fence[s] = 0;
+            }
+        } else if (m_cudaMode && m_heldInCuda[s]) {
+            if (m_fence[s]) {
+                glDeleteSync(reinterpret_cast<GLsync>(m_fence[s]));
+                m_fence[s] = 0;
+            }
+            m_heldInCuda[s] = false;
         }
     }
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -627,24 +639,34 @@ bool FboCapture::grab(int64_t pts, GrabResult* out) {
                                   GL_SYNC_FLUSH_COMMANDS_BIT, 50'000'000ull);
         }
         if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
-            void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
-                                            GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
-            if (!mapped) {
-                mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
-                                          GL_MAP_READ_BIT);
-            }
-            if (mapped) {
-                m_mapped[slot] = static_cast<uint8_t*>(mapped);
+            if (m_cudaMode) {
+                m_heldInCuda[slot] = true;
                 m_encBusy[slot].store(true, std::memory_order_release);
-                out->data = m_mapped[slot];
+                out->data = nullptr;
                 out->slot = slot;
                 out->preCopied = false;
                 out->pts = m_pts[slot];
                 got = true;
             } else {
-                logGLErr("glMapBufferRange");
-                skkbot2::log::warn("[RENDER] capture map failed (fence was "
-                                   "signaled)");
+                void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
+                                                GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+                if (!mapped) {
+                    mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_nv12Size,
+                                              GL_MAP_READ_BIT);
+                }
+                if (mapped) {
+                    m_mapped[slot] = static_cast<uint8_t*>(mapped);
+                    m_encBusy[slot].store(true, std::memory_order_release);
+                    out->data = m_mapped[slot];
+                    out->slot = slot;
+                    out->preCopied = false;
+                    out->pts = m_pts[slot];
+                    got = true;
+                } else {
+                    logGLErr("glMapBufferRange");
+                    skkbot2::log::warn("[RENDER] capture map failed (fence was "
+                                       "signaled)");
+                }
             }
         } else {
             static uint64_t s_failLog = 0;

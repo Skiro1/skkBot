@@ -15,6 +15,9 @@ renderer using bundled FFmpeg — no extra downloads needed.
 - **Accuracy levels**: Vanilla and CBS (Click-Between-Steps) + COS helper — applied through
   vanilla GD mechanics; external accuracy mods (Superb Input Precision, Click-Between-Frames)
   are declared as incompatibilities
+- **2.1 Physics (BETA)**: toggle in Settings -> Accuracy. Re-enables authentic GD 2.1 physics
+  (upside-down ship gravity bug, 2D slerp ship rotation, 1.75x flip velocity boost, 11.18 ring jump height,
+  robot pad jump reset, dual repell disable), preserved in SKK/SKC macros and automatically detected in foreign imports
 - **Triple RNG lock** (shake + teleport + per-object), velocity fix (always on),
   gravity/up-down/dash state correction from player-visual bits
 - **Per-frame persistence-attempt** recording + playback, practice-mode support (practice
@@ -27,7 +30,9 @@ renderer using bundled FFmpeg — no extra downloads needed.
 - **Ultra-compressed `.skc` format**: inputs-only (~1–2 bytes/action) adaptive
   range coding with LZ phrase prediction, stores the attempt seed for bit-exact
   RNG, supports playback from mid-level (Recording & Playback)
-- **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output, the codec
+- **Built-in video renderer** (FFmpeg runtime): FBO + PBO ring, GPU NV12 output,
+  **CUDA Zero-Copy Direct Interop** (zero-overhead VRAM -> NVENC transfer), **Fast Render mode**
+  (uncapped FPS, up to 1.28x realtime on 4K 130 Mbps), the codec
   list shows every video encoder available in the build (NVENC, AMF, QSV, libx264,
   libx265, AV1, VP9/VP8, MPEG-4, ProRes, MJPEG, ...); resolution presets (720p–8K),
   1–240 FPS, bitrate 5–300 Mbps, fade in/out (video + audio), speedhack during render,

@@ -1,5 +1,8 @@
 #include "core/rng_lock.hpp"
 #include "version_offsets.hpp"
+#include "skkBot.hpp"
+#include "skc/skc_bot.hpp"
+#include "skc/skc_rng.hpp"
 
 #include <Geode/Geode.hpp>
 #include <logger/logger.hpp>
@@ -43,6 +46,20 @@ void restoreTripleRng(TripleRngState const& state) {
     pinTripleSeedAtReset(state.primary, state.teleport);
 }
 
+
+uint64_t currentAttemptSeed() {
+    auto& bot = skk::skc::Bot::get();
+    if (bot.isRecording() || bot.isPlaying()) {
+        if (bot.getMacro().wireSeedStamp > 0) {
+            return static_cast<uint64_t>(bot.getMacro().wireSeedStamp);
+        }
+        return skk::skc::kSkcLayerSeed;
+    }
+    if (auto* engine = ReplayEngine::get()) {
+        return engine->macroSetupSeed();
+    }
+    return skk::skc::kSkcLayerSeed;
+}
 
 namespace {
     std::vector<AdvRandEntry> g_advRandom;

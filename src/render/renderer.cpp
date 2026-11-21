@@ -23,7 +23,13 @@
 #include "../logger/logger.hpp"
 #include "audiocap.hpp"
 #include "hwprobe.hpp"
+#include "cuda_interop.hpp"
 #include "../hacks/physicsbypass.hpp"
+
+#ifdef GEODE_IS_WINDOWS
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
+#endif
 
 using namespace geode::prelude;
 using namespace cocos2d;
@@ -32,11 +38,88 @@ namespace skkbot2 {
 namespace render {
 
 namespace {
+
+#ifdef GEODE_IS_WINDOWS
+struct FfHwFns {
+    decltype(av_hwdevice_ctx_create)* hwdevice_ctx_create = nullptr;
+    decltype(av_hwframe_ctx_alloc)* hwframe_ctx_alloc = nullptr;
+    decltype(av_hwframe_ctx_init)* hwframe_ctx_init = nullptr;
+    decltype(av_hwframe_get_buffer)* hwframe_get_buffer = nullptr;
+    decltype(av_buffer_ref)* buffer_ref = nullptr;
+    decltype(av_buffer_unref)* buffer_unref = nullptr;
+    bool loaded = false;
+};
+
+static FfHwFns s_ffHw;
+
+static bool loadFfHw(const std::filesystem::path& dir, FfHwFns& out) {
+    if (out.loaded) return true;
+    std::filesystem::path p = dir / "avutil-61.dll";
+    HMODULE avutil = LoadLibraryW(p.wstring().c_str());
+    if (!avutil) return false;
+
+    out.hwdevice_ctx_create = reinterpret_cast<decltype(out.hwdevice_ctx_create)>(
+        GetProcAddress(avutil, "av_hwdevice_ctx_create"));
+    out.hwframe_ctx_alloc = reinterpret_cast<decltype(out.hwframe_ctx_alloc)>(
+        GetProcAddress(avutil, "av_hwframe_ctx_alloc"));
+    out.hwframe_ctx_init = reinterpret_cast<decltype(out.hwframe_ctx_init)>(
+        GetProcAddress(avutil, "av_hwframe_ctx_init"));
+    out.hwframe_get_buffer = reinterpret_cast<decltype(out.hwframe_get_buffer)>(
+        GetProcAddress(avutil, "av_hwframe_get_buffer"));
+    out.buffer_ref = reinterpret_cast<decltype(out.buffer_ref)>(
+        GetProcAddress(avutil, "av_buffer_ref"));
+    out.buffer_unref = reinterpret_cast<decltype(out.buffer_unref)>(
+        GetProcAddress(avutil, "av_buffer_unref"));
+
+    out.loaded = (out.hwdevice_ctx_create && out.hwframe_ctx_alloc && out.hwframe_ctx_init &&
+                  out.hwframe_get_buffer && out.buffer_ref && out.buffer_unref);
+    return out.loaded;
+}
+#endif
 inline double nowS() {
     return std::chrono::duration<double>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+
+#ifdef GEODE_IS_WINDOWS
+typedef BOOL(WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int interval);
+typedef int(WINAPI* PFNWGLGETSWAPINTERVALEXTPROC)(void);
+
+static PFNWGLSWAPINTERVALEXTPROC s_wglSwapIntervalEXT = nullptr;
+static PFNWGLGETSWAPINTERVALEXTPROC s_wglGetSwapIntervalEXT = nullptr;
+static int s_savedSwapInterval = 1;
+static bool s_swapIntervalSaved = false;
+
+static void disableVsyncForRender() {
+    if (!s_wglSwapIntervalEXT) {
+        s_wglSwapIntervalEXT = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(
+            wglGetProcAddress("wglSwapIntervalEXT"));
+        s_wglGetSwapIntervalEXT = reinterpret_cast<PFNWGLGETSWAPINTERVALEXTPROC>(
+            wglGetProcAddress("wglGetSwapIntervalEXT"));
+    }
+    if (s_wglSwapIntervalEXT) {
+        if (s_wglGetSwapIntervalEXT) {
+            s_savedSwapInterval = s_wglGetSwapIntervalEXT();
+            s_swapIntervalSaved = true;
+        }
+        s_wglSwapIntervalEXT(0);
+        skkbot2::log::info("[RENDER] VSync disabled during render (prior interval={})",
+                           s_savedSwapInterval);
+    }
+}
+
+static void restoreVsyncAfterRender() {
+    if (s_wglSwapIntervalEXT && s_swapIntervalSaved) {
+        s_wglSwapIntervalEXT(s_savedSwapInterval);
+        skkbot2::log::info("[RENDER] VSync restored to {}", s_savedSwapInterval);
+        s_swapIntervalSaved = false;
+    }
+}
+#else
+static void disableVsyncForRender() {}
+static void restoreVsyncAfterRender() {}
+#endif
 
 static uint64_t computeRenderFrame(GJBaseGameLayer* layer, double tps) {
     if (!layer) {
@@ -422,11 +505,63 @@ bool Renderer::startEncoder(const std::string& outPath) {
     std::string cname = mCodec->name ? mCodec->name : "";
     bool isNvenc = (cname.find("nvenc") != std::string::npos);
 
+    m_usingCudaZeroCopy = false;
+#ifdef GEODE_IS_WINDOWS
+    if (isNvenc && m_cudaZeroCopy) {
+        if (loadFfHw(m_ffDir, s_ffHw)) {
+            ret = s_ffHw.hwdevice_ctx_create(&m_hwDeviceCtx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+            if (ret >= 0 && m_hwDeviceCtx) {
+                m_hwFramesCtx = s_ffHw.hwframe_ctx_alloc(m_hwDeviceCtx);
+                if (m_hwFramesCtx) {
+                    AVHWFramesContext* frames = reinterpret_cast<AVHWFramesContext*>(m_hwFramesCtx->data);
+                    frames->format = AV_PIX_FMT_CUDA;
+                    frames->sw_format = AV_PIX_FMT_NV12;
+                    frames->width = static_cast<int>(mWidth & ~1);
+                    frames->height = static_cast<int>(mHeight & ~1);
+                    frames->initial_pool_size = RING_SIZE;
+                    ret = s_ffHw.hwframe_ctx_init(m_hwFramesCtx);
+                    if (ret >= 0) {
+                        AVHWDeviceContext* devCtx = reinterpret_cast<AVHWDeviceContext*>(m_hwDeviceCtx->data);
+                        AVCUDADeviceContext* cudaDev = reinterpret_cast<AVCUDADeviceContext*>(devCtx->hwctx);
+                        if (CudaInterop::get().initContext(cudaDev->cuda_ctx)) {
+                            bool regOk = true;
+                            for (int s = 0; s < mCapture.pboCount(); ++s) {
+                                if (!CudaInterop::get().registerGlBuffer(s, mCapture.pboId(s))) {
+                                    regOk = false;
+                                    break;
+                                }
+                            }
+                            if (regOk) {
+                                for (size_t i = 0; i < RING_SIZE; ++i) {
+                                    mCudaFrames[i] = m_ff.av_frame_alloc();
+                                }
+                                m_usingCudaZeroCopy = true;
+                                mCapture.setCudaMode(true);
+                                skkbot2::log::info("[RENDER] CUDA Zero-Copy (GPU VRAM -> NVENC) initialized successfully!");
+                            } else {
+                                skkbot2::log::warn("[RENDER] PBO registration with CUDA failed - falling back to PBO");
+                                CudaInterop::get().destroy();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     auto fillContext = [&](bool cbr) {
         mCtx->codec_id = mCodec->id;
         mCtx->width = static_cast<int>(mWidth & ~1);
         mCtx->height = static_cast<int>(mHeight & ~1);
-        mCtx->pix_fmt = AV_PIX_FMT_NV12;
+        if (m_usingCudaZeroCopy) {
+            mCtx->pix_fmt = AV_PIX_FMT_CUDA;
+#ifdef GEODE_IS_WINDOWS
+            mCtx->hw_frames_ctx = s_ffHw.buffer_ref(m_hwFramesCtx);
+#endif
+        } else {
+            mCtx->pix_fmt = AV_PIX_FMT_NV12;
+        }
         mCtx->time_base = AVRational{1, mFps};
         mCtx->framerate = AVRational{mFps, 1};
         mCtx->max_b_frames = 0;
@@ -496,6 +631,27 @@ bool Renderer::startEncoder(const std::string& outPath) {
         }
 
         if (!opened) {
+            if (m_usingCudaZeroCopy) {
+                CudaInterop::get().destroy();
+                for (auto& f : mCudaFrames) {
+                    if (f) {
+                        m_ff.av_frame_free(&f);
+                        f = nullptr;
+                    }
+                }
+#ifdef GEODE_IS_WINDOWS
+                if (m_hwFramesCtx) {
+                    s_ffHw.buffer_unref(&m_hwFramesCtx);
+                    m_hwFramesCtx = nullptr;
+                }
+                if (m_hwDeviceCtx) {
+                    s_ffHw.buffer_unref(&m_hwDeviceCtx);
+                    m_hwDeviceCtx = nullptr;
+                }
+#endif
+                mCapture.setCudaMode(false);
+                m_usingCudaZeroCopy = false;
+            }
             m_ff.avcodec_free_context(&mCtx);
             mCtx = nullptr;
             mCodec = nullptr;
@@ -670,28 +826,32 @@ bool Renderer::startEncoder(const std::string& outPath) {
         return false;
     }
     m_yuvIdx = 0;
-    for (auto& f : mYuvFrames) {
-        f = m_ff.av_frame_alloc();
-        if (!f) {
-            m_error = "frame alloc";
-            return false;
-        }
-        f->format = AV_PIX_FMT_NV12;
-        f->width = static_cast<int>(mWidth);
-        f->height = static_cast<int>(mHeight);
-        f->linesize[0] = static_cast<int>(mWidth);
-        f->linesize[1] = static_cast<int>(mWidth);
-        if (m_ff.av_frame_get_buffer(f, 32) < 0) {
-            m_error = "frame buffer alloc";
-            return false;
+    if (!m_usingCudaZeroCopy) {
+        for (auto& f : mYuvFrames) {
+            f = m_ff.av_frame_alloc();
+            if (!f) {
+                m_error = "frame alloc";
+                return false;
+            }
+            f->format = AV_PIX_FMT_NV12;
+            f->width = static_cast<int>(mWidth);
+            f->height = static_cast<int>(mHeight);
+            f->linesize[0] = static_cast<int>(mWidth);
+            f->linesize[1] = static_cast<int>(mWidth);
+            if (m_ff.av_frame_get_buffer(f, 32) < 0) {
+                m_error = "frame buffer alloc";
+                return false;
+            }
         }
     }
 
     return true;
 }
 
-void Renderer::encodeOneFrame(const uint8_t* nv12, int64_t pts, bool alreadyOwned) {
+void Renderer::encodeOneFrame(const uint8_t* nv12, int64_t pts, bool alreadyOwned, int slot) {
     if (!mPkt || !mCtx || !mFmt) {
+        if (slot >= 0) mCapture.releaseSlot(slot);
+        else if (alreadyOwned) mCapture.releaseSync();
         return;
     }
 
@@ -735,32 +895,42 @@ void Renderer::encodeOneFrame(const uint8_t* nv12, int64_t pts, bool alreadyOwne
     AVFrame* f = mYuvFrames[m_yuvIdx];
     m_yuvIdx = (m_yuvIdx + 1) % ENC_FRAMES;
     if (!f) {
+        if (slot >= 0) mCapture.releaseSlot(slot);
+        else if (alreadyOwned) mCapture.releaseSync();
         return;
     }
     if (m_ff.av_frame_make_writable(f) < 0) {
-        skkbot2::log::error("[RENDER] av_frame_make_writable failed вЂ” frame "
-                            "dropped");
+        skkbot2::log::error("[RENDER] av_frame_make_writable failed — frame dropped");
+        if (slot >= 0) mCapture.releaseSlot(slot);
+        else if (alreadyOwned) mCapture.releaseSync();
         return;
     }
-      const double copyT0 = nowS();
-      if (alreadyOwned) {
-      } else if (f->linesize[0] == static_cast<int>(mWidth) &&
-          f->linesize[1] == static_cast<int>(mWidth)) {
-          std::memcpy(f->data[0], nv12, ySize);
-          std::memcpy(f->data[1], nv12 + ySize, ySize / 2);
-      } else {
-          for (int r = 0; r < static_cast<int>(mHeight); r++) {
-              std::memcpy(f->data[0] + static_cast<size_t>(r) * f->linesize[0],
-                          nv12 + static_cast<size_t>(r) * mWidth, mWidth);
-          }
-          for (int r = 0; r < static_cast<int>(mHeight) / 2; r++) {
-              std::memcpy(f->data[1] + static_cast<size_t>(r) * f->linesize[1],
-                          nv12 + ySize + static_cast<size_t>(r) * mWidth, mWidth);
-          }
-      }
-      if (!alreadyOwned) {
-          m_encCopyMs += (nowS() - copyT0) * 1e3;
-      }
+    const double copyT0 = nowS();
+    if (alreadyOwned) {
+    } else if (f->linesize[0] == static_cast<int>(mWidth) &&
+        f->linesize[1] == static_cast<int>(mWidth)) {
+        std::memcpy(f->data[0], nv12, ySize);
+        std::memcpy(f->data[1], nv12 + ySize, ySize / 2);
+    } else {
+        for (int r = 0; r < static_cast<int>(mHeight); r++) {
+            std::memcpy(f->data[0] + static_cast<size_t>(r) * f->linesize[0],
+                        nv12 + static_cast<size_t>(r) * mWidth, mWidth);
+        }
+        for (int r = 0; r < static_cast<int>(mHeight) / 2; r++) {
+            std::memcpy(f->data[1] + static_cast<size_t>(r) * f->linesize[1],
+                        nv12 + ySize + static_cast<size_t>(r) * mWidth, mWidth);
+        }
+    }
+    if (!alreadyOwned) {
+        m_encCopyMs += (nowS() - copyT0) * 1e3;
+    }
+
+    if (slot >= 0) {
+        mCapture.releaseSlot(slot);
+        m_qCv.notify_one();
+    } else if (alreadyOwned) {
+        mCapture.releaseSync();
+    }
     const int64_t sentPts = m_videoPts++;
     f->pts = sentPts;
     m_lastSentPts = sentPts;
@@ -802,6 +972,66 @@ void Renderer::encodeOneFrame(const uint8_t* nv12, int64_t pts, bool alreadyOwne
     }
     drainPackets();
     mEncodedFrames.fetch_add(1, std::memory_order_release);
+}
+
+void Renderer::encodeCudaFrame(AVFrame* hwFrame, int64_t pts, int slot) {
+    if (!mPkt || !mCtx || !mFmt || !hwFrame) {
+        if (slot >= 0) mCapture.releaseSlot(slot);
+        if (hwFrame) m_ff.av_frame_unref(hwFrame);
+        return;
+    }
+
+    if (slot >= 0) {
+        mCapture.releaseSlot(slot);
+        m_qCv.notify_one();
+    }
+
+    auto drainPackets = [this]() {
+        const double drainT0 = nowS();
+        while (true) {
+            int ret = m_ff.avcodec_receive_packet(mCtx, mPkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret < 0) {
+                break;
+            }
+            m_ff.av_packet_rescale_ts(mPkt, mCtx->time_base, mFmt->streams[0]->time_base);
+            mPkt->stream_index = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_muxMu);
+                m_ff.av_interleaved_write_frame(mFmt, mPkt);
+            }
+            m_ff.av_packet_unref(mPkt);
+        }
+        m_encDrainMs += (nowS() - drainT0) * 1e3;
+    };
+
+    const int64_t sentPts = m_videoPts++;
+    hwFrame->pts = sentPts;
+    m_lastSentPts = sentPts;
+
+    drainPackets();
+    const double sendT0 = nowS();
+    int sendRet = 0;
+    for (int attempt = 0; attempt < 500; attempt++) {
+        sendRet = m_ff.avcodec_send_frame(mCtx, hwFrame);
+        if (sendRet == 0) {
+            break;
+        }
+        if (sendRet == AVERROR(EAGAIN)) {
+            m_encEagain++;
+            drainPackets();
+            continue;
+        }
+        skkbot2::log::error("[RENDER] send_frame(CUDA): {}", ffErrString(&m_ff, sendRet));
+        break;
+    }
+    m_encSendMs += (nowS() - sendT0) * 1e3;
+    drainPackets();
+    mEncodedFrames.fetch_add(1, std::memory_order_release);
+
+    m_ff.av_frame_unref(hwFrame);
 }
 
 void Renderer::flush() {
@@ -860,6 +1090,12 @@ void Renderer::freeEncoder() {
             f = nullptr;
         }
     }
+    for (auto& f : mCudaFrames) {
+        if (f) {
+            m_ff.av_frame_free(&f);
+            f = nullptr;
+        }
+    }
     if (mFmt) {
         if (mFmt->pb) {
             m_ff.avio_close(mFmt->pb);
@@ -900,13 +1136,28 @@ void Renderer::applySettings(const RenderSettings& s) {
     m_audioFadeOutSec = s.audioFadeOutSec;
     if (m_audioFadeOutSec < 0.0) m_audioFadeOutSec = 0.0;
     if (m_audioFadeOutSec > 10.0) m_audioFadeOutSec = 10.0;
+    m_cudaZeroCopy = s.cudaZeroCopy;
+    m_fastRender = s.fastRender;
 }
 
 Renderer::RenderSettings Renderer::settings() const {
-    return RenderSettings{mWidth, mHeight, mFps, mBitrateMbps, m_audioWanted,
-                          m_audioCodecSel, m_audioBitrate, m_musicVolume,
-                          m_sfxVolume, m_fadeInSeconds, m_fadeOutSeconds,
-                          m_audioFadeInSec, m_audioFadeOutSec};
+    RenderSettings s{};
+    s.width = mWidth;
+    s.height = mHeight;
+    s.fps = mFps;
+    s.bitrateMbps = mBitrateMbps;
+    s.cudaZeroCopy = m_cudaZeroCopy;
+    s.fastRender = m_fastRender;
+    s.audioEnabled = m_audioWanted;
+    s.audioCodec = m_audioCodecSel;
+    s.audioBitrate = m_audioBitrate;
+    s.musicVolume = m_musicVolume;
+    s.sfxVolume = m_sfxVolume;
+    s.fadeInSeconds = m_fadeInSeconds;
+    s.fadeOutSeconds = m_fadeOutSeconds;
+    s.audioFadeInSec = m_audioFadeInSec;
+    s.audioFadeOutSec = m_audioFadeOutSec;
+    return s;
 }
 
 bool Renderer::hasAudioCodec(const std::string& name) const {
@@ -1020,7 +1271,6 @@ void Renderer::audioPump(double levelTime) {
         return;
     }
     AudioCapture::get().pump(levelTime);
-    audioEncodePending();
 }
 
 void Renderer::logAvSync(GJBaseGameLayer* layer) {
@@ -1372,12 +1622,15 @@ if (pl->m_musicPrepared) {
         skkbot2::log::info("[RENDER] audio kick: no PlayLayer");
     }
 
+    mCapture.init(mWidth, mHeight);
+
     if (!startEncoder(outPath)) {
         skkbot2::log::error("[RENDER] start failed: {}", m_error);
         if (m_audioEnabled) {
             AudioCapture::get().detach();
             m_audioEnabled = false;
         }
+        mCapture.destroy();
         disarmMusicRestart();
         return false;
     }
@@ -1396,8 +1649,6 @@ if (pl->m_musicPrepared) {
     }
     skkbot2::log::info("[RENDER] speed captured: {:.3f}x (clock = tps x speed, "
                        "independent of Lock Delta / Real Time)", mSpeed);
-
-    mCapture.init(mWidth, mHeight);
 
     m_ring.assign(RING_SIZE, RingEntry{});
     m_ringPts.assign(RING_SIZE, -1);
@@ -1462,9 +1713,10 @@ if (pl->m_musicPrepared) {
 
     m_encThread = std::thread(&Renderer::encodeThreadMain, this);
 
-    skkbot2::log::info("[RENDER] Started -> {} ({}x{}@{}fps, {} Mbps, {}{})",
+    skkbot2::log::info("[RENDER] Started -> {} ({}x{}@{}fps, {} Mbps, {}{}{})",
                        outPath, mWidth, mHeight, mFps, mBitrateMbps,
                        m_encoderUsed.empty() ? "auto" : m_encoderUsed,
+                       m_fastRender ? ", fastRender" : "",
                        m_audioEnabled
                            ? (std::string(", audio ") + m_audioCodecUsed +
                               " " + std::to_string(m_audioBitrate) + " kbps")
@@ -1486,9 +1738,45 @@ bool Renderer::ringFull() {
 }
 
 void Renderer::commitSlot(const render::GrabResult& frame, int64_t pts) {
+#ifdef GEODE_IS_WINDOWS
+    if (m_usingCudaZeroCopy) {
+        if (frame.slot >= 0) {
+            std::lock_guard lk(m_qMu);
+            AVFrame* hwFrame = mCudaFrames[m_wr];
+            if (!hwFrame) {
+                mCudaFrames[m_wr] = m_ff.av_frame_alloc();
+                hwFrame = mCudaFrames[m_wr];
+            }
+            int r = s_ffHw.hwframe_get_buffer(m_hwFramesCtx, hwFrame, 0);
+            if (r >= 0) {
+                bool ok = CudaInterop::get().copyGlBufferToNv12(
+                    frame.slot,
+                    reinterpret_cast<CUdeviceptr>(hwFrame->data[0]),
+                    hwFrame->linesize[0],
+                    reinterpret_cast<CUdeviceptr>(hwFrame->data[1]),
+                    hwFrame->linesize[1],
+                    mWidth, mHeight);
+                if (ok) {
+                    m_ring[m_wr] = RingEntry{nullptr, frame.slot, false, hwFrame};
+                    m_ringPts[m_wr] = pts;
+                    m_wr = (m_wr + 1) % RING_SIZE;
+                    m_qCv.notify_one();
+                    return;
+                } else {
+                    skkbot2::log::error("[RENDER] copyGlBufferToNv12 failed for slot {}", frame.slot);
+                    mCapture.releaseSlot(frame.slot);
+                    m_ff.av_frame_unref(hwFrame);
+                }
+            } else {
+                mCapture.releaseSlot(frame.slot);
+                skkbot2::log::warn("[RENDER] hwframe_get_buffer failed: {}", r);
+            }
+        }
+    }
+#endif
     {
         std::lock_guard lk(m_qMu);
-        m_ring[m_wr] = RingEntry{frame.data, frame.slot, frame.preCopied};
+        m_ring[m_wr] = RingEntry{frame.data, frame.slot, frame.preCopied, nullptr};
         m_ringPts[m_wr] = pts;
         m_wr = (m_wr + 1) % RING_SIZE;
     }
@@ -1496,6 +1784,9 @@ void Renderer::commitSlot(const render::GrabResult& frame, int64_t pts) {
 }
 
 void Renderer::encodeThreadMain() {
+#ifdef GEODE_IS_WINDOWS
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
     m_encRunning.store(true);
     while (true) {
         RingEntry entry;
@@ -1511,14 +1802,22 @@ void Renderer::encodeThreadMain() {
             entry = m_ring[m_rd];
             pts = m_ringPts[m_rd];
             m_rd = (m_rd + 1) % RING_SIZE;
+            m_qCv.notify_one();
         }
-        encodeOneFrame(entry.ptr, pts, entry.preCopied);
-        if (entry.slot >= 0) {
-            mCapture.releaseSlot(entry.slot);
-        } else if (entry.preCopied) {
-            mCapture.releaseSync();
+        if (entry.hwFrame != nullptr) {
+            encodeCudaFrame(entry.hwFrame, pts, entry.slot);
+            m_qCv.notify_one();
+        } else {
+            encodeOneFrame(entry.ptr, pts, entry.preCopied, entry.slot);
+            m_qCv.notify_one();
         }
-        m_qCv.notify_one();
+
+        if (m_audioEnabled) {
+            audioEncodePending();
+        }
+    }
+    if (m_audioEnabled) {
+        audioEncodePending();
     }
     if (mFmt) {
         flush();
@@ -1571,6 +1870,10 @@ void Renderer::drive(GJBaseGameLayer* layer,
         }
         ++produced;
     }
+
+    if (produced > 0) {
+        glFlush();
+    }
     mBatchCalls++;
     mBatchProduced += produced;
     if (produced >= m_batchLimit && m_batchLimit > 0) {
@@ -1616,6 +1919,7 @@ bool Renderer::driveOneFrame(GJBaseGameLayer* layer,
                 "[RENDER] encoder stalled: capture ring full for ~30s вЂ” "
                 "aborting render");
             stop();
+            return false;
         }
         return false;
     }
@@ -1972,7 +2276,7 @@ void Renderer::noteStage(double seconds, Stage which) {
 
 void Renderer::drawPreview() {
     StageTimer previewTimer(&m_stageMs[static_cast<int>(Stage::Preview)]);
-    mCapture.displayPreview(m_windowW, m_windowH);
+    mCapture.displayPreview(m_windowW, m_windowH, m_fastRender);
 }
 
 void Renderer::restoreViewForPauseMenu() {
@@ -2017,6 +2321,23 @@ void Renderer::stop() {
         }
     }
 
+    if (m_usingCudaZeroCopy) {
+        CudaInterop::get().destroy();
+        mCapture.setCudaMode(false);
+        m_usingCudaZeroCopy = false;
+        skkbot2::log::info("[RENDER] CUDA Zero-Copy resources destroyed");
+    }
+#ifdef GEODE_IS_WINDOWS
+    if (m_hwFramesCtx) {
+        s_ffHw.buffer_unref(&m_hwFramesCtx);
+        m_hwFramesCtx = nullptr;
+    }
+    if (m_hwDeviceCtx) {
+        s_ffHw.buffer_unref(&m_hwDeviceCtx);
+        m_hwDeviceCtx = nullptr;
+    }
+#endif
+
     double paused = mPausedWallSecs;
     if (mLevelPaused && mPauseStartWall > 0.0) {
         paused += nowS() - mPauseStartWall;
@@ -2025,13 +2346,14 @@ void Renderer::stop() {
     double lvl = mLastPts > 0 ? static_cast<double>(mLastPts) / mFps : 0.0;
     skkbot2::log::info(
         "[RENDER] Summary: captured={} encoded={} wall={:.1f}s paused={:.1f}s "
-        "level={:.2f}s speed={:.2f}x ticks={} driveHz={:.0f} batch={} "
+        "level={:.2f}s speed={:.2f}x ticks={} driveHz={:.0f} batch={} fast={} "
         "grabAvg={:.1f}ms grabMax={:.1f}ms@pts={} grabFails={} drops={} "
         "pboGate={} batchAvg={:.2} batchFull={} stopDrive={} stopDraw={}{}",
         mCapturedFrames.load(), mEncodedFrames.load(), wall, paused, lvl,
         wall > 0.0 ? lvl / wall : 0.0, m_stepCount,
         wall > 0.0 ? static_cast<double>(m_driveCalls) / wall : 0.0,
         m_batchLimit,
+        m_fastRender ? "on" : "off",
         m_grabN > 0 ? m_grabMs / m_grabN : 0.0, m_grabMaxMs, m_grabMaxPts,
         m_grabFailTotal,
         m_pendingDrops,

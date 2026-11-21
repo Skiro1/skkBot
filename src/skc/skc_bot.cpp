@@ -154,8 +154,11 @@ void Bot::startRecording() {
     auto& gui = skkbot2::gui::get();
     m_macro.lockDeltaMode = gui.lockDelta && !gui.realTime;
     m_macro.realTimeMode = gui.realTime && !gui.lockDelta;
+    auto* engine = ReplayEngine::get();
+    m_macro.physics21 = engine && engine->physics21;
     m_macro.header.lockDeltaMode = m_macro.lockDeltaMode;
     m_macro.header.realTimeMode = m_macro.realTimeMode;
+    m_macro.header.physics21 = m_macro.physics21;
     applySessionAccuracy(false, false);
     const uint32_t startFrame = FrameClock::get().getFrame();
     m_state = State::Record;
@@ -224,12 +227,22 @@ void Bot::startPlayback() {
     if (m_state == State::Disabled) {
         if (auto* engine = ReplayEngine::get()) {
             m_savedTickRate = engine->tickRate;
+            m_savedPhysics21 = engine->physics21;
         }
     }
     applySessionAccuracy(false, false);
     auto& gui = skkbot2::gui::get();
     gui.lockDelta = m_macro.header.lockDeltaMode;
     gui.realTime = m_macro.header.realTimeMode;
+    if (auto* engine = ReplayEngine::get()) {
+        const bool macroPhysics21 = m_macro.header.physics21 || m_macro.physics21;
+        engine->physics21 = macroPhysics21;
+        Mod::get()->setSavedValue("gui_21_physics", engine->physics21);
+        skkbot2::log::info("[SKC] playback physics 2.1: {} (from macro)", macroPhysics21);
+        if (auto* pl = PlayLayer::get()) {
+            skkbot2::physics21::syncState(pl);
+        }
+    }
     dropCarry();
     m_state = State::Playback;
     m_pendingAction = PendingAction::None;
@@ -408,10 +421,17 @@ std::string Bot::describeStartBlock(const PlaybackStart& start) const {
 
 void Bot::stop() {
     const bool wasHolding = m_state != State::Disabled;
+    const bool wasPlayback = (m_state == State::Playback);
     skkbot2::log::info("[SKC] stop: entry (state={})", static_cast<int>(m_state));
     skkbot2::Logger::get().flush();
     if (m_state == State::Record) {
         skkbot2::autosave::flushRecording();
+        skkbot2::log::info(
+            "[SKC] stop: recording ended with {} action(s), rng anchors={} "
+            "(last f={}), multi-command frames={}",
+            m_macro.actions.size(), m_macro.rngJournal.size(),
+            m_macro.rngJournal.empty() ? 0u : m_macro.rngJournal.back().frame,
+            m_multiCommandFrames);
         auto& gui = skkbot2::gui::get();
         if (gui.macroName[0] == '\0') {
             const std::string autoName = skkbot2::autosave::skcAutosaveName();
@@ -427,9 +447,14 @@ void Bot::stop() {
     if (wasHolding) skkbot2::fps::endMacro();
     skkbot2::debug::setFullPageHeap(false);
     restoreUserAccuracy();
-    if (wasHolding) {
+    if (wasPlayback) {
         if (auto* engine = ReplayEngine::get()) {
             engine->tickRate = m_savedTickRate;
+            engine->physics21 = m_savedPhysics21;
+            Mod::get()->setSavedValue("gui_21_physics", engine->physics21);
+            if (auto* pl = PlayLayer::get()) {
+                skkbot2::physics21::syncState(pl);
+            }
         }
     }
     if (wasHolding) {
@@ -605,14 +630,27 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
     if (button >= 1 && button <= 3) {
         bool& held = m_holdShadow[player2 ? 1 : 0][button];
         if (held == pressed) {
-            ++m_duplicateEvents;
-            if (m_duplicateEvents <= 5) {
-                skkbot2::log::debug(
-                    "[SKC] drop [no-transition] frame={} button={} p2={} "
-                    "down={} (already {})", frame, button, player2, pressed,
-                    pressed ? "down" : "up");
+            if (pressed) {
+                Action synthRelease;
+                synthRelease.frame = frame;
+                synthRelease.button = button;
+                synthRelease.pressed = false;
+                synthRelease.player2 = player2;
+                synthRelease.halfTick = false;
+                m_macro.actions.push_back(synthRelease);
+                skkbot2::log::info(
+                    "[SKC] record: repeated press f={} btn={} p2={} - synthesized "
+                    "zero-frame release to preserve rapid-tap/orb activation",
+                    frame, button, player2 ? 1 : 0);
+            } else {
+                ++m_duplicateEvents;
+                if (m_duplicateEvents <= 5) {
+                    skkbot2::log::debug(
+                        "[SKC] drop [no-transition] frame={} button={} p2={} "
+                        "down=false (already up)", frame, button, player2);
+                }
+                return;
             }
-            return;
         }
         held = pressed;
     }
@@ -623,7 +661,25 @@ void Bot::recordInput(uint32_t frame, uint8_t button, bool player2,
     action.pressed = pressed;
     action.player2 = player2;
     action.halfTick = false;
+    bool sameChannelThisFrame = false;
+    for (auto it = m_macro.actions.rbegin(); it != m_macro.actions.rend(); ++it) {
+        if (it->frame != frame) break;
+        if (it->button == button && it->player2 == player2) {
+            sameChannelThisFrame = true;
+            break;
+        }
+    }
     m_macro.actions.push_back(action);
+    if (sameChannelThisFrame) {
+        ++m_multiCommandFrames;
+        if (m_firstMultiCommandFrame == 0) m_firstMultiCommandFrame = frame;
+        if (m_multiCommandFrames <= 32) {
+            skkbot2::log::info(
+                "[SKC] record: f={} carries another btn={} p2={} command "
+                "(down={}) - fast click in one step ({} such frame(s) so far)",
+                frame, button, player2, pressed, m_multiCommandFrames);
+        }
+    }
     m_rngTypedInput = true;
     skkbot2::log::debug(
         "[SKC] record frame={} button={} p2={} down={} (action {}/{})",
@@ -763,6 +819,9 @@ std::optional<Action> Bot::poll(uint32_t frame) {
 void Bot::clearInputs() {
     m_macro.actions.clear();
     m_inputIndex = 0;
+    m_macro.wireSeedStamp = 0;
+    m_multiCommandFrames = 0;
+    m_firstMultiCommandFrame = 0;
 }
 
 Bot::HeldState Bot::heldBefore(uint32_t frame) const {
@@ -1009,6 +1068,15 @@ bool Bot::save(const std::filesystem::path& path) {
         return false;
     }
 
+    const bool seedWanted =
+        geode::Mod::get()->getSavedValue<bool>("gui_record_seed", true);
+    m_macro.wireSeedStamp = seedWanted ? 1 : -1;
+    if (seedWanted && m_macro.rngJournal.empty()) {
+        skkbot2::log::warn(
+            "[SKC] SEED: RNG-журнал ПУСТ - файл уйдёт без якорей, сид "
+            "записанного мира на плейбэке не запинится (SAVE seed=on)");
+    }
+
     if (!saveToFile(path, m_macro)) {
         skkbot2::log::error("[SKC] failed to save {}", skk::pathToUtf8(path));
         return false;
@@ -1021,6 +1089,13 @@ bool Bot::save(const std::filesystem::path& path) {
     }
     skkbot2::log::info("[SKC] saved {} actions (P1={}, P2={}) to {}", m_macro.actions.size(),
                        p1, p2, skk::pathToUtf8(path));
+    skkbot2::log::info(
+        "[SKC] saved state: seed={} rng anchors={} (last f={}) | "
+        "multi-command frames={} (first f={}) | dropped={} dup={} suppressed={}",
+        seedWanted ? "on" : "off", m_macro.rngJournal.size(),
+        m_macro.rngJournal.empty() ? 0u : m_macro.rngJournal.back().frame,
+        m_multiCommandFrames, m_firstMultiCommandFrame, m_droppedEvents,
+        m_duplicateEvents, m_suppressedEvents);
     if (p2 > 0) {
         skkbot2::log::warn(
             "[SKC] the macro has {} second-player action(s). If this level has no "
@@ -1120,6 +1195,20 @@ bool Bot::adopt(Macro macro, std::string const& name, uint32_t levelId,
     stop();
     PracticeFix::get().clear();
     m_macro = std::move(macro);
+    if (auto* engine = ReplayEngine::get()) {
+        if (engine->physics21) {
+            m_macro.physics21 = true;
+            m_macro.header.physics21 = true;
+        } else if (m_macro.physics21 || m_macro.header.physics21) {
+            m_macro.physics21 = true;
+            m_macro.header.physics21 = true;
+            engine->physics21 = true;
+            Mod::get()->setSavedValue("gui_21_physics", true);
+            if (auto* pl = PlayLayer::get()) {
+                skkbot2::physics21::syncState(pl);
+            }
+        }
+    }
     m_inputIndex = 0;
     journalResetCursor();
     m_macroName = name;

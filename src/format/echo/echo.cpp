@@ -692,6 +692,10 @@ bool skk::echo::toSkcMacro(const Replay& replay, skc::Macro& out,
 
     out = skc::Macro{};
     out.header.tps = replay.tps;
+    if (replay.version > 0 && replay.version < 3) {
+        out.physics21 = true;
+        out.header.physics21 = true;
+    }
     out.actions.reserve(replay.actions.size());
 
     std::size_t droppedRelease = 0, droppedDuplicate = 0;

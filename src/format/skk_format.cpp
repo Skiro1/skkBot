@@ -116,6 +116,9 @@ void SkMacro::recordAction(std::vector<SkInput>& target, int tick, int button, b
         input.cbsTimeOffset = cbsTimeOffset;
         exactCbsTiming = true;
     }
+    if (!target.empty() && target.back().tick == input.tick && input.timeSeconds < target.back().timeSeconds) {
+        input.timeSeconds = target.back().timeSeconds;
+    }
     target.push_back(input);
 }
 

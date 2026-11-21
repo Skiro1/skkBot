@@ -472,6 +472,7 @@ public:
     double displayFps = 0.0;
     bool lockDelta = true;
     bool realTime = false;
+    bool physics21 = false;
 
     MacroSequence()
         : Replay("skkBot", MOD_VERSION) {}
@@ -493,6 +494,7 @@ public:
         }
         ext["timing_lock_delta"] = lockDelta;
         ext["timing_real_time"] = realTime;
+        ext["physics_21"] = physics21;
 
         if (recordedFromStartPos) {
             ext["from_start_pos"] = true;

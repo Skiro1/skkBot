@@ -255,6 +255,10 @@ bool skk::gdr2::toSkcMacro(const skk::gdr2::Replay& replay, skc::Macro& out,
     out.platformerKnown = true;
     out.header.platformerMode = out.platformerMode;
     out.header.platformerKnown = true;
+    if (replay.gameVersion != 0 && (replay.gameVersion < 22 || replay.gameVersion == 21 || replay.gameVersion == 211 || replay.gameVersion == 2100)) {
+        out.physics21 = true;
+        out.header.physics21 = true;
+    }
 
     if (replay.platformer) {
         size_t jumpPresses = 0, leftPresses = 0, rightPresses = 0;

@@ -114,6 +114,7 @@ inline constexpr uint8_t kModePlatformerKnown = 0x08u;
 inline constexpr uint8_t kModeLz = 0x10u;
 inline constexpr uint8_t kModeLockDelta = 0x20u;
 inline constexpr uint8_t kModeRealTime = 0x40u;
+inline constexpr uint8_t kModePhysics21 = 0x80u;
 
 inline constexpr uint32_t kTpsBytes = 8;
 inline constexpr uint32_t kTpsDoubleBytes = 16;
@@ -134,9 +135,10 @@ struct Header {
     bool lzMode = false;
     bool lockDeltaMode = true;
     bool realTimeMode = false;
+    bool physics21 = false;
 };
 #pragma pack(pop)
-static_assert(sizeof(Header) == 23, "in-memory Header is packed");
+static_assert(sizeof(Header) == 24, "in-memory Header is packed");
 
 [[nodiscard]] const std::vector<Variant>& candidateVariants();
 
@@ -174,6 +176,7 @@ struct Macro {
     bool subtickEncoded = false;
     bool lockDeltaMode = true;
     bool realTimeMode = false;
+    bool physics21 = false;
     std::vector<Action> actions;
     std::vector<RngJournalEntry> rngJournal;
     int wireSeedStamp = 0;

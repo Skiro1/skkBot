@@ -183,6 +183,7 @@ struct Macro {
     double displayFps = 0.0;
     bool lockDelta = true;
     bool realTime = false;
+    bool physics21 = false;
     double duration = 0.0;
     float startPosX = 0.0f;
     float startPosY = 0.0f;

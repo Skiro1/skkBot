@@ -495,15 +495,7 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
     }
 
     bool shouldUseInputOnlySkPlayback() {
-        auto* engine = ReplayEngine::get();
-
-        return engine &&
-            engine->engineMode == MODE_EXECUTE &&
-            engine->skMode &&
-            engine->activeSk &&
-            !engine->activeSk->inputs.empty() &&
-            engine->activeSk->anchors.empty() &&
-            ReplayEngine::runtimeAccuracyModeFor(engine->activeSk->accuracyMode) != AccuracyMode::CBS;
+        return false;
     }
 
     bool shouldUseInputOnlyGDRPlayback() {
@@ -1284,6 +1276,9 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         static int diagCount = 0;
         ++diagCount;
 
+        uint32_t dispatched = 0;
+        int oldestDispatchedTick = effectiveTick;
+
         while (engine->executeIndex < inputList.size()) {
             auto const& input = inputList[engine->executeIndex];
 
@@ -1311,6 +1306,34 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                                   inputList.size());
             dispatchImmediatePlaybackAction(tick, input.actionType, input.isPressed(), player2, input.stepOffset);
             ++engine->executeIndex;
+            ++dispatched;
+            if (input.tick < oldestDispatchedTick) {
+                oldestDispatchedTick = input.tick;
+            }
+        }
+
+        if (dispatched > 1) {
+            static uint32_t sMultiTicks = 0;
+            if (++sMultiTicks <= 64) {
+                skkbot2::log::info(
+                    "[SKK] dispatch: tick={} applies {} command(s) at once "
+                    "(multi-command tick #{}, oldest tick={})",
+                    effectiveTick, dispatched, sMultiTicks,
+                    oldestDispatchedTick);
+            } else if (sMultiTicks == 65) {
+                skkbot2::log::info(
+                    "[SKK] dispatch: further multi-command ticks suppressed");
+            }
+        }
+        if (dispatched > 1 && oldestDispatchedTick < effectiveTick) {
+            static uint32_t sBacklogTicks = 0;
+            if (++sBacklogTicks <= 32) {
+                skkbot2::log::warn(
+                    "[SKK] dispatch backlog: tick={} swallowed tick(s) {}-{} "
+                    "in one go ({} command(s)) - cadence lost recorded steps",
+                    effectiveTick, oldestDispatchedTick, effectiveTick - 1,
+                    dispatched);
+            }
         }
     }
 
@@ -2679,17 +2702,21 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
         }
 
         bool realTransition;
+        bool repeatedPress = false;
         if (!trackHoldTransition) {
             realTransition = true;
         } else if (hold) {
             realTransition = effChanged ? effBefore == 0 : !wasHeld;
+            if (!realTransition && (wasHeld || shadowHeld)) {
+                repeatedPress = true;
+            }
         } else {
             realTransition = (effChanged ? effBefore == 1 : wasHeld) || shadowHeld;
         }
         if (trackHoldTransition) {
             engine->recordedHoldShadow[paramShadowIndex] = hold;
         }
-        if (!realTransition) {
+        if (!realTransition && !repeatedPress) {
             skkbot2::log::debug("capture drop: tick={} button={} p2={} down={} wasHeld={} shadowHeld={} "
                                 "effSlot={} effBefore={} p1={}→{} p2={}→{} (NOT recorded)",
                 tick_util::current(this, engine), button, player2, hold, wasHeld ? 1 : 0, shadowHeld ? 1 : 0,
@@ -2731,6 +2758,25 @@ class $modify(MacroEngineBaseLayer, GJBaseGameLayer) {
                     stepOffset = 0.0f;
                     cbsTimeOffset = -1.0;
                 }
+            } else if (engine->activeMacro) {
+                if (!usesTimedAccuracy(engine->activeMacro->accuracyMode)) {
+                    stepOffset = 0.0f;
+                }
+            }
+
+            if (repeatedPress) {
+                if (engine->skMode && engine->activeSk) {
+                    engine->recordSkAction(recordTick, button, recordPlayer2, false, stepOffset, cbsTimeOffset);
+                } else if (engine->activeMacro) {
+                    engine->activeMacro->recordAction(recordTick, button, recordPlayer2, false, stepOffset);
+                }
+                skkbot2::log::info(
+                    "[SKK] capture: repeated press tick={} btn={} p2={} - synthesized "
+                    "release edge to preserve rapid-tap/orb activation",
+                    recordTick, button, recordPlayer2 ? 1 : 0);
+            }
+
+            if (engine->skMode && engine->activeSk) {
                 engine->recordSkAction(recordTick, button, recordPlayer2, hold, stepOffset, cbsTimeOffset);
                 skkbot2::log::debug("capture input: tick={} button={} p2={} pressed={} persistence={} shadow={} step={:.2f} cbs={:.6f} via=raw",
                     recordTick, button, recordPlayer2, hold,

@@ -978,6 +978,11 @@ inline float& dropdownScroll() {
     return s;
 }
 
+inline ImVec2& dropdownOpenPos() {
+    static ImVec2 p(0.0f, 0.0f);
+    return p;
+}
+
 inline int dropdownField(ImFont* font, const char* id, ImVec2 pos, float width,
                          const char* preview, const std::vector<std::string>& items,
                          int curIndex, bool enabled) {
@@ -1051,12 +1056,14 @@ inline int dropdownField(ImFont* font, const char* id, ImVec2 pos, float width,
 
 ImGuiID& openId = dropdownOpenId();
 float& scroll = dropdownScroll();
+ImVec2& openPos = dropdownOpenPos();
 if (clicked && enabled) {
     if (openId == key) {
         openId = 0;
     } else {
         openId = key;
         scroll = 0.0f;
+        openPos = pos;
     }
 }
 if (!enabled && openId == key) openId = 0;
@@ -1064,6 +1071,19 @@ if (ImGui::IsKeyPressed(ImGuiKey_Escape) && openId == key) openId = 0;
 
 int picked = -1;
 if (openId != key) return picked;
+
+if (std::abs(pos.x - openPos.x) > 1.0f || std::abs(pos.y - openPos.y) > 1.0f) {
+    openId = 0;
+    return picked;
+}
+
+const ImVec2 clipMin = draw->GetClipRectMin();
+const ImVec2 clipMax = draw->GetClipRectMax();
+if (pos.y + size.y <= clipMin.y || pos.y >= clipMax.y ||
+    pos.x + size.x <= clipMin.x || pos.x >= clipMax.x) {
+    openId = 0;
+    return picked;
+}
 
 const float itemH = 26.0f * k;
 const float r = 28.0f * k;
@@ -1088,15 +1108,29 @@ const ImVec2 panelMax(pos.x + panelW, panelY + panelH);
 const float maxScroll = std::max(0.0f, contentH - viewH);
 scroll = std::clamp(scroll, 0.0f, maxScroll);
 
+const bool overPanel = ImGui::IsMouseHoveringRect(panelMin, panelMax);
+const bool clickNow = ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1) || ImGui::IsMouseClicked(2);
+
+if (ImGui::GetIO().MouseWheel != 0.0f) {
+    if (overPanel && maxScroll > 0.0f) {
+        scroll = std::clamp(scroll - ImGui::GetIO().MouseWheel * itemH, 0.0f, maxScroll);
+        ImGui::GetIO().MouseWheel = 0.0f;
+    } else {
+        openId = 0;
+        return picked;
+    }
+}
+
+if ((clickNow || ImGui::IsMouseDown(0)) && !hovered && !overPanel) {
+    openId = 0;
+    return picked;
+}
+
+const ImVec2 savedCursorPos = ImGui::GetCursorScreenPos();
 ImGui::SetCursorScreenPos(panelMin);
 ImGui::InvisibleButton("##dd_panel_hit", ImVec2(panelW, panelH),
                        ImGuiButtonFlags_MouseButtonLeft);
-
-const bool clickNow = ImGui::IsMouseClicked(0);
-const bool overPanel = ImGui::IsMouseHoveringRect(panelMin, panelMax);
-if (overPanel && ImGui::GetIO().MouseWheel != 0.0f) {
-    scroll = std::clamp(scroll - ImGui::GetIO().MouseWheel * itemH, 0.0f, maxScroll);
-}
+ImGui::SetCursorScreenPos(savedCursorPos);
 
 ImDrawList* fg = ImGui::GetForegroundDrawList();
 fg->PushClipRect(panelMin, panelMax, true);

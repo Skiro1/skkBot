@@ -1581,8 +1581,9 @@ std::vector<uint8_t> serialize(Macro const& macro, WriteOptions options) {
     if (followTps || pinned || equalsTps) {
         writeLE<double>(output, equalsTps ? std::copysign(0.0, -1.0) : macro.displayFps);
     }
-    if (macro.realTime) {
-        writeLE<uint8_t>(output, 1u);
+    if (macro.realTime || macro.physics21) {
+        uint8_t modeByte = (macro.realTime ? 1u : 0u) | (macro.physics21 ? 2u : 0u);
+        writeLE<uint8_t>(output, modeByte);
     }
 
     if (output.size() > std::numeric_limits<uint32_t>::max()) {
@@ -1780,9 +1781,10 @@ std::optional<Macro> deserialize(std::vector<uint8_t> const& data, std::string* 
         return fail("invalid SKK3 metadata");
     }
     if (metadataCtx.remaining() >= sizeof(uint8_t)) {
-        uint8_t timingByte = readLE<uint8_t>(metadataCtx);
-        macro.realTime = (timingByte == 1u);
+        uint8_t modeByte = readLE<uint8_t>(metadataCtx);
+        macro.realTime = (modeByte & 1u) != 0;
         macro.lockDelta = !macro.realTime;
+        macro.physics21 = (modeByte & 2u) != 0;
     } else if (metadataCtx.remaining() != 0) {
         return fail("invalid SKK3 metadata");
     }
@@ -2354,6 +2356,7 @@ Macro fromSkMacro(SkMacro const& macro) {
     result.displayFps = macro.displayFps;
     result.lockDelta = macro.lockDelta;
     result.realTime = macro.realTime;
+    result.physics21 = macro.physics21;
     result.duration = macro.duration;
     result.startPosX = macro.startPosX;
     result.startPosY = macro.startPosY;
@@ -2430,6 +2433,7 @@ SkMacro toSkMacro(Macro const& macro) {
     result.displayFps = macro.displayFps;
     result.lockDelta = macro.lockDelta;
     result.realTime = macro.realTime;
+    result.physics21 = macro.physics21;
     result.duration = macro.duration;
     result.gameVersion = static_cast<uint32_t>(std::min<uint64_t>(
         macro.gameVersion,
